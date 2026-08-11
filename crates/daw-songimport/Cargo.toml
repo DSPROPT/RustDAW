@@ -1,0 +1,21 @@
+[package]
+name = "daw-songimport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+daw-analysis = { path = "../daw-analysis" }
+daw-core = { path = "../daw-core" }
+daw-midi = { path = "../daw-midi" }
+daw-project = { path = "../daw-project" }
+hound.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

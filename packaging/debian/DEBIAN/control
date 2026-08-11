@@ -1,0 +1,18 @@
+Package: rustdaw
+Version: 0.7.0
+Section: sound
+Priority: optional
+Architecture: amd64
+Maintainer: RustDAW Project
+Depends: libasound2, libpulse0, libgl1
+Recommends: ffmpeg
+Description: Ubuntu-first digital audio workstation
+ RustDAW provides mono and stereo recording, low-latency monitoring,
+ metronome, timeline editing, session persistence, and stereo export.
+ .
+ It also imports a song as separated instrument tracks, detects its tempo,
+ beat grid and chord chart natively, and plays transcribed MIDI through a
+ built-in General MIDI instrument bank with a piano roll editor.
+ .
+ Song import needs ffmpeg for sample-rate conversion, and a local DSPRO
+ Studio worker for the stem separation itself.

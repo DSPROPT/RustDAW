@@ -1,0 +1,641 @@
+//! Turning a finished DSPRO Studio project into a `RustDAW` session.
+//!
+//! The two applications disagree about sample rate: the pipeline works at
+//! 44.1 kHz because that is what the source material is, while a `RustDAW`
+//! session runs at whatever rate the interface opened, normally 48 kHz for a
+//! Scarlett. The engine deliberately refuses mismatched media rather than
+//! resampling behind the user's back, so conversion happens here, once, at
+//! import, into files the session owns.
+
+use anyhow::{Context, Result, bail};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use daw_core::ChannelLayout;
+use daw_midi::{MidiClip, TempoMap};
+use daw_project::{ProjectClip, ProjectDocument, ProjectTrack};
+use uuid::Uuid;
+
+use crate::manifest::SongManifest;
+
+/// Below this peak a stem is silence in practice. Demucs always emits all six
+/// stems; on a song with no piano the piano stem is dither and nothing else,
+/// and importing it as a track is just clutter.
+const SILENCE_CEILING_DB: f64 = -60.0;
+
+#[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools, reason = "independent import switches")]
+pub struct IngestOptions {
+    /// Directory that will contain the new session folder.
+    pub destination_root: PathBuf,
+    /// Also import kick/snare/toms/cymbals. Off by default: they sum to the
+    /// drum stem, so importing both plays the drums twice.
+    pub include_drumkit: bool,
+    /// Delay the song so its first downbeat lands on a bar line of the click.
+    pub align_to_bar: bool,
+    /// Skip stems that contain no audible signal.
+    pub skip_silent: bool,
+    /// Detect tempo natively instead of trusting the pipeline's beat grid.
+    pub detect_tempo: bool,
+    /// Import the transcription as instrument tracks.
+    pub import_midi: bool,
+    /// Detect the chord chart and the key.
+    pub detect_chords: bool,
+}
+
+impl Default for IngestOptions {
+    fn default() -> Self {
+        Self {
+            destination_root: PathBuf::from("Songs"),
+            include_drumkit: false,
+            align_to_bar: true,
+            skip_silent: true,
+            detect_tempo: true,
+            import_midi: true,
+            detect_chords: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Ingested {
+    pub document: ProjectDocument,
+    pub session_path: PathBuf,
+    pub session_dir: PathBuf,
+    /// Human-readable remarks: skipped stems, tempo drift, applied offset.
+    /// Shown to the user because each one is a decision they may want to undo.
+    pub notes: Vec<String>,
+}
+
+/// What a converted stem turned out to be.
+#[derive(Clone, Copy, Debug)]
+struct ConvertedAudio {
+    frames: u64,
+    peak_db: Option<f64>,
+}
+
+impl ConvertedAudio {
+    fn is_silent(self) -> bool {
+        self.peak_db.is_some_and(|peak| peak <= SILENCE_CEILING_DB)
+    }
+}
+
+/// Converts a DSPRO project into a saved `RustDAW` session.
+///
+/// `progress` is called with a 0.0–1.0 fraction and a label for each stem, so
+/// a caller on a background thread can drive a progress bar.
+///
+/// # Errors
+///
+/// Returns an error if the manifest is unreadable, the project has no stems,
+/// ffmpeg is missing or fails, or the session cannot be written.
+#[allow(clippy::too_many_lines)]
+pub fn ingest_project(
+    project_dir: &Path,
+    options: &IngestOptions,
+    target_rate: u32,
+    mut progress: impl FnMut(f32, &str),
+) -> Result<Ingested> {
+    let manifest = SongManifest::load(project_dir)?;
+    if !manifest.has_stems() {
+        bail!(
+            "this project has no separated stems yet; let the pipeline finish the separate stage first"
+        );
+    }
+
+    let mut sources = manifest.ordered_stems();
+    if options.include_drumkit {
+        sources.extend(manifest.ordered_drumkit());
+    }
+
+    let name = manifest.display_name();
+    let file_stem = sanitize_file_name(&name);
+    let session_dir = unique_directory(&options.destination_root, &file_stem)?;
+    let audio_dir = session_dir.join("Audio");
+    std::fs::create_dir_all(&audio_dir)
+        .with_context(|| format!("failed to create {}", audio_dir.display()))?;
+
+    let mut notes = Vec::new();
+    let beats_per_bar = manifest
+        .detected_tempo()
+        .map_or(4, |detected| detected.beats_per_bar);
+
+    let mut tracks = Vec::new();
+    let mut skipped = Vec::new();
+    let total = sources.len().max(1);
+    for (index, (stem_name, relative_path)) in sources.iter().enumerate() {
+        #[allow(clippy::cast_precision_loss)]
+        let fraction = index as f32 / total as f32;
+        progress(fraction, stem_name);
+
+        let source = project_dir.join(relative_path);
+        if !source.is_file() {
+            skipped.push(format!("{stem_name} (file missing)"));
+            continue;
+        }
+        let destination = audio_dir.join(format!("{stem_name}.wav"));
+        let converted = convert_audio(&source, &destination, target_rate)
+            .with_context(|| format!("failed to convert the {stem_name} stem"))?;
+
+        if converted.frames == 0 || (options.skip_silent && converted.is_silent()) {
+            let _ = std::fs::remove_file(&destination);
+            skipped.push(stem_name.clone());
+            continue;
+        }
+
+        let mut track = ProjectTrack::new(title_case(stem_name), ChannelLayout::Stereo);
+        track.clips.push(ProjectClip {
+            id: Uuid::new_v4(),
+            name: title_case(stem_name),
+            path: destination,
+            start_frame: 0,
+            end_frame: converted.frames,
+        });
+        tracks.push(track);
+    }
+    progress(1.0, "session");
+
+    if tracks.is_empty() {
+        bail!("every stem in this project was silent or missing");
+    }
+
+    if !skipped.is_empty() {
+        notes.push(format!("Skipped silent or missing: {}", skipped.join(", ")));
+    }
+
+    progress(1.0, "tempo");
+    let (tempo_map, first_downbeat, tempo_map_beats) =
+        detect_tempo(&audio_dir, options, target_rate, &mut notes);
+
+    // Shift the song so its first downbeat lands on bar 1 of the click. The
+    // offset is measured against the tempo the click will actually run at.
+    let offset_seconds = if options.align_to_bar {
+        bar_alignment_offset(&tempo_map, first_downbeat, beats_per_bar)
+    } else {
+        0.0
+    };
+    let offset_frames = seconds_to_frames(offset_seconds, target_rate);
+    if offset_frames > 0 {
+        for clip in tracks.iter_mut().flat_map(|track| track.clips.iter_mut()) {
+            clip.start_frame = offset_frames;
+            clip.end_frame = clip.end_frame.saturating_add(offset_frames);
+        }
+        notes.push(format!(
+            "Song delayed {offset_seconds:.2} s so its first downbeat lands on bar 1."
+        ));
+    }
+
+    let mut document = ProjectDocument {
+        name,
+        sample_rate: target_rate,
+        tempo: 120,
+        meter_numerator: beats_per_bar,
+        meter_denominator: 4,
+        // The song is the reference; a click on top of it is rarely wanted at
+        // first and is one keypress away.
+        click_enabled: false,
+        tracks,
+        ..ProjectDocument::default()
+    };
+    document.set_tempo_map(tempo_map);
+
+    if options.detect_chords {
+        progress(1.0, "chords");
+        match detect_chord_chart(&audio_dir, &tempo_map_beats, offset_seconds) {
+            Ok((chords, key)) if !chords.is_empty() => {
+                let named = chords.iter().filter(|event| !event.is_silent()).count();
+                notes.push(format!(
+                    "{named} chord(s) detected{}.",
+                    key.as_ref()
+                        .map_or_else(String::new, |key| format!(" in {key}"))
+                ));
+                document.chords = chords;
+                document.key = key;
+            }
+            Ok(_) => notes.push("No chords could be detected.".to_owned()),
+            Err(error) => notes.push(format!("Chord detection failed: {error}")),
+        }
+    }
+
+    if options.import_midi {
+        match import_midi_tracks(project_dir, &document.tempo_map(), offset_seconds) {
+            Ok((instrument_tracks, skipped_midi)) => {
+                if !skipped_midi.is_empty() {
+                    notes.push(format!("MIDI tracks left out: {}", skipped_midi.join(", ")));
+                }
+                if instrument_tracks.is_empty() {
+                    notes.push("No transcription in this project.".to_owned());
+                } else {
+                    let count = instrument_tracks.len();
+                    document.tracks.extend(instrument_tracks);
+                    notes.push(format!("Imported {count} instrument track(s) from the transcription."));
+                }
+            }
+            Err(error) => notes.push(format!("MIDI could not be imported: {error}")),
+        }
+    }
+
+    let session_path = session_dir.join(format!("{file_stem}.rustdaw.json"));
+    daw_project::save_atomic(&document, &session_path)?;
+
+    Ok(Ingested {
+        document,
+        session_path,
+        session_dir,
+        notes,
+    })
+}
+
+/// Detects tempo from the converted audio.
+///
+/// The drum stem is the best evidence available: it carries the pulse without
+/// the harmonic content that confuses onset detection. Falling back to the
+/// full mix keeps songs with no drums working.
+fn detect_tempo(
+    audio_dir: &Path,
+    options: &IngestOptions,
+    target_rate: u32,
+    notes: &mut Vec<String>,
+) -> (TempoMap, f64, BeatGrid) {
+    if !options.detect_tempo {
+        return (TempoMap::constant(120.0), 0.0, BeatGrid::default());
+    }
+    let candidates = ["drums.wav", "other.wav", "bass.wav"];
+    let Some(source) = candidates
+        .iter()
+        .map(|name| audio_dir.join(name))
+        .find(|path| path.is_file())
+    else {
+        notes.push("Nothing to analyse for tempo; left at 120 BPM.".to_owned());
+        return (TempoMap::constant(120.0), 0.0, BeatGrid::default());
+    };
+
+    match daw_analysis::analyse_wav(&source, 3.0) {
+        Ok(analysis) => {
+            if !analysis.beats.is_usable() {
+                notes.push(
+                    "No clear pulse was found; tempo is a fallback and bar lines are a guess."
+                        .to_owned(),
+                );
+                return (analysis.tempo_map, 0.0, BeatGrid::default());
+            }
+            let source_name = source
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("audio");
+            notes.push(format!(
+                "Tempo {:.2} BPM detected from the {source_name} stem.",
+                analysis.bpm()
+            ));
+            if !analysis.tempo_map.is_constant() {
+                notes.push(format!(
+                    "The song's tempo moves: {} tempo changes were kept.",
+                    analysis.tempo_map.points().len() - 1
+                ));
+            }
+            let downbeat = analysis.beats.first_downbeat();
+            let grid = BeatGrid {
+                beat_times: analysis.beats.beat_times.clone(),
+                downbeat_index: analysis.beats.downbeat_index,
+            };
+            (analysis.tempo_map, downbeat, grid)
+        }
+        Err(error) => {
+            notes.push(format!("Tempo detection failed ({error}); left at 120 BPM."));
+            let _ = target_rate;
+            (TempoMap::constant(120.0), 0.0, BeatGrid::default())
+        }
+    }
+}
+
+/// The beat grid detection produced, kept for the chord decoder.
+#[derive(Clone, Debug, Default)]
+struct BeatGrid {
+    beat_times: Vec<f64>,
+    downbeat_index: usize,
+}
+
+/// Detects the chord chart from the harmonic stems.
+///
+/// Drums have no pitch and a singer's passing notes are not the chord, so both
+/// are left out and only bass, guitar, piano and "other" are summed. This is
+/// the single biggest thing that makes a chart usable — running the same
+/// analysis on a full mix produces a chart that is mostly wrong.
+fn detect_chord_chart(
+    audio_dir: &Path,
+    grid: &BeatGrid,
+    offset_seconds: f64,
+) -> Result<(Vec<daw_project::ChordEvent>, Option<String>)> {
+    if grid.beat_times.len() < 2 {
+        return Ok((Vec::new(), None));
+    }
+    let mut mixed: Vec<f32> = Vec::new();
+    let mut rate = 0;
+    for name in ["bass.wav", "guitar.wav", "piano.wav", "other.wav"] {
+        let path = audio_dir.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let (samples, sample_rate) = daw_analysis::read_wav_mono(&path)?;
+        rate = sample_rate;
+        if mixed.len() < samples.len() {
+            mixed.resize(samples.len(), 0.0);
+        }
+        for (slot, value) in mixed.iter_mut().zip(samples) {
+            *slot += value;
+        }
+    }
+    if mixed.is_empty() || rate == 0 {
+        return Ok((Vec::new(), None));
+    }
+
+    let chromagram = daw_analysis::chroma::chromagram(&mixed, rate);
+    let (spans, key) = daw_analysis::chords::detect_chords(
+        &chromagram,
+        &grid.beat_times,
+        4,
+        grid.downbeat_index,
+    );
+    // The audio was delayed to put its downbeat on bar 1; the chart has to move
+    // with it or every chord would sit a fraction of a bar early.
+    let chords = spans
+        .into_iter()
+        .map(|span| daw_project::ChordEvent {
+            start_seconds: span.start_seconds + offset_seconds,
+            end_seconds: span.end_seconds + offset_seconds,
+            label: span.label(),
+            confidence: span.confidence,
+        })
+        .collect();
+    Ok((chords, key.map(|key| key.name())))
+}
+
+/// Seconds to delay the song so `first_downbeat` lands on a bar line.
+fn bar_alignment_offset(tempo: &TempoMap, first_downbeat: f64, beats_per_bar: u16) -> f64 {
+    let seconds_per_bar = tempo.seconds_per_bar(0, beats_per_bar);
+    if seconds_per_bar <= 0.0 || first_downbeat <= 0.0 {
+        return 0.0;
+    }
+    let position_in_bar = first_downbeat % seconds_per_bar;
+    if position_in_bar <= f64::EPSILON {
+        0.0
+    } else {
+        seconds_per_bar - position_in_bar
+    }
+}
+
+/// Reads `midi/song.mid` and turns each pitched track into an instrument track.
+///
+/// Returns the tracks and the names of any drum tracks that were left out.
+fn import_midi_tracks(
+    project_dir: &Path,
+    tempo: &TempoMap,
+    offset_seconds: f64,
+) -> Result<(Vec<ProjectTrack>, Vec<String>)> {
+    let path = project_dir.join("midi/song.mid");
+    if !path.is_file() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let file = daw_midi::smf::parse(&bytes)?;
+
+    // The file's ticks mean nothing on their own: they are relative to the
+    // tempo map the pipeline wrote, which is not the one this session runs at.
+    // Every note is therefore rebased through seconds — the only quantity the
+    // two maps agree on — or a 120 BPM transcription would play a third too
+    // slow against audio detected at 94.
+    let rebase = |tick: u64| -> u64 {
+        let seconds = file.tempo_map.tick_to_seconds(tick) + offset_seconds.max(0.0);
+        tempo.seconds_to_tick(seconds)
+    };
+
+    let mut tracks = Vec::new();
+    let skipped = Vec::new();
+    for source in file.sounding_tracks() {
+        let name = if source.name.is_empty() {
+            "MIDI".to_owned()
+        } else {
+            title_case(&source.name)
+        };
+        let mut clip = MidiClip::new(name.clone(), 0, 0);
+        clip.notes = source
+            .notes
+            .iter()
+            .map(|note| {
+                let start = rebase(note.start_tick);
+                let end = rebase(note.end_tick()).max(start + 1);
+                daw_midi::Note::new(note.pitch, note.velocity, start, end - start)
+            })
+            .collect();
+        clip.resort();
+        clip.length_ticks = clip
+            .notes
+            .last()
+            .map_or(1, |note| note.end_tick())
+            .max(1);
+        // Channel 10 is the General MIDI drum kit, which the synth now plays.
+        let mut track = if source.is_drums() {
+            ProjectTrack::drum_track(name)
+        } else {
+            ProjectTrack::instrument(name, source.program)
+        };
+        // Instrument tracks start quiet: the stems are the reference and the
+        // synth is there to be brought up against them, not to compete.
+        track.gain_db = -9.0;
+        track.midi_clips.push(clip);
+        tracks.push(track);
+    }
+    Ok((tracks, skipped))
+}
+
+/// Resamples one file into the session, reporting its length and peak.
+///
+/// `volumedetect` rides along in the same pass so the peak costs no extra
+/// read; a stem is roughly 50 MB once converted and scanning them twice would
+/// double the import's disk traffic for nothing.
+fn convert_audio(source: &Path, destination: &Path, target_rate: u32) -> Result<ConvertedAudio> {
+    let output = Command::new("ffmpeg")
+        .arg("-nostdin")
+        .arg("-y")
+        .args(["-v", "info"])
+        .arg("-i")
+        .arg(source)
+        .args(["-af", "volumedetect"])
+        .args(["-ar", &target_rate.to_string()])
+        .args(["-ac", "2"])
+        .args(["-c:a", "pcm_s24le"])
+        .arg(destination)
+        .output()
+        .context("failed to run ffmpeg; install it with `sudo apt install ffmpeg`")?;
+
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let reason = detail.lines().last().unwrap_or("ffmpeg failed");
+        bail!("ffmpeg could not convert {}: {reason}", source.display());
+    }
+
+    let frames = wav_frame_count(destination)?;
+    Ok(ConvertedAudio {
+        frames,
+        peak_db: parse_max_volume(&String::from_utf8_lossy(&output.stderr)),
+    })
+}
+
+/// Reads the frame count from a WAV header without decoding the audio.
+fn wav_frame_count(path: &Path) -> Result<u64> {
+    let reader = hound::WavReader::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    Ok(u64::from(reader.duration()))
+}
+
+/// Extracts `max_volume: -12.3 dB` from ffmpeg's `volumedetect` output.
+/// Returns `None` when the line is absent or unparseable, which is treated as
+/// "assume there is signal" so a parsing change never silently drops a stem.
+fn parse_max_volume(stderr: &str) -> Option<f64> {
+    let line = stderr
+        .lines()
+        .rev()
+        .find(|line| line.contains("max_volume:"))?;
+    let value = line.split("max_volume:").nth(1)?.trim();
+    let number = value.strip_suffix("dB").unwrap_or(value).trim();
+    if number.eq_ignore_ascii_case("-inf") {
+        return Some(f64::NEG_INFINITY);
+    }
+    number.parse().ok()
+}
+
+/// Picks a session directory that does not exist yet, so importing the same
+/// song twice never overwrites the first import's audio or takes.
+fn unique_directory(root: &Path, base: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("failed to create {}", root.display()))?;
+    let first = root.join(base);
+    if !first.exists() {
+        return Ok(first);
+    }
+    for suffix in 2..1000_u32 {
+        let candidate = root.join(format!("{base} ({suffix})"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    bail!("could not find an unused folder name under {}", root.display())
+}
+
+fn sanitize_file_name(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, '-' | '_' | ' ') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        "Imported Song".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn title_case(name: &str) -> String {
+    let mut characters = name.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn seconds_to_frames(seconds: f64, rate: u32) -> u64 {
+    if seconds <= 0.0 {
+        return 0;
+    }
+    (seconds * f64::from(rate)).round() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_volume_is_read_from_ffmpeg_output() {
+        let stderr = "[Parsed_volumedetect_0 @ 0x55] n_samples: 100\n\
+                      [Parsed_volumedetect_0 @ 0x55] mean_volume: -22.7 dB\n\
+                      [Parsed_volumedetect_0 @ 0x55] max_volume: -0.4 dB\n";
+        assert_eq!(parse_max_volume(stderr), Some(-0.4));
+    }
+
+    #[test]
+    fn digital_silence_reports_negative_infinity() {
+        let stderr = "[Parsed_volumedetect_0 @ 0x55] max_volume: -inf dB\n";
+        assert_eq!(parse_max_volume(stderr), Some(f64::NEG_INFINITY));
+        assert!(
+            ConvertedAudio {
+                frames: 1,
+                peak_db: Some(f64::NEG_INFINITY),
+            }
+            .is_silent()
+        );
+    }
+
+    #[test]
+    fn unreadable_output_keeps_the_stem() {
+        assert_eq!(parse_max_volume("ffmpeg version 6.1.1\n"), None);
+        assert!(
+            !ConvertedAudio {
+                frames: 1,
+                peak_db: None,
+            }
+            .is_silent(),
+            "an unparsed peak must not be treated as silence"
+        );
+    }
+
+    #[test]
+    fn a_quiet_but_audible_stem_is_kept() {
+        assert!(
+            !ConvertedAudio {
+                frames: 1,
+                peak_db: Some(-42.0),
+            }
+            .is_silent()
+        );
+    }
+
+    #[test]
+    fn file_names_lose_separators_and_keep_spaces() {
+        assert_eq!(sanitize_file_name("AC/DC - Back in Black"), "AC_DC - Back in Black");
+        assert_eq!(sanitize_file_name("../../etc"), "______etc");
+        assert_eq!(sanitize_file_name("   "), "Imported Song");
+    }
+
+    #[test]
+    fn seconds_convert_to_frames_at_the_session_rate() {
+        assert_eq!(seconds_to_frames(1.5, 48_000), 72_000);
+        assert_eq!(seconds_to_frames(-1.0, 48_000), 0);
+        assert_eq!(seconds_to_frames(0.0, 48_000), 0);
+    }
+
+    #[test]
+    fn repeated_imports_get_their_own_folder() {
+        let root = std::env::temp_dir().join(format!("rustdaw-ingest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let first = unique_directory(&root, "Song").unwrap();
+        std::fs::create_dir_all(&first).unwrap();
+        let second = unique_directory(&root, "Song").unwrap();
+        assert_eq!(first.file_name().unwrap(), "Song");
+        assert_eq!(second.file_name().unwrap(), "Song (2)");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn stem_names_become_track_names() {
+        assert_eq!(title_case("drums"), "Drums");
+        assert_eq!(title_case(""), "");
+    }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "daw-audio-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossbeam-queue.workspace = true
+cpal.workspace = true
+daw-core = { path = "../daw-core" }
+daw-engine = { path = "../daw-engine" }
+daw-midi = { path = "../daw-midi" }
+hound.workspace = true
+
+[lints]
+workspace = true

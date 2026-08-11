@@ -1,0 +1,25 @@
+[package]
+name = "rustdaw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+daw-audio-linux = { path = "../../crates/daw-audio-linux" }
+daw-core = { path = "../../crates/daw-core" }
+daw-engine = { path = "../../crates/daw-engine" }
+daw-midi = { path = "../../crates/daw-midi" }
+daw-project = { path = "../../crates/daw-project" }
+daw-render = { path = "../../crates/daw-render" }
+daw-songimport = { path = "../../crates/daw-songimport" }
+eframe.workspace = true
+hound.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rfd.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

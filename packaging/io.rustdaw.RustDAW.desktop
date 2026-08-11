@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=RustDAW
+GenericName=Digital Audio Workstation
+Comment=Record and edit audio with a professional low-latency workflow
+Exec=rustdaw
+Icon=io.rustdaw.RustDAW
+Terminal=false
+Categories=AudioVideo;Audio;AudioVideoEditing;Recorder;
+Keywords=audio;recording;DAW;music;guitar;
+StartupNotify=true
+StartupWMClass=rustdaw

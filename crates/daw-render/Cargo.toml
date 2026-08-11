@@ -1,0 +1,19 @@
+[package]
+name = "daw-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+daw-core = { path = "../daw-core" }
+daw-engine = { path = "../daw-engine" }
+daw-project = { path = "../daw-project" }
+hound.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
+
+[lints]
+workspace = true

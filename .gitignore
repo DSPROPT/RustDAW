@@ -1,0 +1,6 @@
+/target/
+/Songs/
+*.wav
+*.peak
+.rustdaw/
+
