@@ -5,6 +5,8 @@ use crossbeam_queue::ArrayQueue;
 use daw_core::{ChannelLayout, SamplePosition, SampleRate};
 use daw_engine::{ChannelStrip, ChannelStripParams, GmBank, Metronome, Synth};
 use daw_midi::ScheduledNote;
+
+use crate::time_stretch::TimeStretcher;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -22,6 +24,9 @@ const RETIRED_PLAYBACK_CAPACITY: usize = 256;
 const MIXER_TRACK_CAPACITY: usize = 64;
 /// One slot per instrument track.
 const MIDI_SLOT_CAPACITY: usize = 64;
+/// Playback-speed limits for the real-time time-stretch control.
+const MIN_SPEED: f32 = 0.5;
+const MAX_SPEED: f32 = 2.0;
 
 #[derive(Clone, Debug)]
 pub struct AudioRuntimeConfig {
@@ -99,6 +104,12 @@ struct Shared {
     monitor_left: AtomicUsize,
     monitor_right: AtomicUsize,
     output_test_frames: AtomicU64,
+    /// Playback speed as f32 bits. 1.0 is normal; other values resample the mix
+    /// in real time, which changes pitch as well as tempo (varispeed).
+    speed_bits: AtomicU32,
+    /// Phase offset of the click grid, in frames. Shifts where bar one falls so
+    /// the click can be lined up with a song whose first beat is not at frame 0.
+    click_offset_frames: AtomicU64,
 }
 
 impl Shared {
@@ -126,6 +137,8 @@ impl Shared {
             monitor_left: AtomicUsize::new(0),
             monitor_right: AtomicUsize::new(1),
             output_test_frames: AtomicU64::new(0),
+            speed_bits: AtomicU32::new(1.0_f32.to_bits()),
+            click_offset_frames: AtomicU64::new(0),
         }
     }
 }
@@ -222,11 +235,7 @@ impl AudioRuntime {
     /// Returns an error when PulseAudio/PipeWire is unavailable, a matching
     /// device is missing, or either stream cannot be opened.
     pub fn open(config: &AudioRuntimeConfig) -> Result<Self> {
-        let pulse_id = cpal::available_hosts()
-            .into_iter()
-            .find(|id| id.name() == "PulseAudio")
-            .context("PulseAudio/PipeWire audio host is unavailable")?;
-        let host = cpal::host_from_id(pulse_id).context("failed to connect to PipeWire audio")?;
+        let host = select_host()?;
         let input = find_device(&host, &config.input_name_contains, true)?;
         let output = find_device(&host, &config.output_name_contains, false)?;
         let input_default = input
@@ -246,11 +255,16 @@ impl AudioRuntime {
             .name()
             .to_owned();
 
-        let sample_rate = SampleRate::new(input_default.sample_rate())
-            .context("audio backend returned a zero sample rate")?;
-        if output_default.sample_rate() != sample_rate.get() {
-            bail!("input/output sample rates differ; configure both devices to the same rate");
-        }
+        // The engine clock follows the output device, since that is what drives
+        // synthesis and playback. A single interface like a Scarlett reports the
+        // same rate on both sides; a laptop's built-in mic and speakers often do
+        // not, so the input stream is allowed to run at its own rate rather than
+        // refusing to open. (Recording through a mismatched-rate input is out of
+        // scope here — this path exists so playback works on any machine.)
+        let sample_rate = SampleRate::new(output_default.sample_rate())
+            .context("audio backend returned a zero output sample rate")?;
+        let input_rate =
+            SampleRate::new(input_default.sample_rate()).unwrap_or(sample_rate);
 
         let shared = Arc::new(Shared::new());
         let playback_commands = Arc::new(ArrayQueue::new(PLAYBACK_COMMAND_CAPACITY));
@@ -271,7 +285,7 @@ impl AudioRuntime {
 
         let input_config = StreamConfig {
             channels: input_default.channels(),
-            sample_rate: sample_rate.get(),
+            sample_rate: input_rate.get(),
             buffer_size: cpal::BufferSize::Fixed(config.buffer_frames),
         };
         let output_config = StreamConfig {
@@ -643,6 +657,24 @@ impl AudioRuntime {
             .store(bpm.clamp(20, 300), Ordering::Release);
     }
 
+    /// Sets the real-time playback speed. 1.0 is normal; higher is faster (and
+    /// higher-pitched), lower is slower. Clamped to a sane range.
+    pub fn set_speed(&self, speed: f32) {
+        let clamped = if speed.is_finite() {
+            speed.clamp(MIN_SPEED, MAX_SPEED)
+        } else {
+            1.0
+        };
+        self.shared
+            .speed_bits
+            .store(clamped.to_bits(), Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn speed(&self) -> f32 {
+        f32::from_bits(self.shared.speed_bits.load(Ordering::Acquire))
+    }
+
     pub fn set_meter(&self, numerator: u16, denominator: u16) {
         self.shared
             .meter_numerator
@@ -657,6 +689,14 @@ impl AudioRuntime {
         self.shared
             .click_level_bits
             .store(level.clamp(0.0, 1.0).to_bits(), Ordering::Release);
+    }
+
+    /// Shifts the click grid so bar one lands `frames` later, lining the click
+    /// up with a song whose first beat is not at frame zero.
+    pub fn set_click_offset(&self, frames: u64) {
+        self.shared
+            .click_offset_frames
+            .store(frames, Ordering::Release);
     }
 
     pub fn set_monitoring(&self, enabled: bool, left_channel: usize, right_channel: usize) {
@@ -774,6 +814,22 @@ impl Drop for AudioRuntime {
     }
 }
 
+/// Chooses the audio host to open streams on.
+///
+/// Linux drives `PipeWire` through its `PulseAudio` compatibility host, which is
+/// what this backend was built for. On macOS and Windows that host does not
+/// exist, so fall back to the platform default (`CoreAudio` / WASAPI) and the
+/// app runs against the built-in interface instead.
+fn select_host() -> Result<cpal::Host> {
+    if let Some(id) = cpal::available_hosts()
+        .into_iter()
+        .find(|id| id.name() == "PulseAudio")
+    {
+        return cpal::host_from_id(id).context("failed to connect to PipeWire audio");
+    }
+    Ok(cpal::default_host())
+}
+
 fn find_device(host: &cpal::Host, pattern: &str, input: bool) -> Result<cpal::Device> {
     let devices = if input {
         host.input_devices()
@@ -800,9 +856,19 @@ fn find_device(host: &cpal::Host, pattern: &str, input: bool) -> Result<cpal::De
             None
         }
     });
-    selected
-        .or(fallback)
-        .with_context(|| format!("no audio device contains ‘{pattern}’"))
+    if let Some(device) = selected.or(fallback) {
+        return Ok(device);
+    }
+    // Nothing matched the preferred name — e.g. no Scarlett on a laptop — so use
+    // the host's default device, which is the machine's built-in interface.
+    let default = if input {
+        host.default_input_device()
+    } else {
+        host.default_output_device()
+    };
+    default.with_context(|| {
+        format!("no audio device contains ‘{pattern}’ and the host has no default device")
+    })
 }
 
 fn is_output_monitor_name(name: &str) -> bool {
@@ -982,7 +1048,12 @@ fn build_output(
     Ok(stream)
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn output_stream<T: cpal::SizedSample + Copy + Send + 'static>(
     device: &cpal::Device,
     config: StreamConfig,
@@ -1002,6 +1073,9 @@ fn output_stream<T: cpal::SizedSample + Copy + Send + 'static>(
     let mut monitor_effects = ChannelStrip::new(sample_rate, ChannelStripParams::default());
     let mut was_playing = false;
     let mut test_phase = 0.0_f32;
+    // Pitch-preserving time-stretcher, carried across callbacks so its overlap
+    // buffers stay continuous. Engaged only when the speed is not 1.0.
+    let mut stretcher = TimeStretcher::new();
     device
         .build_output_stream::<T, _, _>(
             config,
@@ -1089,9 +1163,14 @@ fn output_stream<T: cpal::SizedSample + Copy + Send + 'static>(
                 }
                 data.fill(convert(0.0));
                 let playing = shared.playing.load(Ordering::Acquire);
-                if was_playing && !playing {
-                    // Stopping must not leave a held note ringing.
-                    mixer.reset_synths();
+                if was_playing != playing {
+                    if !playing {
+                        // Stopping must not leave a held note ringing.
+                        mixer.reset_synths();
+                    }
+                    // The stretcher's carried history is meaningless across a
+                    // start/stop; reset it so playback resumes cleanly.
+                    stretcher.reset();
                 }
                 was_playing = playing;
                 if channels == 0
@@ -1099,6 +1178,13 @@ fn output_stream<T: cpal::SizedSample + Copy + Send + 'static>(
                 {
                     return;
                 }
+                // Speed only bends live playback; a stopped output test stays 1:1.
+                let speed = if playing {
+                    f32::from_bits(shared.speed_bits.load(Ordering::Relaxed))
+                        .clamp(MIN_SPEED, MAX_SPEED)
+                } else {
+                    1.0
+                };
                 let mut position = shared.position.load(Ordering::Relaxed);
                 activate_recording_if_due(&shared, position);
                 let tempo = shared.tempo.load(Ordering::Relaxed);
@@ -1109,81 +1195,88 @@ fn output_stream<T: cpal::SizedSample + Copy + Send + 'static>(
 
                 for output_chunk in data.chunks_mut(channels * CLICK_SCRATCH_FRAMES) {
                     let frames = output_chunk.len() / channels;
-                    scratch_left[..frames].fill(0.0);
-                    scratch_right[..frames].fill(0.0);
-                    if click_enabled && playing {
-                        if let Ok(mut metronome) = Metronome::with_meter(
-                            sample_rate,
-                            tempo,
-                            meter_numerator,
-                            meter_denominator,
-                        ) {
-                            metronome.set_level(click_level);
-                            metronome.render_mono(
-                                SamplePosition::new(position),
-                                &mut scratch_left[..frames],
-                            );
-                            scratch_right[..frames].copy_from_slice(&scratch_left[..frames]);
-                        }
-                    }
-                    let mut block_track_peaks = [0.0_f32; MIXER_TRACK_CAPACITY];
-                    mixer.render(
-                        &playback_slots,
-                        &midi_slots,
-                        position,
-                        &mut scratch_left[..frames],
-                        &mut scratch_right[..frames],
-                        &mut block_track_peaks,
-                    );
-                    for (atomic, peak) in shared.track_peaks.iter().zip(block_track_peaks) {
-                        let previous = f32::from_bits(atomic.load(Ordering::Relaxed));
-                        atomic.store((previous * 0.86).max(peak).to_bits(), Ordering::Relaxed);
-                    }
-                    mix_monitoring(
-                        &shared,
-                        &queues.monitor,
-                        &mut scratch_left[..frames],
-                        &mut scratch_right[..frames],
-                        &mut monitor_effects,
-                    );
-                    let test_frames = shared.output_test_frames.load(Ordering::Relaxed);
-                    let rendered_test_frames =
-                        usize::try_from(test_frames.min(frames as u64)).unwrap_or(frames);
-                    for (left, right) in scratch_left[..rendered_test_frames]
-                        .iter_mut()
-                        .zip(&mut scratch_right[..rendered_test_frames])
-                    {
-                        let sample = test_phase.sin() * 0.15;
-                        *left += sample;
-                        *right += sample;
-                        #[allow(clippy::cast_precision_loss)]
-                        {
-                            test_phase += std::f32::consts::TAU * 440.0 / sample_rate.get() as f32;
-                        }
-                        if test_phase >= std::f32::consts::TAU {
-                            test_phase -= std::f32::consts::TAU;
-                        }
-                    }
-                    if rendered_test_frames > 0 {
-                        shared.output_test_frames.store(
-                            test_frames.saturating_sub(rendered_test_frames as u64),
-                            Ordering::Relaxed,
+                    if !playing || (speed - 1.0).abs() < 1e-4 {
+                        // Normal 1:1 path — unchanged, and the only path that can
+                        // sound the stopped output-test tone.
+                        render_source_block(
+                            position, frames, playing, click_enabled, click_level, tempo,
+                            meter_numerator, meter_denominator, sample_rate, &mut scratch_left,
+                            &mut scratch_right, &mut mixer, &playback_slots, &midi_slots, &shared,
+                            &queues.monitor, &mut monitor_effects,
                         );
-                    }
-                    for ((frame, left), right) in output_chunk
-                        .chunks_exact_mut(channels)
-                        .zip(&scratch_left[..frames])
-                        .zip(&scratch_right[..frames])
-                    {
-                        if let Some(sample) = frame.first_mut() {
-                            *sample = convert(*left);
+                        let test_frames = shared.output_test_frames.load(Ordering::Relaxed);
+                        let rendered_test_frames =
+                            usize::try_from(test_frames.min(frames as u64)).unwrap_or(frames);
+                        for (left, right) in scratch_left[..rendered_test_frames]
+                            .iter_mut()
+                            .zip(&mut scratch_right[..rendered_test_frames])
+                        {
+                            let sample = test_phase.sin() * 0.15;
+                            *left += sample;
+                            *right += sample;
+                            #[allow(clippy::cast_precision_loss)]
+                            {
+                                test_phase +=
+                                    std::f32::consts::TAU * 440.0 / sample_rate.get() as f32;
+                            }
+                            if test_phase >= std::f32::consts::TAU {
+                                test_phase -= std::f32::consts::TAU;
+                            }
                         }
-                        if let Some(sample) = frame.get_mut(1) {
-                            *sample = convert(*right);
+                        if rendered_test_frames > 0 {
+                            shared.output_test_frames.store(
+                                test_frames.saturating_sub(rendered_test_frames as u64),
+                                Ordering::Relaxed,
+                            );
                         }
-                    }
-                    if playing {
-                        position = position.saturating_add(frames as u64);
+                        for ((frame, left), right) in output_chunk
+                            .chunks_exact_mut(channels)
+                            .zip(&scratch_left[..frames])
+                            .zip(&scratch_right[..frames])
+                        {
+                            if let Some(sample) = frame.first_mut() {
+                                *sample = convert(*left);
+                            }
+                            if let Some(sample) = frame.get_mut(1) {
+                                *sample = convert(*right);
+                            }
+                        }
+                        if playing {
+                            position = position.saturating_add(frames as u64);
+                        }
+                    } else {
+                        // Pitch-preserving time-stretch. The stretcher pulls the
+                        // mix forward through `render`, which advances the
+                        // transport by exactly the source it consumes so the
+                        // playhead still tracks the audio. The click is left out
+                        // here so it need not be re-timed against the stretch.
+                        let ratio = f64::from(speed);
+                        stretcher.process(
+                            &mut scratch_left[..frames],
+                            &mut scratch_right[..frames],
+                            ratio,
+                            |count, source_left, source_right| {
+                                render_source_block(
+                                    position, count, true, false, click_level, tempo,
+                                    meter_numerator, meter_denominator, sample_rate, source_left,
+                                    source_right, &mut mixer, &playback_slots, &midi_slots, &shared,
+                                    &queues.monitor, &mut monitor_effects,
+                                );
+                                position = position.saturating_add(count as u64);
+                            },
+                        );
+                        for ((frame, left), right) in output_chunk
+                            .chunks_exact_mut(channels)
+                            .zip(&scratch_left[..frames])
+                            .zip(&scratch_right[..frames])
+                        {
+                            if let Some(sample) = frame.first_mut() {
+                                *sample = convert(*left);
+                            }
+                            if let Some(sample) = frame.get_mut(1) {
+                                *sample = convert(*right);
+                            }
+                        }
                     }
                 }
                 shared.position.store(position, Ordering::Release);
@@ -1194,6 +1287,68 @@ fn output_stream<T: cpal::SizedSample + Copy + Send + 'static>(
             Some(Duration::from_secs(2)),
         )
         .context("failed to build output stream")
+}
+
+/// Renders `frames` of the mix at `position` into the scratch buffers: the
+/// click, every track through the mixer, and software monitoring. Shared by the
+/// normal 1:1 path and the varispeed resampler, so both produce the same mix.
+#[allow(clippy::too_many_arguments)]
+fn render_source_block(
+    position: u64,
+    frames: usize,
+    playing: bool,
+    click_enabled: bool,
+    click_level: f32,
+    tempo: u16,
+    meter_numerator: u16,
+    meter_denominator: u16,
+    sample_rate: SampleRate,
+    scratch_left: &mut [f32],
+    scratch_right: &mut [f32],
+    mixer: &mut TrackMixer,
+    playback_slots: &[Option<PlaybackClip>; PLAYBACK_SLOT_CAPACITY],
+    midi_slots: &[Option<MidiPart>; MIDI_SLOT_CAPACITY],
+    shared: &Shared,
+    monitor_queue: &ArrayQueue<[f32; 2]>,
+    monitor_effects: &mut ChannelStrip,
+) {
+    scratch_left[..frames].fill(0.0);
+    scratch_right[..frames].fill(0.0);
+    if click_enabled && playing {
+        if let Ok(mut metronome) =
+            Metronome::with_meter(sample_rate, tempo, meter_numerator, meter_denominator)
+        {
+            metronome.set_level(click_level);
+            // Shift the grid by the phase offset so bar one can be lined up with
+            // the song's first beat rather than always sitting at frame zero.
+            let click_offset = shared.click_offset_frames.load(Ordering::Relaxed);
+            metronome.render_mono(
+                SamplePosition::new(position.saturating_sub(click_offset)),
+                &mut scratch_left[..frames],
+            );
+            scratch_right[..frames].copy_from_slice(&scratch_left[..frames]);
+        }
+    }
+    let mut block_track_peaks = [0.0_f32; MIXER_TRACK_CAPACITY];
+    mixer.render(
+        playback_slots,
+        midi_slots,
+        position,
+        &mut scratch_left[..frames],
+        &mut scratch_right[..frames],
+        &mut block_track_peaks,
+    );
+    for (atomic, peak) in shared.track_peaks.iter().zip(block_track_peaks) {
+        let previous = f32::from_bits(atomic.load(Ordering::Relaxed));
+        atomic.store((previous * 0.86).max(peak).to_bits(), Ordering::Relaxed);
+    }
+    mix_monitoring(
+        shared,
+        monitor_queue,
+        &mut scratch_left[..frames],
+        &mut scratch_right[..frames],
+        monitor_effects,
+    );
 }
 
 fn mix_monitoring(

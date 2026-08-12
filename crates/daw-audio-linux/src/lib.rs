@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
 
 mod runtime;
+mod time_stretch;
 
 pub use runtime::{AudioRuntime, AudioRuntimeConfig, RuntimeSnapshot, RuntimeTransportState};
 

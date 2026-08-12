@@ -55,8 +55,29 @@ struct Voice {
     release_step: f32,
 
     noise_level: f32,
-    filter_coefficient: f32,
+    /// The low-pass sweeps from `filter_coeff_peak` down to `filter_coeff_base`
+    /// as `filter_env` falls from 1 to 0, brightening the onset. Drums pin both
+    /// coefficients to the same value, so their filter is fixed.
+    filter_coeff_base: f32,
+    filter_coeff_peak: f32,
+    filter_env: f32,
+    filter_env_step: f32,
+    /// Two cascaded one-pole stages make a -12 dB/octave low-pass, steep enough
+    /// for the sweep to be heard against the band-limited tables.
     filter_state: f32,
+    filter_state2: f32,
+
+    /// Vibrato as a quadrature oscillator: `(lfo_sin, lfo_cos)` is rotated by a
+    /// fixed angle each frame, so pitch is modulated without a `sin` call per
+    /// sample. `vibrato_depth` is the peak deviation as a frequency ratio, and
+    /// `vibrato_ramp` swells it in from silence over the note's onset.
+    lfo_sin: f32,
+    lfo_cos: f32,
+    lfo_rot_sin: f32,
+    lfo_rot_cos: f32,
+    vibrato_depth: f32,
+    vibrato_ramp: f32,
+    vibrato_ramp_step: f32,
 
     /// Drum voices sweep in pitch and ignore how long the note is held.
     is_drum: bool,
@@ -291,7 +312,19 @@ fn pitched_voice_state(
     let detune = 2.0_f32.powf(patch.detune_cents / 1_200.0);
     // Brightness is a multiple of the note's own pitch, so high notes stay
     // proportionally as bright as low ones instead of turning into sine waves.
-    let cutoff = (frequency * patch.brightness).clamp(60.0, rate * 0.45);
+    // A softly played note is darker as well as quieter: velocity scales the
+    // cutoff down as `velocity_brightness` approaches one.
+    let ceiling = rate * 0.45;
+    let velocity_scale = 1.0 - patch.velocity_brightness * (1.0 - amplitude);
+    // The onset reaches the patch's full brightness; the tone then darkens to a
+    // fraction of that as it rings, which is where the filter can actually be
+    // heard — the band-limited tables have little energy above the nominal
+    // cutoff, so the sweep has to move down into the harmonics, not up past
+    // them, to change the timbre.
+    let peak_cutoff = (frequency * patch.brightness * velocity_scale).clamp(60.0, ceiling);
+    let base_cutoff = (peak_cutoff / (1.0 + patch.filter_env)).clamp(60.0, ceiling);
+    let vibrato_depth = 2.0_f32.powf(patch.vibrato_cents / 1_200.0) - 1.0;
+    let vibrato_angle = std::f32::consts::TAU * patch.vibrato_hz / rate;
     Voice {
         stage: Stage::Attack,
         phase: 0.0,
@@ -310,8 +343,19 @@ fn pitched_voice_state(
         sustain: patch.sustain,
         release_step: 1.0 / (patch.release_seconds * rate).max(1.0),
         noise_level: patch.noise,
-        filter_coefficient: one_pole_coefficient(cutoff, rate),
+        filter_coeff_base: one_pole_coefficient(base_cutoff, rate),
+        filter_coeff_peak: one_pole_coefficient(peak_cutoff, rate),
+        filter_env: 1.0,
+        filter_env_step: 1.0 / (patch.filter_decay_seconds * rate).max(1.0),
         filter_state: 0.0,
+        filter_state2: 0.0,
+        lfo_sin: 0.0,
+        lfo_cos: 1.0,
+        lfo_rot_sin: vibrato_angle.sin(),
+        lfo_rot_cos: vibrato_angle.cos(),
+        vibrato_depth,
+        vibrato_ramp: 0.0,
+        vibrato_ramp_step: 1.0 / (patch.vibrato_delay_seconds * rate).max(1.0),
         is_drum: false,
         pitch_multiplier: 1.0,
         pitch_step: 0.0,
@@ -339,8 +383,19 @@ fn drum_voice_state(voice: DrumVoice, rate: f32, amplitude: f32) -> Voice {
         sustain: 0.0,
         release_step: 1.0 / decay_frames,
         noise_level: voice.noise,
-        filter_coefficient: one_pole_coefficient(voice.noise_cutoff.min(rate * 0.45), rate),
+        filter_coeff_base: one_pole_coefficient(voice.noise_cutoff.min(rate * 0.45), rate),
+        filter_coeff_peak: one_pole_coefficient(voice.noise_cutoff.min(rate * 0.45), rate),
+        filter_env: 0.0,
+        filter_env_step: 1.0,
         filter_state: 0.0,
+        filter_state2: 0.0,
+        lfo_sin: 0.0,
+        lfo_cos: 1.0,
+        lfo_rot_sin: 0.0,
+        lfo_rot_cos: 1.0,
+        vibrato_depth: 0.0,
+        vibrato_ramp: 0.0,
+        vibrato_ramp_step: 1.0,
         is_drum: true,
         pitch_multiplier: 1.0,
         pitch_step: (voice.pitch_drop - 1.0) / decay_frames,
@@ -400,21 +455,41 @@ fn advance(voice: &mut Voice, table: &[f32; TABLE_SIZE], noise: f32) -> f32 {
     };
 
     let mixed = tone * (1.0 - voice.noise_level) + noise * voice.noise_level;
-    voice.filter_state += voice.filter_coefficient * (mixed - voice.filter_state);
+    // The filter cutoff sweeps from its bright onset down to the settled tone.
+    let coefficient =
+        voice.filter_coeff_base + (voice.filter_coeff_peak - voice.filter_coeff_base) * voice.filter_env;
+    voice.filter_state += coefficient * (mixed - voice.filter_state);
+    voice.filter_state2 += coefficient * (voice.filter_state - voice.filter_state2);
+    if voice.filter_env > 0.0 {
+        voice.filter_env = (voice.filter_env - voice.filter_env_step).max(0.0);
+    }
 
-    voice.phase += voice.increment * voice.pitch_multiplier;
+    // Pitched voices bend with the vibrato; drums keep their downward sweep.
+    let pitch = if voice.is_drum {
+        let multiplier = voice.pitch_multiplier;
+        voice.pitch_multiplier = (voice.pitch_multiplier + voice.pitch_step).max(0.05);
+        multiplier
+    } else {
+        // Rotate the quadrature LFO one step; a zero-Hz vibrato leaves it at
+        // (0, 1), so a patch without vibrato costs nothing and never drifts.
+        let sin = voice.lfo_sin * voice.lfo_rot_cos + voice.lfo_cos * voice.lfo_rot_sin;
+        let cos = voice.lfo_cos * voice.lfo_rot_cos - voice.lfo_sin * voice.lfo_rot_sin;
+        voice.lfo_sin = sin;
+        voice.lfo_cos = cos;
+        voice.vibrato_ramp = (voice.vibrato_ramp + voice.vibrato_ramp_step).min(1.0);
+        1.0 + voice.vibrato_depth * voice.vibrato_ramp * sin
+    };
+
+    voice.phase += voice.increment * pitch;
     if voice.phase >= 1.0 {
         voice.phase -= voice.phase.floor();
     }
-    voice.phase_detuned += voice.increment_detuned * voice.pitch_multiplier;
+    voice.phase_detuned += voice.increment_detuned * pitch;
     if voice.phase_detuned >= 1.0 {
         voice.phase_detuned -= voice.phase_detuned.floor();
     }
-    if voice.is_drum {
-        voice.pitch_multiplier = (voice.pitch_multiplier + voice.pitch_step).max(0.05);
-    }
 
-    voice.filter_state * voice.level()
+    voice.filter_state2 * voice.level()
 }
 
 fn sample_table(table: &[f32; TABLE_SIZE], phase: f32) -> f32 {
@@ -696,5 +771,89 @@ mod tests {
         let first = render_note(73, false, 60, 2_048);
         let second = render_note(73, false, 60, 2_048);
         assert_eq!(first, second, "a breathy patch must render identically twice");
+    }
+
+    /// A spectral-tilt measure: energy of the sample-to-sample change over the
+    /// signal's own energy. This is the normalised spectral centroid — high
+    /// harmonics carry quadratic weight, so it tracks how bright a tone is
+    /// independent of how loud the window is, without being swamped by the
+    /// fundamental the way a first-difference-over-level ratio is.
+    fn brightness(buffer: &[f32]) -> f32 {
+        let change: f32 = buffer.windows(2).map(|pair| (pair[1] - pair[0]).powi(2)).sum();
+        let energy: f32 = buffer.iter().map(|value| value * value).sum();
+        change / (energy + 1e-12)
+    }
+
+    fn render_note_at(program: u8, pitch: u8, velocity: u8, frames: usize) -> Vec<f32> {
+        let mut synth = synth();
+        synth.set_program(program);
+        let notes = [ScheduledNote {
+            start_frame: 0,
+            end_frame: frames as u64,
+            pitch,
+            velocity,
+        }];
+        let mut left = vec![0.0; frames];
+        let mut right = vec![0.0; frames];
+        synth.render(&notes, 0, &mut left, &mut right);
+        left
+    }
+
+    #[test]
+    fn a_struck_note_is_brightest_at_its_attack() {
+        // The filter envelope opens the piano's tone at the onset and lets it
+        // darken as the string rings, the way a real one does.
+        let piano = render_note(0, false, 60, 96_000);
+        let onset = brightness(&piano[500..4_500]);
+        let ring = brightness(&piano[60_000..64_000]);
+        assert!(
+            onset > ring * 1.1,
+            "the attack ({onset}) was not brighter than the tail ({ring})"
+        );
+    }
+
+    #[test]
+    fn a_harder_hit_is_brighter_not_just_louder() {
+        // Velocity must change timbre, not only level: a hard piano note is
+        // brighter than a soft one over the same window.
+        let soft = render_note_at(0, 60, 30, 8_000);
+        let hard = render_note_at(0, 60, 120, 8_000);
+        let soft_bright = brightness(&soft[500..4_500]);
+        let hard_bright = brightness(&hard[500..4_500]);
+        assert!(
+            hard_bright > soft_bright * 1.1,
+            "a hard hit ({hard_bright}) was no brighter than a soft one ({soft_bright})"
+        );
+    }
+
+    #[test]
+    fn sustained_instruments_waver_and_struck_ones_hold_steady() {
+        let rate = SampleRate::DEFAULT.get().max(1) as f32;
+        let bank = GmBank::new();
+        let depth = |program: u8| new_voice(&note(0, 48_000, 60), bank.patch(program), false, rate).vibrato_depth;
+        // Strings and flute carry a vibrato; a piano and a pluck must not.
+        assert!(depth(48) > 0.0, "strings should waver");
+        assert!(depth(73) > 0.0, "a flute should waver");
+        assert_eq!(depth(0), 0.0, "a piano must not waver");
+        assert_eq!(depth(45), 0.0, "a plucked string must not waver");
+    }
+
+    #[test]
+    fn the_vibrato_swells_in_rather_than_starting_at_full_depth() {
+        let rate = SampleRate::DEFAULT.get().max(1) as f32;
+        let bank = GmBank::new();
+        let table = bank.table(48);
+        let mut voice = new_voice(&note(0, 96_000, 60), bank.patch(48), false, rate);
+        // Immediately after the onset the LFO has barely moved off its start;
+        // a second later it is oscillating with real depth.
+        for _ in 0..64 {
+            advance(&mut voice, table, 0.0);
+        }
+        let early = voice.lfo_sin.abs() * voice.vibrato_ramp;
+        for _ in 0..48_000 {
+            advance(&mut voice, table, 0.0);
+        }
+        assert!(voice.vibrato_ramp > 0.9, "the vibrato never reached full depth");
+        assert!(early < 0.1, "the vibrato did not delay its onset");
     }
 }

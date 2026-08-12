@@ -106,11 +106,29 @@ pub struct Patch {
     /// Low-pass cutoff as a multiple of the note's own frequency. Low values
     /// darken high notes the way a real instrument's body does.
     pub brightness: f32,
+    /// How far the tone darkens as it rings, as a fraction of the onset cutoff:
+    /// the low-pass starts at the full `brightness` and settles to
+    /// `brightness / (1 + filter_env)` over `filter_decay_seconds`. This bright
+    /// transient that mellows as the note sustains is what tells a struck string
+    /// from a sine — the single biggest step towards a realistic tone.
+    pub filter_env: f32,
+    pub filter_decay_seconds: f32,
+    /// How much velocity brightens the tone, beyond making it louder. Zero
+    /// means a soft note and a hard one differ only in level; higher values
+    /// make a soft note as dark as it is quiet, the way a real instrument
+    /// responds to how hard it is played.
+    pub velocity_brightness: f32,
     /// Breath or bow noise mixed in.
     pub noise: f32,
     /// Detune between two stacked oscillators, in cents. Gives ensembles and
     /// pads their width; zero for anything that should sound like one player.
     pub detune_cents: f32,
+    /// Pitch vibrato: depth in cents, rate in Hz, and how long the note waits
+    /// before the vibrato swells in. Zero depth for anything struck or plucked;
+    /// a delayed, gentle vibrato is what brings bowed and blown notes to life.
+    pub vibrato_cents: f32,
+    pub vibrato_hz: f32,
+    pub vibrato_delay_seconds: f32,
     pub level: f32,
 }
 
@@ -123,8 +141,14 @@ impl Default for Patch {
             sustain: 0.6,
             release_seconds: 0.12,
             brightness: 8.0,
+            filter_env: 1.2,
+            filter_decay_seconds: 0.3,
+            velocity_brightness: 0.5,
             noise: 0.0,
             detune_cents: 0.0,
+            vibrato_cents: 0.0,
+            vibrato_hz: 5.0,
+            vibrato_delay_seconds: 0.3,
             level: 1.0,
         }
     }
@@ -156,6 +180,9 @@ pub fn patch_for_program(program: u8) -> Patch {
             sustain: 0.0,
             release_seconds: 0.18,
             brightness: 9.0,
+            filter_env: 2.2,
+            filter_decay_seconds: 0.35,
+            velocity_brightness: 0.7,
             ..Patch::default()
         },
         Family::ChromaticPercussion => Patch {
@@ -165,6 +192,9 @@ pub fn patch_for_program(program: u8) -> Patch {
             sustain: 0.0,
             release_seconds: 0.14,
             brightness: 14.0,
+            filter_env: 2.5,
+            filter_decay_seconds: 0.18,
+            velocity_brightness: 0.6,
             ..Patch::default()
         },
         Family::Organ => Patch {
@@ -175,6 +205,10 @@ pub fn patch_for_program(program: u8) -> Patch {
             sustain: 0.95,
             release_seconds: 0.06,
             brightness: 10.0,
+            // Electronic and near-static: barely any transient, level-flat.
+            filter_env: 0.25,
+            filter_decay_seconds: 0.1,
+            velocity_brightness: 0.15,
             ..Patch::default()
         },
         Family::Guitar => Patch {
@@ -184,6 +218,9 @@ pub fn patch_for_program(program: u8) -> Patch {
             sustain: 0.0,
             release_seconds: 0.16,
             brightness: 7.0,
+            filter_env: 2.0,
+            filter_decay_seconds: 0.3,
+            velocity_brightness: 0.7,
             ..Patch::default()
         },
         Family::Bass => Patch {
@@ -193,6 +230,9 @@ pub fn patch_for_program(program: u8) -> Patch {
             sustain: 0.25,
             release_seconds: 0.1,
             brightness: 5.0,
+            filter_env: 1.6,
+            filter_decay_seconds: 0.22,
+            velocity_brightness: 0.65,
             ..Patch::default()
         },
         Family::Strings => Patch {
@@ -202,8 +242,15 @@ pub fn patch_for_program(program: u8) -> Patch {
             sustain: 0.85,
             release_seconds: 0.32,
             brightness: 6.5,
+            // Bowed: soft, gradual onset, so little filter transient — the life
+            // comes from the vibrato instead.
+            filter_env: 0.4,
+            velocity_brightness: 0.4,
             noise: 0.015,
             detune_cents: 4.0,
+            vibrato_cents: 8.0,
+            vibrato_hz: 5.5,
+            vibrato_delay_seconds: 0.35,
             ..Patch::default()
         },
         Family::Ensemble => Patch {
@@ -213,8 +260,15 @@ pub fn patch_for_program(program: u8) -> Patch {
             sustain: 0.88,
             release_seconds: 0.4,
             brightness: 6.0,
+            filter_env: 0.3,
+            velocity_brightness: 0.35,
             noise: 0.02,
             detune_cents: 11.0,
+            // Many players never quite agree on the vibrato, so it is slower and
+            // shallower than a soloist's.
+            vibrato_cents: 5.0,
+            vibrato_hz: 4.8,
+            vibrato_delay_seconds: 0.45,
             ..Patch::default()
         },
         Family::Brass => Patch {
@@ -224,8 +278,16 @@ pub fn patch_for_program(program: u8) -> Patch {
             sustain: 0.8,
             release_seconds: 0.14,
             brightness: 9.0,
+            // Brass blares open when pushed: a strong onset and a big velocity
+            // response are most of what makes it read as brass.
+            filter_env: 1.3,
+            filter_decay_seconds: 0.12,
+            velocity_brightness: 0.85,
             noise: 0.01,
             detune_cents: 3.0,
+            vibrato_cents: 4.0,
+            vibrato_hz: 5.5,
+            vibrato_delay_seconds: 0.3,
             ..Patch::default()
         },
         Family::Reed => Patch {
@@ -236,7 +298,13 @@ pub fn patch_for_program(program: u8) -> Patch {
             sustain: 0.82,
             release_seconds: 0.12,
             brightness: 8.0,
+            filter_env: 0.8,
+            filter_decay_seconds: 0.15,
+            velocity_brightness: 0.6,
             noise: 0.035,
+            vibrato_cents: 7.0,
+            vibrato_hz: 5.0,
+            vibrato_delay_seconds: 0.3,
             ..Patch::default()
         },
         Family::Pipe => Patch {
@@ -246,7 +314,12 @@ pub fn patch_for_program(program: u8) -> Patch {
             sustain: 0.9,
             release_seconds: 0.13,
             brightness: 12.0,
+            filter_env: 0.5,
+            velocity_brightness: 0.4,
             noise: 0.09,
+            vibrato_cents: 9.0,
+            vibrato_hz: 5.0,
+            vibrato_delay_seconds: 0.25,
             ..Patch::default()
         },
         Family::SynthLead => Patch {
@@ -256,7 +329,12 @@ pub fn patch_for_program(program: u8) -> Patch {
             sustain: 0.75,
             release_seconds: 0.1,
             brightness: 7.0,
+            filter_env: 1.4,
+            filter_decay_seconds: 0.25,
             detune_cents: 7.0,
+            vibrato_cents: 8.0,
+            vibrato_hz: 6.0,
+            vibrato_delay_seconds: 0.2,
             ..Patch::default()
         },
         Family::SynthPad => Patch {
@@ -266,6 +344,9 @@ pub fn patch_for_program(program: u8) -> Patch {
             sustain: 0.8,
             release_seconds: 0.7,
             brightness: 4.5,
+            filter_env: 0.6,
+            filter_decay_seconds: 0.9,
+            velocity_brightness: 0.3,
             detune_cents: 14.0,
             ..Patch::default()
         },
@@ -357,12 +438,16 @@ fn refine(program: u8, mut patch: Patch) -> Patch {
             patch.harmonics = [1.0, 0.6, 0.42, 0.3, 0.2, 0.12, 0.07, 0.04];
             patch.brightness = 6.5;
         }
-        // Pizzicato strings and harp are plucked, not bowed.
+        // Pizzicato strings and harp are plucked, not bowed: a struck
+        // transient, and none of the family's vibrato.
         45 | 46 => {
             patch.attack_seconds = 0.002;
             patch.sustain = 0.0;
             patch.decay_seconds = 0.8;
             patch.noise = 0.0;
+            patch.filter_env = 1.8;
+            patch.filter_decay_seconds = 0.25;
+            patch.vibrato_cents = 0.0;
         }
         // Timpani.
         47 => {
@@ -370,17 +455,23 @@ fn refine(program: u8, mut patch: Patch) -> Patch {
             patch.sustain = 0.0;
             patch.decay_seconds = 1.4;
             patch.brightness = 4.0;
+            patch.filter_env = 1.2;
+            patch.vibrato_cents = 0.0;
         }
-        // Choir and voice: formant-ish, breathy, slow.
+        // Choir and voice: formant-ish, breathy, slow, with a human vibrato.
         52..=54 => {
             patch.harmonics = [1.0, 0.5, 0.62, 0.28, 0.18, 0.1, 0.05, 0.02];
             patch.noise = 0.05;
             patch.attack_seconds = 0.14;
+            patch.vibrato_cents = 6.0;
+            patch.vibrato_hz = 4.5;
+            patch.vibrato_delay_seconds = 0.4;
         }
-        // Muted trumpet is thin; brass sections are wide.
+        // Muted trumpet is thin and buzzy, with a tighter onset.
         59 => {
             patch.harmonics = [1.0, 0.4, 0.8, 0.3, 0.5, 0.2, 0.3, 0.12];
             patch.brightness = 11.0;
+            patch.filter_env = 0.9;
         }
         61..=63 => patch.detune_cents = 10.0,
         // Flutes and whistles are nearly pure with breath on top.
@@ -674,6 +765,40 @@ mod tests {
             assert!(patch.release_seconds > 0.0);
             assert!(patch.brightness > 0.0);
             assert!(patch.harmonics.iter().all(|gain| gain.is_finite()));
+        }
+    }
+
+    #[test]
+    fn every_program_has_sane_expression_parameters() {
+        for program in 0..=127_u8 {
+            let patch = patch_for_program(program);
+            assert!(patch.filter_env >= 0.0 && patch.filter_env.is_finite());
+            assert!(patch.filter_decay_seconds > 0.0);
+            assert!((0.0..=1.0).contains(&patch.velocity_brightness));
+            assert!(patch.vibrato_cents >= 0.0 && patch.vibrato_cents.is_finite());
+            assert!(patch.vibrato_hz > 0.0, "program {program} has a zero vibrato rate");
+            assert!(patch.vibrato_delay_seconds > 0.0);
+        }
+    }
+
+    #[test]
+    fn bowed_and_blown_instruments_waver_while_struck_ones_do_not() {
+        // Strings, a flute and a trumpet carry vibrato; a piano, a plucked
+        // string and a drum-like mallet do not.
+        for program in [40_u8, 48, 56, 73] {
+            assert!(
+                patch_for_program(program).vibrato_cents > 0.0,
+                "{} should have vibrato",
+                program_name(program)
+            );
+        }
+        for program in [0_u8, 24, 12, 45] {
+            assert_eq!(
+                patch_for_program(program).vibrato_cents,
+                0.0,
+                "{} should not waver",
+                program_name(program)
+            );
         }
     }
 

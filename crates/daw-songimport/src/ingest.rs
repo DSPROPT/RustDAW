@@ -164,13 +164,16 @@ pub fn ingest_project(
     }
 
     progress(1.0, "tempo");
-    let (tempo_map, first_downbeat, tempo_map_beats) =
-        detect_tempo(&audio_dir, options, target_rate, &mut notes);
+    let detection = detect_tempo(&audio_dir, options, target_rate, &mut notes);
+    let tempo_map_beats = detection.beats.clone();
+    // The click is a constant integer-BPM grid, so measure everything against
+    // that exact tempo: aligning the song to any other value leaves the very
+    // first bar off and the drift only grows.
+    let click_tempo = detection.click_bpm.round().clamp(20.0, 300.0);
 
-    // Shift the song so its first downbeat lands on bar 1 of the click. The
-    // offset is measured against the tempo the click will actually run at.
+    // Shift the song so its first downbeat lands on bar 1 of the click.
     let offset_seconds = if options.align_to_bar {
-        bar_alignment_offset(&tempo_map, first_downbeat, beats_per_bar)
+        bar_alignment_offset(click_tempo, detection.first_downbeat, beats_per_bar)
     } else {
         0.0
     };
@@ -197,7 +200,14 @@ pub fn ingest_project(
         tracks,
         ..ProjectDocument::default()
     };
-    document.set_tempo_map(tempo_map);
+    document.set_tempo_map(detection.tempo_map);
+    // `set_tempo_map` derives the tempo from the map's first interval, which is
+    // one noisy beat; overwrite it with the robust global tempo the click and
+    // the bar alignment were both computed from.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        document.tempo = click_tempo as u16;
+    }
 
     if options.detect_chords {
         progress(1.0, "chords");
@@ -256,9 +266,9 @@ fn detect_tempo(
     options: &IngestOptions,
     target_rate: u32,
     notes: &mut Vec<String>,
-) -> (TempoMap, f64, BeatGrid) {
+) -> TempoDetection {
     if !options.detect_tempo {
-        return (TempoMap::constant(120.0), 0.0, BeatGrid::default());
+        return TempoDetection::fallback(120.0);
     }
     let candidates = ["drums.wav", "other.wav", "bass.wav"];
     let Some(source) = candidates
@@ -267,17 +277,20 @@ fn detect_tempo(
         .find(|path| path.is_file())
     else {
         notes.push("Nothing to analyse for tempo; left at 120 BPM.".to_owned());
-        return (TempoMap::constant(120.0), 0.0, BeatGrid::default());
+        return TempoDetection::fallback(120.0);
     };
 
-    match daw_analysis::analyse_wav(&source, 3.0) {
+    // A wider tolerance keeps a steady song on one tempo: real recordings jitter
+    // by a few BPM per beat, and a tight threshold turns that noise into a string
+    // of spurious tempo changes that the click can never follow.
+    match daw_analysis::analyse_wav(&source, 6.0) {
         Ok(analysis) => {
             if !analysis.beats.is_usable() {
                 notes.push(
                     "No clear pulse was found; tempo is a fallback and bar lines are a guess."
                         .to_owned(),
                 );
-                return (analysis.tempo_map, 0.0, BeatGrid::default());
+                return TempoDetection::fallback(analysis.bpm());
             }
             let source_name = source
                 .file_stem()
@@ -293,17 +306,42 @@ fn detect_tempo(
                     analysis.tempo_map.points().len() - 1
                 ));
             }
-            let downbeat = analysis.beats.first_downbeat();
-            let grid = BeatGrid {
-                beat_times: analysis.beats.beat_times.clone(),
-                downbeat_index: analysis.beats.downbeat_index,
-            };
-            (analysis.tempo_map, downbeat, grid)
+            TempoDetection {
+                first_downbeat: analysis.beats.first_downbeat(),
+                beats: BeatGrid {
+                    beat_times: analysis.beats.beat_times.clone(),
+                    downbeat_index: analysis.beats.downbeat_index,
+                },
+                // The single global tempo drives the click; the map's tick-0
+                // value is one noisy interval and drifts against the song.
+                click_bpm: analysis.bpm(),
+                tempo_map: analysis.tempo_map,
+            }
         }
         Err(error) => {
             notes.push(format!("Tempo detection failed ({error}); left at 120 BPM."));
             let _ = target_rate;
-            (TempoMap::constant(120.0), 0.0, BeatGrid::default())
+            TempoDetection::fallback(120.0)
+        }
+    }
+}
+
+/// Everything tempo detection recovers: the map for MIDI and chords, the phase
+/// for bar alignment, and one robust global tempo for the constant click.
+struct TempoDetection {
+    tempo_map: TempoMap,
+    first_downbeat: f64,
+    beats: BeatGrid,
+    click_bpm: f64,
+}
+
+impl TempoDetection {
+    fn fallback(bpm: f64) -> Self {
+        Self {
+            tempo_map: TempoMap::constant(bpm),
+            first_downbeat: 0.0,
+            beats: BeatGrid::default(),
+            click_bpm: bpm,
         }
     }
 }
@@ -371,9 +409,15 @@ fn detect_chord_chart(
 }
 
 /// Seconds to delay the song so `first_downbeat` lands on a bar line.
-fn bar_alignment_offset(tempo: &TempoMap, first_downbeat: f64, beats_per_bar: u16) -> f64 {
-    let seconds_per_bar = tempo.seconds_per_bar(0, beats_per_bar);
-    if seconds_per_bar <= 0.0 || first_downbeat <= 0.0 {
+/// Seconds of silence to prepend so the first downbeat lands on a bar line of a
+/// constant `bpm` click. Measured at the exact tempo the click runs at, so the
+/// downbeat and the click's bar one coincide.
+fn bar_alignment_offset(bpm: f64, first_downbeat: f64, beats_per_bar: u16) -> f64 {
+    if bpm <= 0.0 || first_downbeat <= 0.0 {
+        return 0.0;
+    }
+    let seconds_per_bar = 60.0 / bpm * f64::from(beats_per_bar.max(1));
+    if seconds_per_bar <= 0.0 {
         return 0.0;
     }
     let position_in_bar = first_downbeat % seconds_per_bar;
@@ -454,8 +498,39 @@ fn import_midi_tracks(
 /// `volumedetect` rides along in the same pass so the peak costs no extra
 /// read; a stem is roughly 50 MB once converted and scanning them twice would
 /// double the import's disk traffic for nothing.
+/// The platform's usual way to install ffmpeg, for the error hint.
+fn ffmpeg_install_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "brew install ffmpeg"
+    } else {
+        "sudo apt install ffmpeg"
+    }
+}
+
+/// Resolves the ffmpeg binary to run.
+///
+/// A GUI app launched from Finder or Launchpad inherits a minimal `PATH`
+/// (`/usr/bin:/bin:…`) that excludes Homebrew, so a bare `ffmpeg` is not found
+/// even when it is installed. `FFMPEG` overrides; otherwise the common install
+/// locations are checked before falling back to the name on `PATH`.
+fn ffmpeg_program() -> std::path::PathBuf {
+    if let Some(explicit) = std::env::var_os("FFMPEG").filter(|value| !value.is_empty()) {
+        return std::path::PathBuf::from(explicit);
+    }
+    for candidate in [
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+    ] {
+        if Path::new(candidate).is_file() {
+            return std::path::PathBuf::from(candidate);
+        }
+    }
+    std::path::PathBuf::from("ffmpeg")
+}
+
 fn convert_audio(source: &Path, destination: &Path, target_rate: u32) -> Result<ConvertedAudio> {
-    let output = Command::new("ffmpeg")
+    let output = Command::new(ffmpeg_program())
         .arg("-nostdin")
         .arg("-y")
         .args(["-v", "info"])
@@ -467,7 +542,7 @@ fn convert_audio(source: &Path, destination: &Path, target_rate: u32) -> Result<
         .args(["-c:a", "pcm_s24le"])
         .arg(destination)
         .output()
-        .context("failed to run ffmpeg; install it with `sudo apt install ffmpeg`")?;
+        .with_context(|| format!("failed to run ffmpeg; install it with `{}`", ffmpeg_install_hint()))?;
 
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr);

@@ -223,6 +223,17 @@ pub struct RustDawApp {
     confirm_new_session: bool,
     status_message: String,
     pixels_per_second: f32,
+    /// When set, the timeline scrolls to keep the playhead in view during
+    /// playback. Off lets the user scroll freely while the transport runs.
+    follow_playhead: bool,
+    /// Real-time playback speed (varispeed). 1.0 is normal; changing it while
+    /// playing speeds up or slows down the song to audition a different tempo.
+    playback_speed: f32,
+    /// The timeline's current horizontal scroll offset in pixels, mirrored here
+    /// so the ruler above the tracks can be drawn scrolled in step with them.
+    timeline_scroll_x: f32,
+    /// Recent tap-tempo button presses, for estimating BPM by tapping.
+    tap_times: Vec<Instant>,
     free_disk_bytes: Option<u64>,
     last_disk_check: Instant,
     audio_preferences: AudioPreferences,
@@ -287,7 +298,11 @@ impl RustDawApp {
             confirm_new_session: false,
             status_message: "Ready".to_owned(),
             pixels_per_second: 84.0,
-            free_disk_bytes: recording_directory().and_then(|path| disk_free_bytes(&path).ok()),
+            follow_playhead: true,
+            playback_speed: 1.0,
+            timeline_scroll_x: 0.0,
+            tap_times: Vec::new(),
+            free_disk_bytes: disk_free_bytes(&recording_directory()).ok(),
             last_disk_check: Instant::now(),
             audio_preferences,
             available_inputs,
@@ -313,6 +328,7 @@ impl RustDawApp {
         if let Some(runtime) = &app.runtime {
             runtime.set_tempo(app.tempo);
             runtime.set_meter(app.meter_numerator, app.meter_denominator);
+            runtime.set_speed(app.playback_speed);
         }
         if let Err(error) = app.sync_playback() {
             app.status_message = format!("Media preload failed: {error}");
@@ -336,6 +352,7 @@ impl RustDawApp {
             Ok(runtime) => {
                 runtime.set_tempo(self.tempo);
                 runtime.set_meter(self.meter_numerator, self.meter_denominator);
+                runtime.set_speed(self.playback_speed);
                 runtime.set_click(self.click_enabled, self.click_level);
                 self.runtime = Some(runtime);
                 self.playback_synced = false;
@@ -505,6 +522,70 @@ impl RustDawApp {
         if !open && self.test_input_channel.take().is_some() {
             if let Some(runtime) = &self.runtime {
                 runtime.set_monitoring(false, 0, 0);
+            }
+        }
+    }
+
+    /// Registers a tap-tempo press: sets the BPM from the tap spacing and, while
+    /// playing, lines the click's downbeat up with the moment of the tap.
+    fn tap_tempo(&mut self) {
+        let now = Instant::now();
+        if self
+            .tap_times
+            .last()
+            .is_some_and(|last| now.duration_since(*last) > Duration::from_secs(2))
+        {
+            // A long gap means a fresh count-in, not a continuation.
+            self.tap_times.clear();
+        }
+        self.tap_times.push(now);
+        if self.tap_times.len() > 8 {
+            self.tap_times.remove(0);
+        }
+
+        if self.tap_times.len() >= 2 {
+            let mut intervals: Vec<f64> = self
+                .tap_times
+                .windows(2)
+                .map(|pair| pair[1].duration_since(pair[0]).as_secs_f64())
+                .collect();
+            intervals.sort_by(|left, right| {
+                left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let median = intervals[intervals.len() / 2];
+            if median > 0.0 {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let bpm = (60.0 / median).round().clamp(20.0, 300.0) as u16;
+                self.tempo = bpm;
+                if let Some(runtime) = &self.runtime {
+                    runtime.set_tempo(bpm);
+                }
+                self.dirty = true;
+            }
+        }
+
+        // Phase-align the click to this tap so bar one falls where you tapped.
+        if let Some(runtime) = &self.runtime {
+            let snapshot = self.snapshot();
+            let running = matches!(
+                snapshot.transport,
+                RuntimeTransportState::Playing
+                    | RuntimeTransportState::Recording
+                    | RuntimeTransportState::CountIn
+            );
+            if running {
+                let rate = f64::from(runtime.sample_rate().get());
+                let bar_frames = rate * 60.0 * 4.0 * f64::from(self.meter_numerator.max(1))
+                    / (f64::from(self.tempo.max(1)) * f64::from(self.meter_denominator.max(1)));
+                if bar_frames > 0.0 {
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        clippy::cast_precision_loss
+                    )]
+                    let offset = (snapshot.position_frames as f64 % bar_frames) as u64;
+                    runtime.set_click_offset(offset);
+                }
             }
         }
     }
@@ -871,7 +952,9 @@ impl RustDawApp {
                     runtime.set_tempo(document.tempo);
                     runtime.set_meter(document.meter_numerator, document.meter_denominator);
                     runtime.set_click(document.click_enabled, self.click_level);
+                    runtime.set_click_offset(0);
                 }
+                self.tap_times.clear();
                 self.session_name = document.name.clone();
                 self.tempo_map = document.tempo_map();
                 self.tempo = document.tempo;
@@ -1463,10 +1546,7 @@ impl RustDawApp {
             self.status_message = "Stop recording before exporting".to_owned();
             return;
         }
-        let destination = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("Exports")
-            .join("Current Mix.wav");
+        let destination = daw_core::media_dir("Exports").join("Current Mix.wav");
         match daw_render::export_stereo(&self.project_document(), &destination) {
             Ok(frames) => {
                 self.status_message = format!(
@@ -1486,7 +1566,11 @@ impl RustDawApp {
             runtime.seek_to_start();
             runtime.set_tempo(120);
             runtime.set_meter(4, 4);
+            runtime.set_speed(1.0);
+            runtime.set_click_offset(0);
         }
+        self.playback_speed = 1.0;
+        self.tap_times.clear();
         self.tracks = vec![Track::new(0, ChannelLayout::Mono)];
         self.session_name = "Untitled Session".to_owned();
         self.selected_track = 0;
@@ -1623,6 +1707,15 @@ impl RustDawApp {
             self.click_enabled = !self.click_enabled;
         }
         if context.input(|input| input.key_pressed(egui::Key::Home)) {
+            if let Some(runtime) = &self.runtime {
+                runtime.seek_to_start();
+            }
+        }
+        // Enter returns the playhead to the start, unless a text field has focus
+        // (where Enter confirms the edit instead of jumping the transport).
+        if !context.wants_keyboard_input()
+            && context.input(|input| input.key_pressed(egui::Key::Enter))
+        {
             if let Some(runtime) = &self.runtime {
                 runtime.seek_to_start();
             }
@@ -2045,6 +2138,16 @@ impl RustDawApp {
                         self.dirty = true;
                     }
                     ui.label("BPM");
+                    if ui
+                        .button("TAP")
+                        .on_hover_text(
+                            "Tap in time with the song to set the tempo. Tapping while it plays \
+                             also lines the click's downbeat up with your taps.",
+                        )
+                        .clicked()
+                    {
+                        self.tap_tempo();
+                    }
                     let mut meter = (self.meter_numerator, self.meter_denominator);
                     let meter_response = egui::ComboBox::from_id_salt("meter")
                         .selected_text(format!("{}/{}", meter.0, meter.1))
@@ -2061,6 +2164,39 @@ impl RustDawApp {
                         }
                         self.dirty = true;
                     }
+                    ui.separator();
+                    // Pitch-preserving playback tempo: a time-stretch multiplier
+                    // on the session tempo, shown as the tempo you actually hear.
+                    ui.label("PLAY");
+                    let base_bpm = f32::from(self.tempo.max(1));
+                    let speed_response = ui
+                        .add(
+                            egui::Slider::new(&mut self.playback_speed, 0.5..=2.0)
+                                .show_value(false)
+                                .custom_formatter(move |value, _| {
+                                    format!("{:.0} BPM", base_bpm * value as f32)
+                                }),
+                        )
+                        .on_hover_text(
+                            "Playback tempo without changing pitch. Drag to audition the song \
+                             faster or slower; double-click to return to the session tempo.",
+                        );
+                    if speed_response.changed() {
+                        if let Some(runtime) = &self.runtime {
+                            runtime.set_speed(self.playback_speed);
+                        }
+                    }
+                    if speed_response.double_clicked() {
+                        self.playback_speed = 1.0;
+                        if let Some(runtime) = &self.runtime {
+                            runtime.set_speed(1.0);
+                        }
+                    }
+                    ui.label(
+                        RichText::new(format!("{:.0} BPM", base_bpm * self.playback_speed))
+                            .small()
+                            .color(theme::MUTED),
+                    );
                     ui.separator();
                     if ui.selectable_label(self.click_enabled, "CLICK").clicked() {
                         self.click_enabled = !self.click_enabled;
@@ -2323,8 +2459,38 @@ impl RustDawApp {
         }
     }
 
+    /// The furthest point any clip reaches, in seconds — the timeline's length.
+    fn timeline_length_seconds(&self, sample_rate: u32) -> f32 {
+        let rate = sample_rate.max(1) as f32;
+        let audio = self
+            .tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .map(|clip| clip.end_frame as f32 / rate)
+            .fold(0.0_f32, f32::max);
+        let midi = self
+            .tracks
+            .iter()
+            .flat_map(|track| &track.midi_clips)
+            .map(|clip| self.tempo_map.tick_to_seconds(clip.end_tick()) as f32)
+            .fold(0.0_f32, f32::max);
+        audio.max(midi)
+    }
+
+    /// The timeline content width in pixels: long enough for the whole song plus
+    /// a little tail to scroll into, but never narrower than the viewport.
+    fn timeline_content_width(&self, viewport_width: f32, sample_rate: u32) -> f32 {
+        let song = (self.timeline_length_seconds(sample_rate) + 4.0) * self.pixels_per_second;
+        song.max(viewport_width).max(900.0)
+    }
+
     fn timeline_track(&mut self, ui: &mut egui::Ui, index: usize, snapshot: &RuntimeSnapshot) {
-        let desired = Vec2::new(ui.available_width().max(900.0), TRACK_HEIGHT);
+        let sample_rate = self
+            .runtime
+            .as_ref()
+            .map_or(48_000, |runtime| runtime.sample_rate().get());
+        let width = self.timeline_content_width(ui.available_width(), sample_rate);
+        let desired = Vec2::new(width, TRACK_HEIGHT);
         let (rect, track_response) = ui.allocate_exact_size(desired, Sense::click());
         let painter = ui.painter_at(rect);
         painter.rect_filled(
@@ -2354,10 +2520,6 @@ impl RustDawApp {
                 ),
             );
         }
-        let sample_rate = self
-            .runtime
-            .as_ref()
-            .map_or(48_000, |runtime| runtime.sample_rate().get());
         let mut selected_request = None;
         let mut drag_start_request = None;
         let mut drag_progress_request = None;
@@ -2575,8 +2737,7 @@ impl eframe::App for RustDawApp {
             self.import_audio_files(dropped_audio);
         }
         if self.last_disk_check.elapsed() >= Duration::from_secs(2) {
-            self.free_disk_bytes =
-                recording_directory().and_then(|path| disk_free_bytes(&path).ok());
+            self.free_disk_bytes = disk_free_bytes(&recording_directory()).ok();
             self.last_disk_check = Instant::now();
         }
         self.handle_shortcuts(context);
@@ -2620,6 +2781,7 @@ impl eframe::App for RustDawApp {
                             .logarithmic(true)
                             .custom_formatter(|value, _| format!("{value:.0} px/s")),
                     );
+                    ui.checkbox(&mut self.follow_playhead, "FOLLOW");
                     ui.separator();
                     if ui
                         .add_enabled(!self.undo_stack.is_empty(), egui::Button::new("UNDO"))
@@ -2746,10 +2908,16 @@ impl eframe::App for RustDawApp {
                 );
                 let painter = ui.painter_at(ruler);
                 painter.rect_filled(ruler, 0.0, theme::PANEL_2);
-                for second in 0..=120 {
-                    let x = ruler.left() + second as f32 * self.pixels_per_second;
+                // The ruler is drawn scrolled by the same offset as the tracks
+                // below it, so its time labels always sit over the right frames.
+                for second in 0..=600 {
+                    let x = ruler.left() + second as f32 * self.pixels_per_second
+                        - self.timeline_scroll_x;
                     if x > ruler.right() {
                         break;
+                    }
+                    if x < ruler.left() - 4.0 {
+                        continue;
                     }
                     if second % 5 == 0 {
                         painter.text(
@@ -2761,13 +2929,34 @@ impl eframe::App for RustDawApp {
                         );
                     }
                 }
-                egui::ScrollArea::both()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for index in 0..self.tracks.len() {
-                            self.timeline_track(ui, index, &snapshot);
-                        }
-                    });
+                // While the transport runs, keep the playhead in view by
+                // scrolling the timeline so it sits near the centre. The user
+                // can turn this off, or it yields as soon as playback stops.
+                let is_running = matches!(
+                    snapshot.transport,
+                    RuntimeTransportState::Playing
+                        | RuntimeTransportState::Recording
+                        | RuntimeTransportState::CountIn
+                );
+                let mut timeline = egui::ScrollArea::both().auto_shrink([false, false]);
+                if self.follow_playhead && is_running {
+                    let sample_rate = self
+                        .runtime
+                        .as_ref()
+                        .map_or(48_000, |runtime| runtime.sample_rate().get());
+                    let playhead_x = snapshot.position_frames as f32 / sample_rate as f32
+                        * self.pixels_per_second;
+                    let target = (playhead_x - ui.available_width() * 0.5).max(0.0);
+                    timeline = timeline.horizontal_scroll_offset(target);
+                }
+                let output = timeline.show(ui, |ui| {
+                    for index in 0..self.tracks.len() {
+                        self.timeline_track(ui, index, &snapshot);
+                    }
+                });
+                // Mirror the actual (clamped) offset so the ruler tracks it next
+                // frame, whether the scroll came from following or the user.
+                self.timeline_scroll_x = output.state.offset.x;
             });
 
         if let Some(error) = &self.audio_error {
@@ -3509,16 +3698,13 @@ fn recording_path(track_index: usize) -> anyhow::Result<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let directory = recording_directory()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve the recording directory"))?;
+    let directory = recording_directory();
     std::fs::create_dir_all(&directory)?;
     Ok(directory.join(format!("Audio_{:02}_{timestamp}.wav", track_index + 1)))
 }
 
-fn recording_directory() -> Option<PathBuf> {
-    std::env::current_dir()
-        .ok()
-        .map(|path| path.join("Recordings"))
+fn recording_directory() -> PathBuf {
+    daw_core::media_dir("Recordings")
 }
 
 fn disk_free_bytes(path: &std::path::Path) -> anyhow::Result<u64> {
@@ -3602,10 +3788,7 @@ fn save_audio_preferences(preferences: &AudioPreferences) -> anyhow::Result<()> 
 }
 
 fn default_session_path() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("Sessions")
-        .join("Current.rustdaw.json")
+    daw_core::media_dir("Sessions").join("Current.rustdaw.json")
 }
 
 fn analyze_waveform(path: &std::path::Path) -> Vec<f32> {

@@ -1,0 +1,12 @@
+# Core song-import worker dependencies — required. Installed into the worker's
+# own virtualenv by install.sh; kept out of the Rust build entirely.
+#
+# Demucs pulls in torch/torchaudio and does the stem separation. yt-dlp
+# downloads the source; librosa detects the tempo. These install cleanly on
+# macOS (Apple Silicon) and Ubuntu on Python 3.10-3.12.
+demucs>=4.0
+yt-dlp>=2024.1
+librosa>=0.10
+pretty_midi>=0.2.10
+soundfile>=0.12
+numpy>=1.24

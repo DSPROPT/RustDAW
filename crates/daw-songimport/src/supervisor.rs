@@ -18,12 +18,19 @@ const PORT_VARIABLE: &str = "CHORDS_STUDIO_PORT";
 const LAUNCHER_VARIABLE: &str = "CHORDS_STUDIO_LAUNCHER";
 
 const DEFAULT_PORT: u16 = 8765;
-const DEFAULT_DATA_DIR: &str = ".local/share/chords-extraction";
 
-/// Candidate locations for the launcher script, tried in order.
-const LAUNCHER_CANDIDATES: [&str; 3] = [
-    "Documents/chords-extraction/bin/chords-studio-servers",
+/// The folder name the worker's data lives under, inside whichever per-user data
+/// directory the platform uses.
+const DATA_DIR_NAME: &str = "chords-extraction";
+
+/// Candidate locations for the launcher script, relative to `$HOME`, tried in
+/// order. `.local/bin` is where the install script drops it on every platform;
+/// the rest cover manual and macOS-conventional installs.
+const LAUNCHER_CANDIDATES: [&str; 5] = [
     ".local/bin/chords-studio-servers",
+    "Library/Application Support/chords-extraction/bin/chords-studio-servers",
+    ".local/share/chords-extraction/bin/chords-studio-servers",
+    "Documents/chords-extraction/bin/chords-studio-servers",
     "chords-extraction/bin/chords-studio-servers",
 ];
 
@@ -34,13 +41,37 @@ pub fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The per-user data directories the worker may live under, most preferred
+/// first. macOS uses `~/Library/Application Support`; every platform also
+/// accepts the XDG `~/.local/share` location so a single install layout works
+/// on both, and an existing installation is always found wherever it sits.
+fn data_dir_candidates(home: &Path) -> Vec<PathBuf> {
+    // The XDG location is always accepted; macOS prefers Application Support and
+    // so puts it first.
+    #[allow(unused_mut)]
+    let mut candidates = vec![home.join(".local/share").join(DATA_DIR_NAME)];
+    #[cfg(target_os = "macos")]
+    candidates.insert(0, home.join("Library/Application Support").join(DATA_DIR_NAME));
+    candidates
+}
+
 /// The worker's data directory: projects, models, logs and the virtualenv.
+///
+/// An explicit `CHORDS_STUDIO_DATA` wins. Otherwise an existing installation is
+/// preferred wherever it is found, falling back to the platform's conventional
+/// location when nothing is installed yet.
 #[must_use]
 pub fn data_dir() -> Option<PathBuf> {
     if let Some(value) = std::env::var_os(DATA_DIR_VARIABLE).filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(value));
     }
-    home_dir().map(|home| home.join(DEFAULT_DATA_DIR))
+    let home = home_dir()?;
+    let candidates = data_dir_candidates(&home);
+    candidates
+        .iter()
+        .find(|path| path.is_dir())
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
 }
 
 /// Where finished song projects live.
@@ -150,6 +181,27 @@ mod tests {
     #[test]
     fn base_url_is_always_loopback() {
         assert!(base_url().starts_with("http://127.0.0.1:"));
+    }
+
+    #[test]
+    fn data_dir_lands_in_the_worker_folder_on_every_platform() {
+        let home = Path::new("/home/tester");
+        let candidates = data_dir_candidates(home);
+        assert!(!candidates.is_empty());
+        assert!(
+            candidates.iter().all(|path| path.ends_with(DATA_DIR_NAME)),
+            "every candidate must be the chords-extraction folder"
+        );
+        // macOS prefers Application Support; the XDG path is always accepted too.
+        if cfg!(target_os = "macos") {
+            assert!(candidates[0].starts_with("/home/tester/Library/Application Support"));
+        }
+        assert!(
+            candidates
+                .iter()
+                .any(|path| path.starts_with("/home/tester/.local/share")),
+            "the XDG location must always be a candidate for a shared layout"
+        );
     }
 
     #[test]

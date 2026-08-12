@@ -143,8 +143,11 @@ fn ensure_worker(client: &WorkerClient, on_progress: &mut impl FnMut(ImportProgr
     }
     if !supervisor::is_installed() {
         bail!(
-            "DSPRO Studio is not installed. Song import needs its Python worker (Demucs and \
-             basic-pitch) in ~/.local/share/chords-extraction."
+            "The song-import worker is not installed. Install it once with \
+             `crates/daw-songimport/worker/install.sh` (macOS and Ubuntu); it sets up a Python \
+             environment with Demucs and basic-pitch under {}.",
+            supervisor::data_dir()
+                .map_or_else(|| "the worker data directory".to_owned(), |dir| dir.display().to_string())
         );
     }
     on_progress(ImportProgress::Status(
@@ -190,12 +193,12 @@ fn run_pipeline(
 }
 
 /// Default location for imported songs: a `Songs` folder beside the
-/// application's `Recordings` and `Sessions` directories.
+/// application's `Recordings` and `Sessions` directories, under the writable
+/// media root (which falls back to `~/RustDAW` when the working directory is not
+/// writable, as it is for a Finder-launched app).
 #[must_use]
 pub fn default_song_root() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("Songs")
+    daw_core::media_dir("Songs")
 }
 
 #[cfg(test)]

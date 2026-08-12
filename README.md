@@ -152,24 +152,50 @@ cargo run --release -p daw-analysis --example detect-chords -- <project-dir>
 ## Song import
 
 **IMPORT SONG** in the bottom bar turns a song into instrument tracks you can
-play along with. Paste a link and the song is downloaded and separated on the
-GPU into drums, bass, guitar, piano, other and vocals; each stem becomes a
-stereo track, and the session tempo and meter come from the detected beat grid.
+play along with. Paste a link and the song is downloaded and separated on this
+machine (a CUDA GPU or Apple Silicon where available, otherwise the CPU) into
+drums, bass, guitar, piano, other and vocals; each stem becomes a stereo track,
+and the session tempo and meter come from the detected beat grid.
 Songs that have already been processed are listed in the same window and import
 in about a second, because only format conversion is left to do.
 
-The transcription is imported too: each pitched MIDI track becomes an instrument
-track you can edit in the piano roll and hear against the stems. Drum MIDI is
-left out — the synth is pitched and cannot play a kit, and the drum stem already
-covers it. Tempo comes from the detector above rather than from the pipeline's
-beat grid, and the notes are rebased through seconds so a transcription written
-at 120 BPM still lines up when the song turns out to be 94.
+When transcription is available, it is imported too: each pitched MIDI track
+becomes an instrument track you can edit in the piano roll and hear against the
+stems. Drum MIDI is left out — the synth is pitched and cannot play a kit, and
+the drum stem already covers it. Tempo comes from the detector above rather than
+from the pipeline's beat grid, and the notes are rebased through seconds so a
+transcription written at 120 BPM still lines up when the song turns out to be 94.
+Transcription (basic-pitch) is optional: it installs on Ubuntu and on macOS with
+Python 3.10/3.11, and is simply skipped elsewhere, in which case a song imports
+as stems only.
 
-The separation itself is Demucs, running in the DSPRO Studio Python worker
-already installed in `~/.local/share/chords-extraction`. RustDAW talks to it
-over loopback HTTP and starts it if it is not answering; nothing is uploaded
-anywhere. Set `CHORDS_STUDIO_LAUNCHER` if `bin/chords-studio-servers` lives
-somewhere unusual.
+The separation itself is Demucs and the transcription is basic-pitch, run by a
+self-contained Python worker that ships in this repo under
+[`crates/daw-songimport/worker`](crates/daw-songimport/worker). Install it once
+per machine — the same script works on macOS and Ubuntu:
+
+```bash
+crates/daw-songimport/worker/install.sh
+```
+
+It creates a virtualenv under the platform's data directory
+(`~/Library/Application Support/chords-extraction` on macOS,
+`~/.local/share/chords-extraction` on Linux) and drops a launcher RustDAW finds
+automatically. RustDAW talks to the worker over loopback HTTP and starts it if it
+is not answering; nothing is uploaded anywhere. The heavy model checkpoints
+(~2–3 GB) download on the first real import, not at install time. Set
+`CHORDS_STUDIO_LAUNCHER` if the launcher lives somewhere unusual, or
+`CHORDS_STUDIO_DATA` to relocate the whole install.
+
+Verify the RustDAW↔worker wiring without any model download by importing a
+synthetic project:
+
+```bash
+# Create a self-test project, then import it from the command line.
+"$HOME/.local/share/chords-extraction/venv/bin/python" \
+  "$HOME/.local/share/chords-extraction/app/store.py" --self-test
+cargo run -p daw-songimport --example import-song -- <printed-id>
+```
 
 Stems are produced at 44.1 kHz, so they are converted once at import to the
 session's rate with ffmpeg and written into `Songs/<name>/Audio/` as 24-bit

@@ -1,0 +1,9 @@
+# Optional MIDI transcription dependency. basic-pitch turns the melodic stems
+# into playable instrument tracks. It is best-effort: separation, tempo and
+# chords all work without it, and RustDAW imports fine when no MIDI is present.
+#
+# basic-pitch hard-depends on tensorflow-macos on macOS, which currently has no
+# wheel for Python 3.12+/Apple Silicon, so install.sh installs this only when it
+# can and never fails the whole install if it cannot. It installs cleanly on
+# Ubuntu, and on macOS under a Python 3.10/3.11 interpreter.
+basic-pitch>=0.3
