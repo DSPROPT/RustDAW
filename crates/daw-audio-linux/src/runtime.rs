@@ -24,6 +24,10 @@ const CLICK_SCRATCH_FRAMES: usize = 2_048;
 const PLAYBACK_COMMAND_CAPACITY: usize = 128;
 const PLAYBACK_SLOT_CAPACITY: usize = 64;
 const MONITOR_QUEUE_FRAMES: usize = 8_192;
+/// Input frames held for the tuner. Pitch detection needs two periods of the
+/// lowest note it looks for — a bass low B is over 1,500 frames — and the
+/// interface drains this at its own pace, so it wants headroom.
+const TUNER_QUEUE_FRAMES: usize = 32_768;
 /// The shortest monitor backlog worth keeping. Below a block or so the two
 /// streams' ordinary jitter starts causing dropouts instead of latency.
 const MONITOR_MIN_QUEUE_FRAMES: usize = 64;
@@ -157,6 +161,9 @@ struct Shared {
     writer_ready: AtomicBool,
     disk_error: AtomicBool,
     monitoring: AtomicBool,
+    /// Whether the input is being tapped for the tuner. Off by default: it
+    /// costs nothing to leave a queue unfed.
+    tuning: AtomicBool,
     monitor_left: AtomicUsize,
     monitor_right: AtomicUsize,
     output_test_frames: AtomicU64,
@@ -192,6 +199,7 @@ impl Shared {
             writer_ready: AtomicBool::new(false),
             disk_error: AtomicBool::new(false),
             monitoring: AtomicBool::new(false),
+            tuning: AtomicBool::new(false),
             monitor_left: AtomicUsize::new(0),
             monitor_right: AtomicUsize::new(1),
             output_test_frames: AtomicU64::new(0),
@@ -387,6 +395,8 @@ pub struct AudioRuntime {
     retired_midi: Arc<ArrayQueue<MidiPart>>,
     retired_nam: Arc<ArrayQueue<ActiveNam>>,
     playback_cache: Mutex<HashMap<PathBuf, Arc<Vec<[f32; 2]>>>>,
+    /// Raw input frames for the tuner, filled only while it is open.
+    tuner_queue: Arc<ArrayQueue<f32>>,
     _input_stream: Stream,
     _output_stream: Stream,
     sample_rate: SampleRate,
@@ -446,6 +456,7 @@ impl AudioRuntime {
         let retired_midi = Arc::new(ArrayQueue::new(RETIRED_PLAYBACK_CAPACITY));
         let retired_nam = Arc::new(ArrayQueue::new(RETIRED_NAM_CAPACITY));
         let monitor_queue = Arc::new(ArrayQueue::new(MONITOR_QUEUE_FRAMES));
+        let tuner_queue = Arc::new(ArrayQueue::new(TUNER_QUEUE_FRAMES));
         let queue_capacity = usize::try_from(sample_rate.get())
             .unwrap_or(48_000)
             .saturating_mul(RECORD_QUEUE_SECONDS);
@@ -476,6 +487,7 @@ impl AudioRuntime {
             Arc::clone(&shared),
             record_queue,
             Arc::clone(&monitor_queue),
+            Arc::clone(&tuner_queue),
         )?;
         // Loading a sound font reads tens of megabytes off disk and allocates
         // heavily, so it happens here rather than anywhere near the callback.
@@ -519,6 +531,7 @@ impl AudioRuntime {
             retired_midi,
             retired_nam,
             playback_cache: Mutex::new(HashMap::new()),
+            tuner_queue,
             _input_stream: input_stream,
             _output_stream: output_stream,
             sample_rate,
@@ -534,6 +547,32 @@ impl AudioRuntime {
     #[must_use]
     pub const fn sample_rate(&self) -> SampleRate {
         self.sample_rate
+    }
+
+    /// Starts or stops tapping the input for the tuner.
+    ///
+    /// Off by default. While off nothing is written to the queue at all, so an
+    /// unopened tuner costs the audio thread a single atomic load per frame.
+    pub fn set_tuning(&self, enabled: bool) {
+        if !enabled {
+            while self.tuner_queue.pop().is_some() {}
+        }
+        self.shared.tuning.store(enabled, Ordering::Release);
+    }
+
+    /// Appends whatever the input has captured since the last call to `window`,
+    /// keeping it at most `capacity` frames long.
+    ///
+    /// The caller keeps the window and slides it, so pitch detection sees a
+    /// continuous signal rather than whatever one interface callback held.
+    pub fn drain_tuner(&self, window: &mut Vec<f32>, capacity: usize) {
+        while let Some(sample) = self.tuner_queue.pop() {
+            window.push(sample);
+        }
+        if window.len() > capacity {
+            // Keep the newest: a tuner shows what is being played now.
+            window.drain(..window.len() - capacity);
+        }
     }
 
     /// The sound font instrument tracks are playing from, or `None` when they
@@ -1132,6 +1171,7 @@ fn build_input(
     shared: Arc<Shared>,
     queue: Arc<ArrayQueue<[f32; 2]>>,
     monitor_queue: Arc<ArrayQueue<[f32; 2]>>,
+    tuner_queue: Arc<ArrayQueue<f32>>,
 ) -> Result<Stream> {
     let channels = usize::from(config.channels);
     let stream = match format {
@@ -1141,6 +1181,7 @@ fn build_input(
             shared,
             queue,
             monitor_queue,
+            tuner_queue,
             channels,
             |value: f32| value,
         ),
@@ -1150,6 +1191,7 @@ fn build_input(
             shared,
             queue,
             monitor_queue,
+            tuner_queue,
             channels,
             |value: i16| f32::from(value) / f32::from(i16::MAX),
         ),
@@ -1159,6 +1201,7 @@ fn build_input(
             shared,
             queue,
             monitor_queue,
+            tuner_queue,
             channels,
             |value: i32| {
                 #[allow(clippy::cast_precision_loss)]
@@ -1178,6 +1221,7 @@ fn input_stream<T: cpal::SizedSample + Copy + Send + 'static>(
     shared: Arc<Shared>,
     queue: Arc<ArrayQueue<[f32; 2]>>,
     monitor_queue: Arc<ArrayQueue<[f32; 2]>>,
+    tuner_queue: Arc<ArrayQueue<f32>>,
     channels: usize,
     convert: fn(T) -> f32,
 ) -> Result<Stream> {
@@ -1186,7 +1230,15 @@ fn input_stream<T: cpal::SizedSample + Copy + Send + 'static>(
         .build_input_stream::<T, _, _>(
             config,
             move |data, _| {
-                capture_input(data, channels, convert, &shared, &queue, &monitor_queue);
+                capture_input(
+                    data,
+                    channels,
+                    convert,
+                    &shared,
+                    &queue,
+                    &monitor_queue,
+                    &tuner_queue,
+                );
             },
             move |_| {
                 error_shared.xruns.fetch_add(1, Ordering::Relaxed);
@@ -1203,6 +1255,7 @@ fn capture_input<T: Copy>(
     shared: &Shared,
     queue: &ArrayQueue<[f32; 2]>,
     monitor_queue: &ArrayQueue<[f32; 2]>,
+    tuner_queue: &ArrayQueue<f32>,
 ) {
     if channels == 0 {
         return;
@@ -1215,6 +1268,7 @@ fn capture_input<T: Copy>(
         .min(channels - 1);
     let recording = shared.recording.load(Ordering::Acquire);
     let monitoring = shared.monitoring.load(Ordering::Acquire);
+    let tuning = shared.tuning.load(Ordering::Acquire);
     let monitor_left = shared
         .monitor_left
         .load(Ordering::Relaxed)
@@ -1237,6 +1291,12 @@ fn capture_input<T: Copy>(
         if monitoring {
             let _ =
                 monitor_queue.push([convert(frame[monitor_left]), convert(frame[monitor_right])]);
+        }
+        if tuning {
+            // The tuner listens to the recording channel, which is the one the
+            // instrument is plugged into. Dropping when full is correct: a
+            // backlog is stale pitch, and stale pitch is worse than none.
+            let _ = tuner_queue.push(convert(frame[left]));
         }
     }
     for (atom, peak) in shared.input_peaks.iter().zip(peaks) {
@@ -2888,6 +2948,37 @@ mod tests {
             &mut None,
         );
         (left, queue)
+    }
+
+    #[test]
+    fn the_tuner_window_keeps_the_newest_input() {
+        // A tuner shows what is being played now. A window that grew without
+        // bound, or kept its oldest samples, would show what was played a
+        // second ago and chase the needle behind the note.
+        let queue: ArrayQueue<f32> = ArrayQueue::new(TUNER_QUEUE_FRAMES);
+        for index in 0..5_000 {
+            queue.push(index as f32).expect("push");
+        }
+        let mut window = Vec::new();
+        // Same logic as `drain_tuner`, which needs a live runtime to call.
+        while let Some(sample) = queue.pop() {
+            window.push(sample);
+        }
+        let capacity = 4_096;
+        if window.len() > capacity {
+            window.drain(..window.len() - capacity);
+        }
+        assert_eq!(window.len(), capacity);
+        assert!(
+            (window[capacity - 1] - 4_999.0).abs() < f32::EPSILON,
+            "the newest sample was dropped: {}",
+            window[capacity - 1]
+        );
+        assert!(
+            window[0] > 900.0,
+            "the oldest samples were kept instead of the newest: {}",
+            window[0]
+        );
     }
 
     #[test]

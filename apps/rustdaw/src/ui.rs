@@ -255,6 +255,10 @@ pub struct RustDawApp {
     song_import: SongImportState,
     tempo_map: TempoMap,
     piano_roll: PianoRollState,
+    tuner: crate::tuner::TunerState,
+    /// When the tuner last ran, so the needle's smoothing is in real time
+    /// rather than per frame.
+    tuner_ticked: Instant,
     /// Amp captures found on disk. Scanned once and on request rather than per
     /// frame: the FX window repaints continuously and the scan touches disk.
     amp_library: Vec<daw_nam::AmpModel>,
@@ -331,6 +335,8 @@ impl RustDawApp {
             song_import: SongImportState::default(),
             tempo_map: document_tempo_map,
             piano_roll: PianoRollState::default(),
+            tuner: crate::tuner::TunerState::default(),
+            tuner_ticked: Instant::now(),
         };
         if app.tracks.is_empty() {
             app.tracks.push(Track::new(0, ChannelLayout::Mono));
@@ -1843,6 +1849,30 @@ impl RustDawApp {
         }
     }
 
+    /// Feeds the tuner and draws it.
+    ///
+    /// The tap on the input is opened only while the window is, so a closed
+    /// tuner costs the audio thread nothing but an atomic load.
+    fn run_tuner(&mut self, context: &egui::Context) {
+        let Some(runtime) = &self.runtime else {
+            self.tuner.open = false;
+            return;
+        };
+        runtime.set_tuning(self.tuner.open);
+        if !self.tuner.open {
+            return;
+        }
+        runtime.drain_tuner(self.tuner.window_mut(), crate::tuner::WINDOW_FRAMES);
+        let elapsed = self.tuner_ticked.elapsed().as_secs_f32();
+        self.tuner_ticked = Instant::now();
+        #[allow(clippy::cast_precision_loss)]
+        let rate = runtime.sample_rate().get() as f32;
+        self.tuner.analyse(rate, elapsed);
+        crate::tuner::window(context, &mut self.tuner);
+        // A needle has to move between input events, not only when the mouse does.
+        context.request_repaint_after(std::time::Duration::from_millis(33));
+    }
+
     fn mixer_window(&mut self, context: &egui::Context, snapshot: &RuntimeSnapshot) {
         if !self.mixer_open {
             return;
@@ -3321,6 +3351,16 @@ impl eframe::App for RustDawApp {
                     if ui.button("MIX").clicked() {
                         self.mixer_open = true;
                     }
+                    if ui
+                        .selectable_label(self.tuner.open, "TUNER")
+                        .on_hover_text(
+                            "Tune the instrument on the armed track's input.\nListens whether \
+                             or not the transport is running.",
+                        )
+                        .clicked()
+                    {
+                        self.tuner.open = !self.tuner.open;
+                    }
                     if ui.button("EXPORT MIX").clicked() {
                         self.export_mix();
                     }
@@ -3551,6 +3591,7 @@ impl eframe::App for RustDawApp {
         self.audio_settings(context, &snapshot);
         self.mixer_window(context, &snapshot);
         self.inserts_window(context, &snapshot);
+        self.run_tuner(context);
         self.poll_song_import(context);
         self.poll_amp_fetch();
         self.song_import_window(context);

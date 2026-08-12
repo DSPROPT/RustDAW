@@ -2999,6 +2999,7 @@ name = "rustdaw"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "daw-analysis",
  "daw-audio-linux",
  "daw-core",
  "daw-engine",

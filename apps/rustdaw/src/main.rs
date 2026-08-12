@@ -1,4 +1,5 @@
 mod piano_roll;
+mod tuner;
 mod theme;
 mod ui;
 

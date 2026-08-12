@@ -19,12 +19,14 @@ pub mod chords;
 pub mod chroma;
 pub mod fft;
 pub mod onset;
+pub mod pitch;
 
 use anyhow::{Context, Result};
 use std::path::Path;
 
 pub use beats::BeatAnalysis;
 pub use onset::OnsetEnvelope;
+pub use pitch::{Pitch, detect};
 
 use daw_midi::TempoMap;
 
