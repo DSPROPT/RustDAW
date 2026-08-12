@@ -36,6 +36,60 @@ files remain dry. Insert settings are stored in the session document.
 The channel-strip window uses console-style rotary controls, illuminated
 module switches, a live segmented input meter, an EQ response graph, and
 dynamics activity indicators.
+
+Audio tracks can also enable the **NAM GUITAR AMP** module in the FX window.
+Choose a `.nam` capture, then use INPUT and OUTPUT calibration around the model.
+NAM is instantiated only for tracks where it is enabled; model loading and
+prewarming stay off the real-time audio callback. The amp is applied to live
+software monitoring, timeline playback, and stereo export, and its path and
+settings are saved with the session. NAM captures must match the session sample
+rate (normally 48 kHz).
+
+Captures are chosen from a menu rather than a file dialog. Drop `.nam` files
+into `Amps/` beside `Recordings/` and `Sessions/` — nested folders are searched,
+so a downloaded pack can be unzipped as it comes — and they appear in the amp
+module's list. **RESCAN** picks up whatever has arrived since. A collection kept
+elsewhere is found too (`~/Documents/NAM`, `~/NAM`, `~/.nam`), or point
+`RUSTDAW_AMP_MODELS` at it. To see what RustDAW can find:
+
+```bash
+cargo run -p daw-nam --example list-amps
+```
+
+**GET AMPS** loads a capture from
+[TONE3000](https://www.tone3000.com/), where thousands are shared for free.
+Given a publishable key it opens TONE3000's own picker in the browser, waits
+for you to choose, and drops the capture straight onto the track; without one
+it just opens the site to download by hand. Put the key in `.env` at the
+workspace root and it is compiled in:
+
+```bash
+TONE3000_PUBLISHABLE_KEY=t3k_pk_…
+```
+
+Register `http://localhost:3001` as the redirect URI, or set
+`TONE3000_REDIRECT_PORT` to match what you registered. To check the link
+without signing in:
+
+```bash
+cargo run -p daw-tone3000 --example check-link
+```
+
+Sign-in uses OAuth with PKCE and the publishable key alone. **Never put the
+secret key in `.env`-backed builds**: it is a server credential, and anything
+compiled into a desktop binary can be read straight back out of it with
+`strings`. The build script reads only the publishable key for that reason.
+
+Captures are not bundled: they belong to the people who made them, and
+TONE3000's terms permit downloading one at a user's request but not
+redistributing, mirroring or bundling their catalogue.
+
+NeuralAmpModelerCore is pinned as a Git submodule. After cloning RustDAW, fetch
+it and its Eigen dependency before building:
+
+```bash
+git submodule update --init --recursive
+```
 EQ, compressor, and gate parameters are applied block-by-block in the real-time
 audio engine. Turning a control sends a bounded parameter command and never
 reloads or reprocesses an entire WAV file.
@@ -80,8 +134,9 @@ with the installed launcher instead of showing a generic application icon.
 
 ## MIDI, the piano roll, and tempo
 
-Instrument tracks hold notes rather than audio and are played by a built-in
-polyphonic synth. Open the **PIANO ROLL** from the bottom bar, or double-click a
+Instrument tracks hold notes rather than audio and are played by a SoundFont or
+the built-in synth (see [Instruments and chords](#instruments-and-chords)). Open
+the **PIANO ROLL** from the bottom bar, or double-click a
 MIDI clip in the timeline: double-click adds a note, drag moves it, its right
 edge changes the length, `Del` removes it, and the grid snaps to anything from
 whole notes to 1/32. Velocity sets each note's brightness as well as its level.
@@ -115,14 +170,47 @@ what random alignment scores:
 
 ## Instruments and chords
 
-Instrument tracks play a **General MIDI bank** synthesised in Rust: all 128
-programs, described by a harmonic recipe, an envelope, a brightness and a
-little noise, plus the channel-10 drum kit as pitch-swept tones and filtered
-noise. A piano decays on its own, an organ holds, a flute is mostly breath, and
-a kick is not a low beep. Nothing is downloaded and nothing is bundled — a
-sampled bank would sound better and cost a 140 MB dependency that sessions
-would break without. Imported MIDI keeps the program each track asks for, and
-drum tracks land on the kit.
+Instrument tracks play from a **SoundFont** when one is installed, and from a
+**General MIDI bank synthesised in Rust** when one is not. Imported MIDI keeps
+the program each track asks for, and drum tracks land on the kit either way.
+
+Any `.sf2` file works. RustDAW looks in the usual places — `/usr/share/soundfonts`,
+`/usr/share/sounds/sf2` — so installing your distribution's package is enough:
+
+```bash
+sudo apt install fluid-soundfont-gm      # Debian, Ubuntu
+sudo pacman -S soundfont-fluid           # Arch
+```
+
+To use one kept somewhere else, point `RUSTDAW_SOUNDFONT` at it. The audio
+settings panel shows which is playing. Nothing is downloaded and nothing is
+bundled: with no SoundFont anywhere, the synthesised bank plays and the session
+still opens.
+
+To check what will be picked up, and that its levels line up with the
+synthesised bank:
+
+```bash
+cargo run -p daw-engine --release --example check-soundfont
+```
+
+The synthesised bank covers all 128 programs plus the channel-10 kit, and is
+built to sound like instruments rather than like a synthesiser: exponential
+envelopes, band-limited wavetables mip-mapped per octave so a bass note keeps
+its harmonics, decay that tracks the keyboard the way a piano's does, a noise
+transient at every onset for the hammer or the pick or the breath, detuned
+unison spread across the stereo field, per-note variation in tuning and timbre
+so no two hits are identical, and a shared reverb bus behind all of it. A piano
+decays on its own, an organ holds, a flute is mostly breath, and a kick is not a
+low beep. Every program is level-matched to within a few decibels of the rest.
+
+To hear the whole bank at once — and, when a SoundFont is installed, each
+instrument played twice so the two can be compared back to back:
+
+```bash
+cargo run -p daw-engine --release --example audition-bank -- bank.wav
+cargo run -p daw-engine --release --example audition-bank -- --synth bank.wav
+```
 
 **Chords are detected natively too.** A chromagram with the harmonic series
 discounted, averaged over half-beats from the detected beat grid, matched
@@ -161,8 +249,9 @@ in about a second, because only format conversion is left to do.
 
 When transcription is available, it is imported too: each pitched MIDI track
 becomes an instrument track you can edit in the piano roll and hear against the
-stems. Drum MIDI is left out — the synth is pitched and cannot play a kit, and
-the drum stem already covers it. Tempo comes from the detector above rather than
+stems, and channel-10 tracks become drum tracks played by the kit. They come in
+at -9 dB: the stems are the reference, and the transcription is there to be
+brought up against them. Tempo comes from the detector above rather than
 from the pipeline's beat grid, and the notes are rebased through seconds so a
 transcription written at 120 BPM still lines up when the song turns out to be 94.
 Transcription (basic-pitch) is optional: it installs on Ubuntu and on macOS with

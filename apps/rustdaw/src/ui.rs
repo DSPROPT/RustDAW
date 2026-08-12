@@ -62,6 +62,7 @@ struct Track {
     gain_db: f32,
     pan: f32,
     effects: TrackEffects,
+    nam_model: Option<PathBuf>,
     clips: Vec<Clip>,
     kind: TrackKind,
     midi_clips: Vec<MidiClip>,
@@ -190,6 +191,7 @@ impl Track {
             gain_db: 0.0,
             pan: 0.0,
             effects: TrackEffects::default(),
+            nam_model: None,
             clips: Vec::new(),
             kind: TrackKind::Audio,
             midi_clips: Vec::new(),
@@ -253,6 +255,12 @@ pub struct RustDawApp {
     song_import: SongImportState,
     tempo_map: TempoMap,
     piano_roll: PianoRollState,
+    /// Amp captures found on disk. Scanned once and on request rather than per
+    /// frame: the FX window repaints continuously and the scan touches disk.
+    amp_library: Vec<daw_nam::AmpModel>,
+    /// An in-flight TONE3000 download. The flow waits on the user's browser,
+    /// so it runs on its own thread and reports back here.
+    amp_fetch: Option<Receiver<Result<daw_tone3000::FetchedModel, String>>>,
 }
 
 impl RustDawApp {
@@ -318,6 +326,8 @@ impl RustDawApp {
             pending_delete_track: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            amp_library: daw_nam::discover(),
+            amp_fetch: None,
             song_import: SongImportState::default(),
             tempo_map: document_tempo_map,
             piano_roll: PianoRollState::default(),
@@ -507,6 +517,13 @@ impl RustDawApp {
                     ));
                     ui.label(RichText::new(runtime.input_name()).small().color(theme::MUTED));
                     ui.label(RichText::new(runtime.output_name()).small().color(theme::MUTED));
+                    // Which instruments the MIDI tracks are playing, so a
+                    // missing SoundFont is visible rather than just quieter.
+                    let instruments = runtime.soundfont_name().map_or_else(
+                        || "Instruments: built-in synth".to_owned(),
+                        |name| format!("Instruments: {name}"),
+                    );
+                    ui.label(RichText::new(instruments).small().color(theme::MUTED));
                 } else if let Some(error) = &self.audio_error {
                     ui.colored_label(theme::RED, format!("Offline: {error}"));
                 }
@@ -741,6 +758,11 @@ impl RustDawApp {
             let audible = !track.muted && (!any_solo || track.solo);
             let gain = 10.0_f32.powf(track.gain_db / 20.0);
             runtime.set_track_effects(track_id, channel_strip_params(track.effects))?;
+            runtime.set_track_nam_model(
+                track_id,
+                track.nam_model.as_deref().filter(|_| track.effects.nam_enabled),
+                channel_strip_params(track.effects),
+            )?;
             for clip in &track.clips {
                 runtime.add_identified_track_playback_file(
                     &clip.path,
@@ -1141,6 +1163,78 @@ impl RustDawApp {
                 self.song_import.error = None;
             }
             Err(error) => self.song_import.error = Some(error.to_string()),
+        }
+    }
+
+    /// Starts the TONE3000 picker on its own thread.
+    ///
+    /// The flow waits on the user signing in and browsing, which can take
+    /// minutes; the interface has to stay live throughout.
+    fn start_amp_fetch(&mut self) {
+        if self.amp_fetch.is_some() {
+            self.status_message = "Already waiting for TONE3000".to_owned();
+            return;
+        }
+        let client = match daw_tone3000::Client::from_env() {
+            Ok(client) => client,
+            Err(error) => {
+                self.status_message = format!("TONE3000: {error}");
+                return;
+            }
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("tone3000-fetch".to_owned())
+            .spawn(move || {
+                let outcome = client
+                    .select_tone(open_in_browser)
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(outcome);
+            });
+        match spawned {
+            Ok(_) => {
+                self.amp_fetch = Some(receiver);
+                self.status_message =
+                    "Pick an amp in your browser — RustDAW is waiting".to_owned();
+            }
+            Err(error) => self.status_message = format!("TONE3000: {error}"),
+        }
+    }
+
+    /// Writes a finished download into the amp library and selects it.
+    fn poll_amp_fetch(&mut self) {
+        let Some(receiver) = self.amp_fetch.take() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(model)) => {
+                let directory = daw_nam::amp_dir();
+                let destination = directory.join(&model.file_name);
+                let written = std::fs::create_dir_all(&directory)
+                    .and_then(|()| std::fs::write(&destination, &model.bytes));
+                match written {
+                    Ok(()) => {
+                        self.amp_library = daw_nam::discover();
+                        // Put it straight on the selected track, which is why
+                        // the user went looking for it.
+                        if let Some(track) = self.tracks.get_mut(self.selected_track) {
+                            track.nam_model = Some(destination);
+                            track.effects.nam_enabled = true;
+                            self.dirty = true;
+                        }
+                        self.status_message = format!("Loaded {} from TONE3000", model.name);
+                    }
+                    Err(error) => {
+                        self.status_message =
+                            format!("Could not save {}: {error}", model.file_name);
+                    }
+                }
+            }
+            Ok(Err(error)) => self.status_message = format!("TONE3000: {error}"),
+            Err(TryRecvError::Empty) => self.amp_fetch = Some(receiver),
+            Err(TryRecvError::Disconnected) => {
+                self.status_message = "The TONE3000 download stopped unexpectedly".to_owned();
+            }
         }
     }
 
@@ -1812,8 +1906,14 @@ impl RustDawApp {
         }
         let mut open = self.inserts_open;
         let track_index = self.selected_track;
+        // Disjoint fields: the amp list is read while the track is edited.
+        // Set inside the window and acted on once its borrow has ended.
+        let mut rescan_amps = false;
+        let mut fetch_amp = false;
+        let amp_library = &self.amp_library;
         let track = &mut self.tracks[track_index];
         let before = track.effects;
+        let before_nam_model = track.nam_model.clone();
         let input_peak = if track.layout == ChannelLayout::Mono {
             snapshot.input_peaks[track.input_left.min(3)]
         } else {
@@ -1821,7 +1921,7 @@ impl RustDawApp {
         };
         egui::Window::new(format!("Channel Strip — {}", track.name))
             .open(&mut open)
-            .default_width(760.0)
+            .default_width(1_540.0)
             .default_height(390.0)
             .max_height(470.0)
             .resizable(false)
@@ -1841,6 +1941,215 @@ impl RustDawApp {
                         });
                         ui.separator();
                         ui.horizontal_top(|ui| {
+                            // Laid out as the Neural Amp Modeler plugin is:
+                            // one row of controls, then the model it is
+                            // playing. The tone stack belongs to the amp, not
+                            // to the channel EQ beside it.
+                            channel_module(
+                                ui,
+                                "NEURAL AMP MODELER",
+                                track.effects.nam_enabled,
+                                430.0,
+                                |ui| {
+                                    ui.horizontal(|ui| {
+                                        rotary_knob(
+                                            ui,
+                                            "INPUT",
+                                            &mut track.effects.nam_input_db,
+                                            -24.0,
+                                            24.0,
+                                            "dB",
+                                            theme::GREEN,
+                                        );
+                                        rotary_knob(
+                                            ui,
+                                            "GATE",
+                                            &mut track.effects.nam_gate_db,
+                                            GATE_OPEN_DB,
+                                            -20.0,
+                                            "dB",
+                                            theme::GREEN,
+                                        );
+                                        rotary_knob(
+                                            ui,
+                                            "BASS",
+                                            &mut track.effects.nam_bass,
+                                            0.0,
+                                            10.0,
+                                            "",
+                                            theme::BLUE,
+                                        );
+                                        rotary_knob(
+                                            ui,
+                                            "MIDDLE",
+                                            &mut track.effects.nam_middle,
+                                            0.0,
+                                            10.0,
+                                            "",
+                                            theme::BLUE,
+                                        );
+                                        rotary_knob(
+                                            ui,
+                                            "TREBLE",
+                                            &mut track.effects.nam_treble,
+                                            0.0,
+                                            10.0,
+                                            "",
+                                            theme::BLUE,
+                                        );
+                                        rotary_knob(
+                                            ui,
+                                            "OUTPUT",
+                                            &mut track.effects.nam_output_db,
+                                            -24.0,
+                                            12.0,
+                                            "dB",
+                                            theme::GREEN,
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        illuminated_toggle(
+                                            ui,
+                                            "AMP IN",
+                                            &mut track.effects.nam_enabled,
+                                            theme::GREEN,
+                                        );
+                                        illuminated_toggle(
+                                            ui,
+                                            "EQ",
+                                            &mut track.effects.nam_tone_enabled,
+                                            theme::BLUE,
+                                        );
+                                        let normalize = ui.add(egui::Button::selectable(
+                                            track.effects.nam_normalize,
+                                            "NORMALIZE",
+                                        ));
+                                        if normalize.clicked() {
+                                            track.effects.nam_normalize =
+                                                !track.effects.nam_normalize;
+                                        }
+                                        normalize.on_hover_text(
+                                            "Level every capture against its own measured \
+                                             loudness, so swapping amps is a change of amp \
+                                             rather than a change of volume",
+                                        );
+                                    });
+                                    ui.separator();
+                                    // The model slot: step through the library
+                                    // with the arrows, or pick from the list.
+                                    ui.horizontal(|ui| {
+                                        let position = track.nam_model.as_deref().and_then(|path| {
+                                            amp_library
+                                                .iter()
+                                                .position(|model| model.path == path)
+                                        });
+                                        let count = amp_library.len();
+                                        // Wraps at both ends, so stepping
+                                        // through a library is a loop rather
+                                        // than something to run off the end of.
+                                        let step = |forward: bool| -> Option<PathBuf> {
+                                            let next = match position {
+                                                None => 0,
+                                                Some(index) if forward => (index + 1) % count.max(1),
+                                                Some(index) => (index + count - 1) % count.max(1),
+                                            };
+                                            amp_library.get(next).map(|model| model.path.clone())
+                                        };
+                                        if ui.button("‹").on_hover_text("Previous amp").clicked() {
+                                            if let Some(path) = step(false) {
+                                                track.nam_model = Some(path);
+                                                track.effects.nam_enabled = true;
+                                            }
+                                        }
+                                        if ui.button("›").on_hover_text("Next amp").clicked() {
+                                            if let Some(path) = step(true) {
+                                                track.nam_model = Some(path);
+                                                track.effects.nam_enabled = true;
+                                            }
+                                        }
+                                        let selected = track
+                                            .nam_model
+                                            .as_deref()
+                                            .and_then(std::path::Path::file_stem)
+                                            .and_then(|name| name.to_str())
+                                            .unwrap_or("Select amp...")
+                                            .to_owned();
+                                        egui::ComboBox::from_id_salt(("nam_model", track_index))
+                                            .selected_text(RichText::new(selected).small())
+                                            .width(228.0)
+                                            .show_ui(ui, |ui| {
+                                                for model in amp_library {
+                                                    let chosen = track.nam_model.as_deref()
+                                                        == Some(model.path.as_path());
+                                                    if ui
+                                                        .selectable_label(chosen, &model.name)
+                                                        .clicked()
+                                                    {
+                                                        track.nam_model =
+                                                            Some(model.path.clone());
+                                                        track.effects.nam_enabled = true;
+                                                    }
+                                                }
+                                                if amp_library.is_empty() {
+                                                    ui.label(
+                                                        RichText::new("No captures found")
+                                                            .small()
+                                                            .color(theme::MUTED),
+                                                    );
+                                                }
+                                            });
+                                        if ui.button("✕").on_hover_text("Clear").clicked() {
+                                            track.nam_model = None;
+                                            track.effects.nam_enabled = false;
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        let linked =
+                                            daw_tone3000::publishable_key().is_some();
+                                        let hint = if linked {
+                                            "Pick an amp on TONE3000 and load it straight onto \
+                                             this track"
+                                                .to_owned()
+                                        } else {
+                                            format!(
+                                                "Browse free amp captures on tone3000.com, then \
+                                                 save the .nam files into\n{}",
+                                                daw_nam::amp_dir().display()
+                                            )
+                                        };
+                                        if ui.button("GET AMPS").on_hover_text(hint).clicked() {
+                                            let _ = std::fs::create_dir_all(daw_nam::amp_dir());
+                                            if linked {
+                                                fetch_amp = true;
+                                            } else {
+                                                open_in_browser(TONE3000_URL);
+                                            }
+                                        }
+                                        if ui
+                                            .button("RESCAN")
+                                            .on_hover_text(amp_library_hint())
+                                            .clicked()
+                                        {
+                                            rescan_amps = true;
+                                        }
+                                        if ui
+                                            .button("BROWSE")
+                                            .on_hover_text("Load a capture from anywhere on disk")
+                                            .clicked()
+                                        {
+                                            if let Some(path) = rfd::FileDialog::new()
+                                                .add_filter("NAM model", &["nam"])
+                                                .set_directory(daw_nam::amp_dir())
+                                                .pick_file()
+                                            {
+                                                track.nam_model = Some(path);
+                                                track.effects.nam_enabled = true;
+                                            }
+                                        }
+                                    });
+                                },
+                            );
+
                             channel_module(
                                 ui,
                                 "3-BAND EQ",
@@ -2019,14 +2328,106 @@ impl RustDawApp {
                                     });
                                 },
                             );
+
+                            // Time-based modules last in the rack, as they are
+                            // last in the signal: echoes and a room around the
+                            // finished tone, not around what it was before the
+                            // amp and the compressor shaped it.
+                            channel_module(
+                                ui,
+                                "DELAY / REVERB",
+                                track.effects.delay_enabled || track.effects.reverb_enabled,
+                                300.0,
+                                |ui| {
+                                    illuminated_toggle(
+                                        ui,
+                                        "DLY IN",
+                                        &mut track.effects.delay_enabled,
+                                        theme::BLUE,
+                                    );
+                                    ui.horizontal(|ui| {
+                                        rotary_knob(
+                                            ui,
+                                            "TIME",
+                                            &mut track.effects.delay_time_ms,
+                                            20.0,
+                                            MAX_DELAY_MS,
+                                            "ms",
+                                            theme::BLUE,
+                                        );
+                                        rotary_knob(
+                                            ui,
+                                            "FEEDBACK",
+                                            &mut track.effects.delay_feedback,
+                                            0.0,
+                                            0.95,
+                                            "",
+                                            theme::BLUE,
+                                        );
+                                        rotary_knob(
+                                            ui,
+                                            "MIX",
+                                            &mut track.effects.delay_mix,
+                                            0.0,
+                                            1.0,
+                                            "",
+                                            theme::BLUE,
+                                        );
+                                    });
+                                    ui.separator();
+                                    illuminated_toggle(
+                                        ui,
+                                        "VERB IN",
+                                        &mut track.effects.reverb_enabled,
+                                        theme::YELLOW,
+                                    );
+                                    ui.horizontal(|ui| {
+                                        rotary_knob(
+                                            ui,
+                                            "SIZE",
+                                            &mut track.effects.reverb_size,
+                                            0.0,
+                                            1.0,
+                                            "",
+                                            theme::YELLOW,
+                                        );
+                                        rotary_knob(
+                                            ui,
+                                            "DAMP",
+                                            &mut track.effects.reverb_damping,
+                                            0.0,
+                                            1.0,
+                                            "",
+                                            theme::YELLOW,
+                                        );
+                                        rotary_knob(
+                                            ui,
+                                            "MIX",
+                                            &mut track.effects.reverb_mix,
+                                            0.0,
+                                            1.0,
+                                            "",
+                                            theme::YELLOW,
+                                        );
+                                    });
+                                },
+                            );
                         });
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("GATE").color(theme::GREEN));
                             ui.label("→");
+                            ui.label(RichText::new("AMP").color(theme::GREEN));
+                            ui.label("→");
+                            ui.label(RichText::new("TONE").color(theme::BLUE));
+                            ui.label("→");
                             ui.label(RichText::new("EQ").color(theme::BLUE));
                             ui.label("→");
                             ui.label(RichText::new("COMPRESSOR").color(theme::YELLOW));
+                            ui.label("→");
+                            ui.label(RichText::new("DELAY").color(theme::BLUE));
+                            ui.label("→");
+                            ui.label(RichText::new("REVERB").color(theme::YELLOW));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 ui.label(
                                     RichText::new("NON-DESTRUCTIVE · SOURCE WAV DRY")
@@ -2038,14 +2439,55 @@ impl RustDawApp {
                     });
             });
         self.inserts_open = open;
-        if before != track.effects {
+        if before != track.effects || before_nam_model != track.nam_model {
             self.dirty = true;
             if let Some(runtime) = &self.runtime {
                 let _ = runtime.set_track_effects(track_index, channel_strip_params(track.effects));
+                if before_nam_model != track.nam_model
+                    || before.nam_enabled != track.effects.nam_enabled
+                {
+                    match runtime.set_track_nam_model(
+                        track_index,
+                        track.nam_model.as_deref().filter(|_| track.effects.nam_enabled),
+                        channel_strip_params(track.effects),
+                    ) {
+                        Ok(()) => self.status_message = if track.effects.nam_enabled {
+                            "NAM guitar amp loaded".to_owned()
+                        } else {
+                            "NAM guitar amp bypassed".to_owned()
+                        },
+                        Err(error) => {
+                            track.effects.nam_enabled = false;
+                            self.status_message = format!("NAM model failed: {error}");
+                        }
+                    }
+                }
                 if track.monitoring {
                     let _ = runtime.set_monitor_effects(channel_strip_params(track.effects));
+                    if before_nam_model != track.nam_model
+                        || before.nam_enabled != track.effects.nam_enabled
+                    {
+                        let _ = runtime.set_monitor_nam_model(
+                            track.nam_model.as_deref().filter(|_| track.effects.nam_enabled),
+                            channel_strip_params(track.effects),
+                        );
+                    }
                 }
             }
+        }
+        if fetch_amp {
+            self.start_amp_fetch();
+        }
+        if rescan_amps {
+            self.amp_library = daw_nam::discover();
+            self.status_message = match self.amp_library.len() {
+                0 => format!(
+                    "No amp captures in {}",
+                    daw_nam::amp_dir().display()
+                ),
+                1 => "Found 1 amp capture".to_owned(),
+                found => format!("Found {found} amp captures"),
+            };
         }
     }
 
@@ -2272,6 +2714,20 @@ impl RustDawApp {
                                 .color(theme::RED),
                         );
                     }
+                    if snapshot.monitor_amp_faults > 0 {
+                        // The amp is on but not being heard; the dry signal is
+                        // going through instead. Without this the only symptom
+                        // is a guitar that sounds unplugged.
+                        ui.label(
+                            RichText::new("AMP BYPASSED")
+                                .color(theme::RED),
+                        )
+                        .on_hover_text(format!(
+                            "The monitoring amp failed on {} block(s) and passed the dry \
+                             signal through. Check the model matches the session sample rate.",
+                            snapshot.monitor_amp_faults
+                        ));
+                    }
                     if snapshot.disk_error {
                         ui.label(RichText::new("DISK WRITE ERROR").color(theme::RED));
                     }
@@ -2325,7 +2781,18 @@ impl RustDawApp {
                         track.armed = !track.armed;
                         self.selected_track = index;
                     }
-                    if ui.selectable_label(track.monitoring, "I").clicked() {
+                    // "I" said nothing about what it did. This is the only way
+                    // to hear the live input — and the only way to hear an amp
+                    // while playing — so it has to name itself.
+                    if ui
+                        .selectable_label(track.monitoring, "MON")
+                        .on_hover_text(
+                            "Input monitoring: hear this track's live input, through its FX \
+                             and amp.\nTurn DIRECT MONITOR off on the interface first, or the \
+                             dry signal is mixed in on top.",
+                        )
+                        .clicked()
+                    {
                         track.monitoring = !track.monitoring;
                         if let Some(runtime) = &self.runtime {
                             let right = if track.layout == ChannelLayout::Mono {
@@ -2336,6 +2803,10 @@ impl RustDawApp {
                             runtime.set_monitoring(track.monitoring, track.input_left, right);
                             let _ =
                                 runtime.set_monitor_effects(channel_strip_params(track.effects));
+                            let _ = runtime.set_monitor_nam_model(
+                                track.nam_model.as_deref().filter(|_| track.effects.nam_enabled),
+                                channel_strip_params(track.effects),
+                            );
                         }
                     }
                     if ui.selectable_label(track.muted, "M").clicked() {
@@ -2346,7 +2817,8 @@ impl RustDawApp {
                     }
                     let fx_active = track.effects.eq_enabled
                         || track.effects.compressor_enabled
-                        || track.effects.gate_enabled;
+                        || track.effects.gate_enabled
+                        || track.effects.nam_enabled;
                     if ui
                         .add(
                             egui::Button::new(RichText::new("FX").color(if fx_active {
@@ -2441,6 +2913,13 @@ impl RustDawApp {
                     track.input_right
                 };
                 runtime.set_monitoring(true, track.input_left, right);
+                // The amp goes with it: changing which socket is being listened
+                // to must not drop the sound the player is monitoring through.
+                let _ = runtime.set_monitor_effects(channel_strip_params(track.effects));
+                let _ = runtime.set_monitor_nam_model(
+                    track.nam_model.as_deref().filter(|_| track.effects.nam_enabled),
+                    channel_strip_params(track.effects),
+                );
             }
         }
         if before != after {
@@ -3073,6 +3552,7 @@ impl eframe::App for RustDawApp {
         self.mixer_window(context, &snapshot);
         self.inserts_window(context, &snapshot);
         self.poll_song_import(context);
+        self.poll_amp_fetch();
         self.song_import_window(context);
         self.piano_roll_window(context);
     }
@@ -3675,6 +4155,35 @@ fn ensure_extension(mut path: PathBuf, extension: &str) -> PathBuf {
     path
 }
 
+/// The bottom of the amp gate's travel, where it passes everything.
+const GATE_OPEN_DB: f32 = -95.0;
+
+/// The delay's longest setting, for the TIME control's range.
+const MAX_DELAY_MS: f32 = 1_000.0;
+
+/// Where free amp captures come from. The catalogue is browsed on the site
+/// itself: the files are downloaded there and read back out of [`daw_nam::amp_dir`].
+const TONE3000_URL: &str = "https://www.tone3000.com/";
+
+/// Opens a URL in the user's browser.
+///
+/// Failure is ignored on purpose. A machine with no browser handler makes this
+/// a button that does nothing, which is a disappointment rather than an error
+/// worth interrupting the session for.
+fn open_in_browser(url: &str) {
+    let _ = std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Names the folder captures are read from, so the rescan button says where to
+/// put the files rather than leaving the user to guess.
+fn amp_library_hint() -> String {
+    format!("Look again in {}", daw_nam::amp_dir().display())
+}
+
 fn sanitize_file_name(name: &str) -> String {
     let sanitized = name
         .chars()
@@ -3843,6 +4352,7 @@ fn track_from_project(track: ProjectTrack) -> Track {
         gain_db: track.gain_db,
         pan: track.pan,
         effects: track.effects,
+        nam_model: track.nam_model,
         clips: track
             .clips
             .into_iter()
@@ -3875,6 +4385,7 @@ fn track_to_project(track: &Track) -> ProjectTrack {
         gain_db: track.gain_db,
         pan: track.pan,
         effects: track.effects,
+        nam_model: track.nam_model.clone(),
         clips: track
             .clips
             .iter()
@@ -3895,6 +4406,23 @@ fn track_to_project(track: &Track) -> ProjectTrack {
 
 fn channel_strip_params(effects: TrackEffects) -> ChannelStripParams {
     ChannelStripParams {
+        nam_enabled: effects.nam_enabled,
+        nam_input_db: effects.nam_input_db,
+        nam_output_db: effects.nam_output_db,
+        nam_gate_db: effects.nam_gate_db,
+        nam_tone_enabled: effects.nam_tone_enabled,
+        nam_bass: effects.nam_bass,
+        nam_middle: effects.nam_middle,
+        nam_treble: effects.nam_treble,
+        nam_normalize: effects.nam_normalize,
+        delay_enabled: effects.delay_enabled,
+        delay_time_ms: effects.delay_time_ms,
+        delay_feedback: effects.delay_feedback,
+        delay_mix: effects.delay_mix,
+        reverb_enabled: effects.reverb_enabled,
+        reverb_size: effects.reverb_size,
+        reverb_damping: effects.reverb_damping,
+        reverb_mix: effects.reverb_mix,
         eq_enabled: effects.eq_enabled,
         low_db: effects.low_db,
         mid_db: effects.mid_db,

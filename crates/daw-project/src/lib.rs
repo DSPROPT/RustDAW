@@ -151,6 +151,9 @@ pub struct ProjectTrack {
     pub pan: f32,
     #[serde(default)]
     pub effects: TrackEffects,
+    /// Neural Amp Modeler capture used by this guitar track.
+    #[serde(default)]
+    pub nam_model: Option<PathBuf>,
     pub clips: Vec<ProjectClip>,
     /// Notes, for instrument tracks. Always empty on audio tracks.
     #[serde(default)]
@@ -179,6 +182,7 @@ impl ProjectTrack {
             gain_db: 0.0,
             pan: 0.0,
             effects: TrackEffects::default(),
+            nam_model: None,
             clips: Vec::new(),
             midi_clips: Vec::new(),
             program: None,
@@ -224,6 +228,40 @@ impl ProjectTrack {
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TrackEffects {
+    #[serde(default)]
+    pub nam_enabled: bool,
+    #[serde(default)]
+    pub nam_input_db: f32,
+    #[serde(default)]
+    pub nam_output_db: f32,
+    #[serde(default = "default_nam_gate_db")]
+    pub nam_gate_db: f32,
+    #[serde(default)]
+    pub nam_tone_enabled: bool,
+    #[serde(default = "default_tone_position")]
+    pub nam_bass: f32,
+    #[serde(default = "default_tone_position")]
+    pub nam_middle: f32,
+    #[serde(default = "default_tone_position")]
+    pub nam_treble: f32,
+    #[serde(default)]
+    pub nam_normalize: bool,
+    #[serde(default)]
+    pub delay_enabled: bool,
+    #[serde(default = "default_delay_time_ms")]
+    pub delay_time_ms: f32,
+    #[serde(default = "default_delay_feedback")]
+    pub delay_feedback: f32,
+    #[serde(default = "default_delay_mix")]
+    pub delay_mix: f32,
+    #[serde(default)]
+    pub reverb_enabled: bool,
+    #[serde(default = "default_reverb_size")]
+    pub reverb_size: f32,
+    #[serde(default = "default_reverb_damping")]
+    pub reverb_damping: f32,
+    #[serde(default = "default_reverb_mix")]
+    pub reverb_mix: f32,
     pub eq_enabled: bool,
     pub low_db: f32,
     pub mid_db: f32,
@@ -242,6 +280,23 @@ pub struct TrackEffects {
 impl Default for TrackEffects {
     fn default() -> Self {
         Self {
+            nam_enabled: false,
+            nam_input_db: 0.0,
+            nam_output_db: 0.0,
+            nam_gate_db: default_nam_gate_db(),
+            nam_tone_enabled: false,
+            nam_bass: default_tone_position(),
+            nam_middle: default_tone_position(),
+            nam_treble: default_tone_position(),
+            nam_normalize: false,
+            delay_enabled: false,
+            delay_time_ms: default_delay_time_ms(),
+            delay_feedback: default_delay_feedback(),
+            delay_mix: default_delay_mix(),
+            reverb_enabled: false,
+            reverb_size: default_reverb_size(),
+            reverb_damping: default_reverb_damping(),
+            reverb_mix: default_reverb_mix(),
             eq_enabled: false,
             low_db: 0.0,
             mid_db: 0.0,
@@ -336,8 +391,83 @@ fn temporary_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The amp's gate, off by default: an unasked-for gate that eats quiet notes
+/// is worse than an unasked-for noise floor.
+const fn default_nam_gate_db() -> f32 {
+    -95.0
+}
+/// Tone controls sit at noon.
+const fn default_tone_position() -> f32 {
+    5.0
+}
+const fn default_delay_time_ms() -> f32 {
+    350.0
+}
+const fn default_delay_feedback() -> f32 {
+    0.35
+}
+const fn default_delay_mix() -> f32 {
+    0.25
+}
+const fn default_reverb_size() -> f32 {
+    0.6
+}
+const fn default_reverb_damping() -> f32 {
+    0.4
+}
+const fn default_reverb_mix() -> f32 {
+    0.2
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_session_written_before_the_time_effects_existed_still_opens() {
+        // Old sessions have no delay or reverb fields at all. They must load,
+        // switched off, with the settings a new track would get rather than
+        // with every control at zero.
+        let json = r#"{
+            "nam_enabled": false,
+            "nam_input_db": 0.0,
+            "nam_output_db": 0.0,
+            "eq_enabled": true,
+            "low_db": 3.0,
+            "mid_db": 0.0,
+            "high_db": -2.0,
+            "compressor_enabled": false,
+            "compressor_threshold_db": -18.0,
+            "compressor_ratio": 4.0,
+            "compressor_attack_ms": 10.0,
+            "compressor_release_ms": 120.0,
+            "compressor_makeup_db": 0.0,
+            "gate_enabled": false,
+            "gate_threshold_db": -45.0,
+            "gate_release_ms": 120.0
+        }"#;
+        let effects: TrackEffects = serde_json::from_str(json).expect("an old session should load");
+        assert!(effects.eq_enabled, "the settings it did have must survive");
+        assert!(!effects.delay_enabled);
+        assert!(!effects.reverb_enabled);
+        let fresh = TrackEffects::default();
+        assert!((effects.delay_time_ms - fresh.delay_time_ms).abs() < f32::EPSILON);
+        assert!((effects.reverb_mix - fresh.reverb_mix).abs() < f32::EPSILON);
+        assert!(effects.delay_time_ms > 0.0, "an unset time must not be zero");
+    }
+
+    #[test]
+    fn the_time_effects_survive_a_save_and_reload() {
+        let effects = TrackEffects {
+            delay_enabled: true,
+            delay_time_ms: 420.0,
+            reverb_enabled: true,
+            reverb_size: 0.85,
+            ..TrackEffects::default()
+        };
+        let json = serde_json::to_string(&effects).expect("serialise");
+        let restored: TrackEffects = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(restored, effects);
+    }
     use super::*;
 
     #[test]

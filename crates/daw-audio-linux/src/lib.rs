@@ -7,7 +7,9 @@ use cpal::traits::{DeviceTrait, HostTrait};
 mod runtime;
 mod time_stretch;
 
-pub use runtime::{AudioRuntime, AudioRuntimeConfig, RuntimeSnapshot, RuntimeTransportState};
+pub use runtime::{
+    AudioRuntime, AudioRuntimeConfig, InstrumentSource, RuntimeSnapshot, RuntimeTransportState,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamRange {

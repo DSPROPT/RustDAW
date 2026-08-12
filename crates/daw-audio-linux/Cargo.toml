@@ -12,7 +12,13 @@ cpal.workspace = true
 daw-core = { path = "../daw-core" }
 daw-engine = { path = "../daw-engine" }
 daw-midi = { path = "../daw-midi" }
+daw-nam = { path = "../daw-nam" }
 hound.workspace = true
+
+[dev-dependencies]
+# The fixture font, so the sound font path can be tested on a machine that has
+# no sound font installed — which is most of them.
+daw-engine = { path = "../daw-engine", features = ["fixtures"] }
 
 [lints]
 workspace = true

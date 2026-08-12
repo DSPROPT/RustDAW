@@ -8,6 +8,15 @@ rust-version.workspace = true
 [dependencies]
 daw-core = { path = "../daw-core" }
 daw-midi = { path = "../daw-midi" }
+rustysynth.workspace = true
+
+[features]
+# Exposes a tiny in-memory SoundFont so other crates can test their sound font
+# paths without one being installed on the machine.
+fixtures = []
+
+[dev-dependencies]
+hound.workspace = true
 
 [lints]
 workspace = true

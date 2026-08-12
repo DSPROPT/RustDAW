@@ -1,8 +1,13 @@
 //! Deterministic offline stereo rendering for `RustDAW` sessions.
 
 use anyhow::{Context, Result, bail};
-use daw_engine::{ChannelStrip, ChannelStripParams};
+use daw_engine::{ChannelStrip, ChannelStripParams, NoiseGate, ToneStack};
 use daw_project::ProjectDocument;
+use daw_nam::NamProcessor;
+
+/// The loudness a normalised capture is brought to, matching the runtime so an
+/// export sounds like what was monitored.
+const NORMALIZE_TARGET_DB: f64 = -18.0;
 use std::path::Path;
 
 /// Renders all unmuted clips to a stereo 24-bit WAV file.
@@ -33,6 +38,23 @@ pub fn export_stereo(project: &ProjectDocument, destination: &Path) -> Result<u6
             daw_core::SampleRate::new(project.sample_rate)
                 .context("project sample rate cannot be zero")?,
             ChannelStripParams {
+                nam_enabled: track.effects.nam_enabled,
+                nam_input_db: track.effects.nam_input_db,
+                nam_output_db: track.effects.nam_output_db,
+                nam_gate_db: track.effects.nam_gate_db,
+                nam_tone_enabled: track.effects.nam_tone_enabled,
+                nam_bass: track.effects.nam_bass,
+                nam_middle: track.effects.nam_middle,
+                nam_treble: track.effects.nam_treble,
+                nam_normalize: track.effects.nam_normalize,
+                delay_enabled: track.effects.delay_enabled,
+                delay_time_ms: track.effects.delay_time_ms,
+                delay_feedback: track.effects.delay_feedback,
+                delay_mix: track.effects.delay_mix,
+                reverb_enabled: track.effects.reverb_enabled,
+                reverb_size: track.effects.reverb_size,
+                reverb_damping: track.effects.reverb_damping,
+                reverb_mix: track.effects.reverb_mix,
                 eq_enabled: track.effects.eq_enabled,
                 low_db: track.effects.low_db,
                 mid_db: track.effects.mid_db,
@@ -48,8 +70,55 @@ pub fn export_stereo(project: &ProjectDocument, destination: &Path) -> Result<u6
                 gate_release_ms: track.effects.gate_release_ms,
             },
         );
+        let sample_rate = daw_core::SampleRate::new(project.sample_rate)
+            .context("project sample rate cannot be zero")?;
+        let mut gate = NoiseGate::new(sample_rate);
+        let mut tone = ToneStack::new(sample_rate);
+        let mut nam = if track.effects.nam_enabled {
+            track
+                .nam_model
+                .as_deref()
+                .map(|path| NamProcessor::load(path, project.sample_rate, 2_048))
+                .transpose()
+                .map_err(anyhow::Error::msg)?
+        } else {
+            None
+        };
         for clip in &track.clips {
             let mut samples = read_wav(&clip.path, project.sample_rate)?;
+            if let Some(nam) = &mut nam {
+                let input_gain = db_to_gain(track.effects.nam_input_db);
+                let normalize = if track.effects.nam_normalize {
+                    nam.loudness().map_or(1.0, |loudness| {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let difference = (NORMALIZE_TARGET_DB - loudness) as f32;
+                        db_to_gain(difference.clamp(-24.0, 24.0))
+                    })
+                } else {
+                    1.0
+                };
+                let output_gain = db_to_gain(track.effects.nam_output_db) * normalize;
+                let mut mono = vec![0.0_f32; 2_048];
+                for block in samples.chunks_mut(2_048) {
+                    let block_len = block.len();
+                    for (sample, frame) in mono[..block_len].iter_mut().zip(block.iter()) {
+                        *sample = (frame[0] + frame[1]) * 0.5 * input_gain;
+                    }
+                    gate.process(&mut mono[..block_len], track.effects.nam_gate_db);
+                    nam.process(&mut mono[..block_len]).map_err(anyhow::Error::msg)?;
+                    for (frame, sample) in block.iter_mut().zip(&mono[..block_len]) {
+                        *frame = [*sample * output_gain; 2];
+                    }
+                    if track.effects.nam_tone_enabled {
+                        tone.process(
+                            block,
+                            track.effects.nam_bass,
+                            track.effects.nam_middle,
+                            track.effects.nam_treble,
+                        );
+                    }
+                }
+            }
             processor.process_stereo(&mut samples);
             let available = clip.end_frame.saturating_sub(clip.start_frame);
             let wanted = usize::try_from(available).unwrap_or(usize::MAX);

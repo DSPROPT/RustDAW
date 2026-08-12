@@ -6,13 +6,18 @@ Architecture: amd64
 Maintainer: RustDAW Project
 Depends: libasound2, libpulse0, libgl1
 Recommends: ffmpeg
+Suggests: fluid-soundfont-gm
 Description: Ubuntu-first digital audio workstation
  RustDAW provides mono and stereo recording, low-latency monitoring,
  metronome, timeline editing, session persistence, and stereo export.
  .
  It also imports a song as separated instrument tracks, detects its tempo,
  beat grid and chord chart natively, and plays transcribed MIDI through a
- built-in General MIDI instrument bank with a piano roll editor.
+ piano roll editor.
+ .
+ Instrument tracks play from a SoundFont when one is installed and from a
+ built-in General MIDI bank synthesised in Rust when one is not, so nothing
+ has to be downloaded for a session to open and sound.
  .
  Song import needs ffmpeg for sample-rate conversion, and a local DSPRO
  Studio worker for the stem separation itself.

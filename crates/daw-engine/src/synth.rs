@@ -11,21 +11,45 @@
 //! wavetable is built once, before the stream opens, into a [`GmBank`] shared
 //! by every track.
 //!
-//! Each voice is two detuned oscillators plus noise through a one-pole
-//! low-pass, under an ADSR — enough for a piano to sound like a piano next to
-//! a flute. Channel-10 tracks take a different path entirely: a pitch-swept
-//! tone and filtered noise, which is what a drum kit actually is.
+//! A voice is three detuned oscillators reading a band-limited table, plus
+//! noise, through a resonant low-pass under an exponential envelope. Four
+//! things do most of the work of sounding like an instrument rather than a
+//! synthesiser:
+//!
+//! - **Exponential envelopes.** Every physical resonator decays by a constant
+//!   fraction per unit time. A linear ramp to zero is audibly synthetic.
+//! - **Key-tracked decay.** A piano's bottom string rings for half a minute
+//!   and its top one for well under a second.
+//! - **An onset transient.** The hammer, the pick, the breath — a short burst
+//!   of noise before the tone speaks. Ears identify instruments largely from
+//!   their first few milliseconds.
+//! - **Never repeating exactly.** Tuning, level and timbre move a little from
+//!   note to note, derived from the note itself so a render is still
+//!   reproducible bit for bit.
+//!
+//! Channel-10 tracks take a different path: sine partials that sweep downwards
+//! in pitch over filtered noise, which is what a drum kit actually is.
 
 use std::sync::Arc;
 
 use daw_core::SampleRate;
 use daw_midi::ScheduledNote;
 
-use crate::gm::{self, DrumVoice, GmBank, Patch, TABLE_SIZE};
+use crate::gm::{self, DrumVoice, GmBank, Patch, Wavetable};
 
 /// Simultaneous notes. Transcribed piano and guitar parts rarely exceed a
 /// dozen; the rest is headroom for pedalled chords and cymbal tails.
 pub const MAX_VOICES: usize = 48;
+
+/// Oscillators per voice: a centre, and a detuned pair placed left and right.
+const UNISON: usize = 3;
+/// Envelope level below which a voice is inaudible and its slot can be reused.
+const SILENCE: f32 = 1e-4;
+/// Decibels a patch's decay and release times are measured over.
+const DECAY_DB: f32 = 60.0;
+/// How much of a drum track goes to the shared reverb. A kit wants a room, not
+/// a hall, or the transients turn to mush.
+const DRUM_REVERB_SEND: f32 = 0.12;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Stage {
@@ -40,32 +64,55 @@ enum Stage {
 #[derive(Clone, Copy, Debug, Default)]
 struct Voice {
     stage: Stage,
-    /// Phase of the two oscillators, in cycles.
-    phase: f32,
-    phase_detuned: f32,
-    increment: f32,
-    increment_detuned: f32,
+    /// Phase of each oscillator, in cycles, and how far it moves per frame.
+    /// A zero increment means the oscillator is unused.
+    phase: [f32; UNISON],
+    increment: [f32; UNISON],
+    /// Each oscillator's gain into the left and right channels. Detune heard
+    /// in mono is beating; spread across the stereo field it is width.
+    osc_gain: [[f32; 2]; UNISON],
+    /// Where the breath, bow or drum noise sits, which is the voice's own
+    /// position rather than any one oscillator's.
+    noise_gain: [f32; 2],
+    /// Index into the bank, resolved once at note-on: which band-limited table
+    /// this voice's pitch reads from.
+    table: usize,
     amplitude: f32,
     envelope: f32,
     end_frame: u64,
 
     attack_step: f32,
-    decay_step: f32,
+    /// Envelopes fall by a constant fraction per frame, not a constant amount.
+    decay_coeff: f32,
     sustain: f32,
-    release_step: f32,
+    release_coeff: f32,
 
-    noise_level: f32,
+    /// Steady breath or bow noise, as a fraction of the tone.
+    noise_mix: f32,
+    /// The onset transient — hammer, pick or chiff — and its fast decay.
+    burst: f32,
+    burst_env: f32,
+    burst_coeff: f32,
+    /// An extra decay on the tone alone, so a drum's head can stop while its
+    /// wires rattle on.
+    tone_env: f32,
+    tone_coeff: f32,
+
     /// The low-pass sweeps from `filter_coeff_peak` down to `filter_coeff_base`
-    /// as `filter_env` falls from 1 to 0, brightening the onset. Drums pin both
+    /// as `filter_env` falls, brightening the onset. Drums pin both
     /// coefficients to the same value, so their filter is fixed.
+    resonance: f32,
     filter_coeff_base: f32,
     filter_coeff_peak: f32,
     filter_env: f32,
-    filter_env_step: f32,
-    /// Two cascaded one-pole stages make a -12 dB/octave low-pass, steep enough
-    /// for the sweep to be heard against the band-limited tables.
-    filter_state: f32,
-    filter_state2: f32,
+    filter_env_coeff: f32,
+    /// Two cascaded one-pole stages with a feedback path make a resonant
+    /// -12 dB/octave low-pass, per channel.
+    filter_state: [[f32; 2]; 2],
+    /// One-pole high-pass on the noise, which is the difference between a
+    /// hi-hat and a hiss.
+    highpass_coeff: f32,
+    highpass_state: f32,
 
     /// Vibrato as a quadrature oscillator: `(lfo_sin, lfo_cos)` is rotated by a
     /// fixed angle each frame, so pitch is modulated without a `sin` call per
@@ -82,7 +129,8 @@ struct Voice {
     /// Drum voices sweep in pitch and ignore how long the note is held.
     is_drum: bool,
     pitch_multiplier: f32,
-    pitch_step: f32,
+    pitch_target: f32,
+    pitch_coeff: f32,
 }
 
 impl Voice {
@@ -152,6 +200,17 @@ impl Synth {
         self.level = level.clamp(0.0, 2.0);
     }
 
+    /// How much of this track belongs in the shared reverb. A hall for strings,
+    /// a small room for a piano, next to nothing for a bass.
+    #[must_use]
+    pub fn reverb_send(&self) -> f32 {
+        if self.is_drum_kit {
+            DRUM_REVERB_SEND
+        } else {
+            self.bank.patch(self.program).reverb_send
+        }
+    }
+
     /// Silences every voice, for a stop or a track becoming inaudible.
     pub fn reset(&mut self) {
         self.voices = [Voice::default(); MAX_VOICES];
@@ -195,7 +254,6 @@ impl Synth {
             sample_rate,
             ..
         } = self;
-        let table = bank.table(*program);
         let patch = bank.patch(*program);
         let rate = sample_rate.get().max(1) as f32;
 
@@ -208,12 +266,12 @@ impl Synth {
                 }
                 if note.end_frame > frame {
                     let slot = free_voice(voices);
-                    voices[slot] = new_voice(note, patch, *is_drum_kit, rate);
+                    voices[slot] = new_voice(note, *program, patch, *is_drum_kit, rate);
                 }
                 *cursor += 1;
             }
 
-            let mut sample = 0.0_f32;
+            let mut sample = [0.0_f32; 2];
             for voice in voices.iter_mut() {
                 if !voice.is_active() {
                     continue;
@@ -222,12 +280,18 @@ impl Synth {
                 if !voice.is_drum && voice.stage != Stage::Release && frame >= voice.end_frame {
                     voice.stage = Stage::Release;
                 }
-                sample += advance(voice, table, next_noise(noise_state));
+                let table = if voice.is_drum {
+                    bank.sine()
+                } else {
+                    bank.table_at(voice.table)
+                };
+                let value = advance(voice, table, next_noise(noise_state));
+                sample[0] += value[0];
+                sample[1] += value[1];
             }
 
-            let value = sample * *level;
-            left[offset] += value;
-            right[offset] += value;
+            left[offset] += sample[0] * *level;
+            right[offset] += sample[1] * *level;
         }
 
         self.expected_frame = block_start.saturating_add(frames as u64);
@@ -236,7 +300,13 @@ impl Synth {
     fn start_voice(&mut self, note: &ScheduledNote) {
         let slot = free_voice(&self.voices);
         let rate = self.sample_rate.get().max(1) as f32;
-        self.voices[slot] = new_voice(note, self.bank.patch(self.program), self.is_drum_kit, rate);
+        self.voices[slot] = new_voice(
+            note,
+            self.program,
+            self.bank.patch(self.program),
+            self.is_drum_kit,
+            rate,
+        );
     }
 
     /// Rebuilds state after the transport jumped.
@@ -272,18 +342,49 @@ fn next_noise(state: &mut u32) -> f32 {
     (*state >> 8) as f32 / 8_388_608.0 - 1.0
 }
 
-fn new_voice(note: &ScheduledNote, patch: &Patch, is_drum_kit: bool, rate: f32) -> Voice {
+/// How far one note strays from the written one.
+///
+/// Derived by hashing the note rather than drawing from the running noise
+/// source, so the same note varies the same way however the block is split and
+/// wherever the transport was before it — an offline render and a live pass
+/// come out identical.
+#[derive(Clone, Copy, Debug)]
+struct Variation {
+    tuning: f32,
+    level: f32,
+    timbre: f32,
+}
+
+fn variation(note: &ScheduledNote) -> Variation {
+    let mut hash = (note.start_frame as u32)
+        ^ ((note.start_frame >> 32) as u32).wrapping_mul(0x9E37_79B9)
+        ^ u32::from(note.pitch).wrapping_mul(0x0085_EBCA)
+        ^ u32::from(note.velocity).wrapping_mul(0x00C2_B2AE);
+    hash = (hash ^ (hash >> 16)).wrapping_mul(0x21F0_AAAD);
+    hash = (hash ^ (hash >> 15)).wrapping_mul(0x735A_2D97);
+    hash ^= hash >> 15;
+    // Disjoint ten-bit slices, each mapped to -1..1.
+    let unit = |shift: u32| ((hash >> shift) & 0x3FF) as f32 / 512.0 - 1.0;
+    Variation {
+        tuning: unit(0),
+        level: unit(10),
+        timbre: unit(20),
+    }
+}
+
+fn new_voice(
+    note: &ScheduledNote,
+    program: u8,
+    patch: &Patch,
+    is_drum_kit: bool,
+    rate: f32,
+) -> Voice {
     let amplitude = f32::from(note.velocity) / 127.0;
+    let variation = variation(note);
     if is_drum_kit {
-        drum_voice_state(gm::drum_voice(note.pitch), rate, amplitude)
+        drum_voice_state(gm::drum_voice(note.pitch), rate, amplitude, variation)
     } else {
-        pitched_voice_state(
-            patch,
-            midi_to_frequency(note.pitch),
-            rate,
-            amplitude,
-            note.end_frame,
-        )
+        pitched_voice_state(patch, program, note, rate, amplitude, variation)
     }
 }
 
@@ -303,13 +404,16 @@ fn free_voice(voices: &[Voice; MAX_VOICES]) -> usize {
 
 fn pitched_voice_state(
     patch: &Patch,
-    frequency: f32,
+    program: u8,
+    note: &ScheduledNote,
     rate: f32,
     amplitude: f32,
-    end_frame: u64,
+    variation: Variation,
 ) -> Voice {
+    let detune = variation.tuning * patch.humanise_cents;
+    let frequency = midi_to_frequency(note.pitch) * cents_ratio(detune);
     let increment = frequency / rate;
-    let detune = 2.0_f32.powf(patch.detune_cents / 1_200.0);
+
     // Brightness is a multiple of the note's own pitch, so high notes stay
     // proportionally as bright as low ones instead of turning into sine waves.
     // A softly played note is darker as well as quieter: velocity scales the
@@ -321,97 +425,182 @@ fn pitched_voice_state(
     // heard — the band-limited tables have little energy above the nominal
     // cutoff, so the sweep has to move down into the harmonics, not up past
     // them, to change the timbre.
-    let peak_cutoff = (frequency * patch.brightness * velocity_scale).clamp(60.0, ceiling);
+    let peak_cutoff = (frequency * patch.brightness * velocity_scale
+        * (1.0 + variation.timbre * 0.06))
+        .clamp(60.0, ceiling);
     let base_cutoff = (peak_cutoff / (1.0 + patch.filter_env)).clamp(60.0, ceiling);
-    let vibrato_depth = 2.0_f32.powf(patch.vibrato_cents / 1_200.0) - 1.0;
+
+    let vibrato_depth = cents_ratio(patch.vibrato_cents) - 1.0;
     let vibrato_angle = std::f32::consts::TAU * patch.vibrato_hz / rate;
-    Voice {
+
+    // Where the note sits between the ends of the keyboard, -1 to 1, so a
+    // piano is laid out under the listener the way it is recorded.
+    let keyboard_position = (f32::from(note.pitch) - 60.0) / 42.0;
+    let voice_pan = (keyboard_position * patch.keyboard_spread).clamp(-1.0, 1.0);
+
+    let mut voice = Voice {
         stage: Stage::Attack,
-        phase: 0.0,
-        phase_detuned: 0.0,
-        increment,
-        increment_detuned: if patch.detune_cents > 0.0 {
-            increment * detune
-        } else {
-            0.0
-        },
-        amplitude: amplitude * patch.level,
+        table: gm::table_index(program, note.pitch),
+        amplitude: amplitude * patch.level * (1.0 + variation.level * 0.05),
         envelope: 0.0,
-        end_frame,
+        end_frame: note.end_frame,
         attack_step: 1.0 / (patch.attack_seconds * rate).max(1.0),
-        decay_step: 1.0 / (patch.decay_seconds * rate).max(1.0),
+        decay_coeff: decay_coefficient(patch.decay_seconds_at(note.pitch), rate),
         sustain: patch.sustain,
-        release_step: 1.0 / (patch.release_seconds * rate).max(1.0),
-        noise_level: patch.noise,
+        release_coeff: decay_coefficient(patch.release_seconds, rate),
+        noise_mix: patch.noise,
+        burst: patch.attack_noise,
+        burst_env: 1.0,
+        burst_coeff: decay_coefficient(patch.attack_noise_seconds, rate),
+        tone_env: 1.0,
+        tone_coeff: 1.0,
+        resonance: patch.resonance.clamp(0.0, 1.0),
         filter_coeff_base: one_pole_coefficient(base_cutoff, rate),
         filter_coeff_peak: one_pole_coefficient(peak_cutoff, rate),
         filter_env: 1.0,
-        filter_env_step: 1.0 / (patch.filter_decay_seconds * rate).max(1.0),
-        filter_state: 0.0,
-        filter_state2: 0.0,
-        lfo_sin: 0.0,
+        filter_env_coeff: decay_coefficient(patch.filter_decay_seconds, rate),
+        highpass_coeff: 0.0,
         lfo_cos: 1.0,
         lfo_rot_sin: vibrato_angle.sin(),
         lfo_rot_cos: vibrato_angle.cos(),
         vibrato_depth,
-        vibrato_ramp: 0.0,
         vibrato_ramp_step: 1.0 / (patch.vibrato_delay_seconds * rate).max(1.0),
-        is_drum: false,
         pitch_multiplier: 1.0,
-        pitch_step: 0.0,
+        pitch_target: 1.0,
+        pitch_coeff: 1.0,
+        ..Voice::default()
+    };
+
+    voice.increment[0] = increment;
+    voice.osc_gain[0] = pan_gains(voice_pan);
+    voice.noise_gain = voice.osc_gain[0];
+    if patch.detune_cents > 0.0 {
+        // The centre keeps the pitch; the pair straddles it and is pushed out
+        // to the sides. Gains sum to one so a detuned patch is no louder than
+        // a single oscillator.
+        let spread = patch.stereo_spread.clamp(0.0, 1.0);
+        // Deliberately lopsided. Detuned by equal amounts either side, the two
+        // would beat against the centre in step and periodically cancel it
+        // outright, which is heard as the note swelling and dropping away.
+        // Nothing tunes that evenly; unequal offsets beat at unequal rates and
+        // never all line up.
+        voice.increment[1] = increment / cents_ratio(patch.detune_cents);
+        voice.increment[2] = increment * cents_ratio(patch.detune_cents * 0.62);
+        // Start them apart. Three strings struck in perfect phase agreement
+        // would be loudest at the onset and thin out as they drifted, which is
+        // both wrong and audible as a swell backwards; no two strings on a real
+        // instrument agree on where their cycle begins.
+        voice.phase[1] = (0.37 + variation.tuning * 0.5).fract().abs();
+        voice.phase[2] = (0.71 + variation.timbre * 0.5).fract().abs();
+        for (index, side) in [(1_usize, -1.0_f32), (2, 1.0)] {
+            let pan = (voice_pan + side * spread).clamp(-1.0, 1.0);
+            let gains = pan_gains(pan);
+            voice.osc_gain[index] = [gains[0] * 0.3, gains[1] * 0.3];
+        }
+        voice.osc_gain[0] = [voice.osc_gain[0][0] * 0.4, voice.osc_gain[0][1] * 0.4];
     }
+    voice
 }
 
-fn drum_voice_state(voice: DrumVoice, rate: f32, amplitude: f32) -> Voice {
-    let decay_frames = (voice.decay_seconds * rate).max(1.0);
-    let increment = if voice.frequency > 0.0 {
-        voice.frequency / rate
-    } else {
-        0.0
-    };
-    Voice {
+fn drum_voice_state(
+    drum: DrumVoice,
+    rate: f32,
+    amplitude: f32,
+    variation: Variation,
+) -> Voice {
+    // No two hits on a real kit are the same. Without this a hi-hat pattern is
+    // instantly recognisable as a machine.
+    let decay_seconds = (drum.decay_seconds * (1.0 + variation.level * 0.12)).max(0.005);
+    let tone_seconds = (drum.tone_decay() * (1.0 + variation.level * 0.12)).max(0.005);
+    let frequency = drum.frequency * (1.0 + variation.tuning * 0.03);
+    let ceiling = rate * 0.45;
+    // A hard hit is brighter as well as louder, on a drum more than anything.
+    let cutoff = (drum.noise_cutoff * (0.55 + 0.45 * amplitude)
+        * (1.0 + variation.timbre * 0.08))
+        .clamp(200.0, ceiling);
+
+    let mut voice = Voice {
         stage: Stage::Decay,
-        phase: 0.0,
-        phase_detuned: 0.0,
-        increment,
-        increment_detuned: 0.0,
-        amplitude: amplitude * voice.level,
+        amplitude: amplitude * drum.level * (1.0 + variation.level * 0.08),
         envelope: 1.0,
         end_frame: u64::MAX,
         attack_step: 1.0,
-        decay_step: 1.0 / decay_frames,
+        decay_coeff: decay_coefficient(decay_seconds, rate),
         sustain: 0.0,
-        release_step: 1.0 / decay_frames,
-        noise_level: voice.noise,
-        filter_coeff_base: one_pole_coefficient(voice.noise_cutoff.min(rate * 0.45), rate),
-        filter_coeff_peak: one_pole_coefficient(voice.noise_cutoff.min(rate * 0.45), rate),
+        release_coeff: decay_coefficient(decay_seconds, rate),
+        noise_mix: drum.noise,
+        burst: drum.click,
+        burst_env: 1.0,
+        burst_coeff: decay_coefficient(0.004, rate),
+        tone_env: 1.0,
+        tone_coeff: decay_coefficient(tone_seconds, rate),
+        resonance: if drum.frequency > 0.0 { 0.15 } else { 0.0 },
+        filter_coeff_base: one_pole_coefficient(cutoff, rate),
+        filter_coeff_peak: one_pole_coefficient(cutoff, rate),
         filter_env: 0.0,
-        filter_env_step: 1.0,
-        filter_state: 0.0,
-        filter_state2: 0.0,
-        lfo_sin: 0.0,
+        filter_env_coeff: 0.0,
+        highpass_coeff: if drum.noise_highpass > 0.0 {
+            one_pole_coefficient(drum.noise_highpass.min(ceiling), rate)
+        } else {
+            0.0
+        },
         lfo_cos: 1.0,
-        lfo_rot_sin: 0.0,
         lfo_rot_cos: 1.0,
-        vibrato_depth: 0.0,
-        vibrato_ramp: 0.0,
         vibrato_ramp_step: 1.0,
         is_drum: true,
         pitch_multiplier: 1.0,
-        pitch_step: (voice.pitch_drop - 1.0) / decay_frames,
+        pitch_target: drum.pitch_drop.max(0.05),
+        pitch_coeff: decay_coefficient(drum.pitch_drop_seconds, rate),
+        ..Voice::default()
+    };
+
+    let gains = pan_gains(drum.pan);
+    voice.noise_gain = gains;
+    if frequency > 0.0 {
+        voice.increment[0] = frequency / rate;
+        voice.osc_gain[0] = gains;
+        if drum.partial_ratio > 0.0 && drum.partial_level > 0.0 {
+            voice.increment[1] = frequency * drum.partial_ratio / rate;
+            voice.osc_gain[1] = [
+                gains[0] * drum.partial_level,
+                gains[1] * drum.partial_level,
+            ];
+        }
     }
+    voice
+}
+
+/// Falls to `-DECAY_DB` over `seconds`, as a per-frame multiplier.
+fn decay_coefficient(seconds: f32, rate: f32) -> f32 {
+    let frames = (seconds * rate).max(1.0);
+    (-DECAY_DB / 20.0 * std::f32::consts::LN_10 / frames).exp()
+}
+
+/// A frequency ratio from an interval in cents.
+fn cents_ratio(cents: f32) -> f32 {
+    2.0_f32.powf(cents / 1_200.0)
+}
+
+/// Constant-power pan: centre is unity in both channels, hard over is `√2` in
+/// one and silence in the other, and the total power is the same throughout.
+fn pan_gains(pan: f32) -> [f32; 2] {
+    let angle = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
+    [
+        angle.cos() * std::f32::consts::SQRT_2,
+        angle.sin() * std::f32::consts::SQRT_2,
+    ]
 }
 
 /// One-pole low-pass coefficient for a cutoff in Hz.
 fn one_pole_coefficient(cutoff: f32, rate: f32) -> f32 {
-    let normalised = (cutoff / rate).clamp(1e-5, 0.49);
+    let normalised = (cutoff / rate).clamp(1e-5, 0.45);
     1.0 - (-std::f32::consts::TAU * normalised).exp()
 }
 
-/// Advances one voice by a frame and returns its contribution.
-fn advance(voice: &mut Voice, table: &[f32; TABLE_SIZE], noise: f32) -> f32 {
+/// Advances one voice by a frame and returns its stereo contribution.
+fn advance(voice: &mut Voice, table: &Wavetable, noise: f32) -> [f32; 2] {
     match voice.stage {
-        Stage::Idle => return 0.0,
+        Stage::Idle => return [0.0; 2],
         Stage::Attack => {
             voice.envelope += voice.attack_step;
             if voice.envelope >= 1.0 {
@@ -420,54 +609,36 @@ fn advance(voice: &mut Voice, table: &[f32; TABLE_SIZE], noise: f32) -> f32 {
             }
         }
         Stage::Decay => {
-            voice.envelope -= voice.decay_step;
-            if voice.envelope <= voice.sustain {
-                if voice.sustain > 0.0 {
+            // Towards the sustain level, by a constant fraction per frame. A
+            // patch that does not sustain therefore approaches silence rather
+            // than crossing it, and is retired at the audibility floor.
+            voice.envelope =
+                voice.sustain + (voice.envelope - voice.sustain) * voice.decay_coeff;
+            if voice.sustain > SILENCE {
+                if voice.envelope - voice.sustain <= SILENCE {
                     voice.envelope = voice.sustain;
                     voice.stage = Stage::Sustain;
-                } else if voice.envelope <= 0.0 {
-                    *voice = Voice::default();
-                    return 0.0;
                 }
+            } else if voice.envelope <= SILENCE {
+                *voice = Voice::default();
+                return [0.0; 2];
             }
         }
         Stage::Sustain => {}
         Stage::Release => {
-            voice.envelope -= voice.release_step;
-            if voice.envelope <= 0.0 {
+            voice.envelope *= voice.release_coeff;
+            if voice.envelope <= SILENCE {
                 *voice = Voice::default();
-                return 0.0;
+                return [0.0; 2];
             }
         }
     }
 
-    let tone = if voice.increment > 0.0 {
-        let first = sample_table(table, voice.phase);
-        if voice.increment_detuned > 0.0 {
-            // Two oscillators at half level each keeps a detuned patch the
-            // same loudness as a single one.
-            (first + sample_table(table, voice.phase_detuned)) * 0.5
-        } else {
-            first
-        }
-    } else {
-        0.0
-    };
-
-    let mixed = tone * (1.0 - voice.noise_level) + noise * voice.noise_level;
-    // The filter cutoff sweeps from its bright onset down to the settled tone.
-    let coefficient =
-        voice.filter_coeff_base + (voice.filter_coeff_peak - voice.filter_coeff_base) * voice.filter_env;
-    voice.filter_state += coefficient * (mixed - voice.filter_state);
-    voice.filter_state2 += coefficient * (voice.filter_state - voice.filter_state2);
-    if voice.filter_env > 0.0 {
-        voice.filter_env = (voice.filter_env - voice.filter_env_step).max(0.0);
-    }
-
-    // Pitched voices bend with the vibrato; drums keep their downward sweep.
+    // Pitched voices bend with the vibrato; drums fall towards their target.
     let pitch = if voice.is_drum {
         let multiplier = voice.pitch_multiplier;
-        voice.pitch_multiplier = (voice.pitch_multiplier + voice.pitch_step).max(0.05);
+        voice.pitch_multiplier = voice.pitch_target
+            + (voice.pitch_multiplier - voice.pitch_target) * voice.pitch_coeff;
         multiplier
     } else {
         // Rotate the quadrature LFO one step; a zero-Hz vibrato leaves it at
@@ -480,24 +651,59 @@ fn advance(voice: &mut Voice, table: &[f32; TABLE_SIZE], noise: f32) -> f32 {
         1.0 + voice.vibrato_depth * voice.vibrato_ramp * sin
     };
 
-    voice.phase += voice.increment * pitch;
-    if voice.phase >= 1.0 {
-        voice.phase -= voice.phase.floor();
+    let mut tone = [0.0_f32; 2];
+    for index in 0..UNISON {
+        let increment = voice.increment[index];
+        if increment <= 0.0 {
+            continue;
+        }
+        let value = table.sample(voice.phase[index]) * voice.tone_env;
+        tone[0] += value * voice.osc_gain[index][0];
+        tone[1] += value * voice.osc_gain[index][1];
+        let mut phase = voice.phase[index] + increment * pitch;
+        if phase >= 1.0 {
+            phase -= phase.floor();
+        }
+        voice.phase[index] = phase;
     }
-    voice.phase_detuned += voice.increment_detuned * pitch;
-    if voice.phase_detuned >= 1.0 {
-        voice.phase_detuned -= voice.phase_detuned.floor();
+    if voice.tone_coeff < 1.0 {
+        voice.tone_env *= voice.tone_coeff;
     }
 
-    voice.filter_state2 * voice.level()
-}
+    // A hi-hat is noise with everything below a few kilohertz taken out; the
+    // same filter keeps a breath from thickening the low end of a flute.
+    let shaped = if voice.highpass_coeff > 0.0 {
+        voice.highpass_state += voice.highpass_coeff * (noise - voice.highpass_state);
+        noise - voice.highpass_state
+    } else {
+        noise
+    };
+    let noise_amount = voice.noise_mix + voice.burst * voice.burst_env;
+    voice.burst_env *= voice.burst_coeff;
+    let noise_gain = voice.noise_gain;
+    let tone_gain = (1.0 - voice.noise_mix).max(0.0);
 
-fn sample_table(table: &[f32; TABLE_SIZE], phase: f32) -> f32 {
-    let index = phase * TABLE_SIZE as f32;
-    let lower = (index as usize) % TABLE_SIZE;
-    let upper = (lower + 1) % TABLE_SIZE;
-    let fraction = index - index.floor();
-    table[lower] + (table[upper] - table[lower]) * fraction
+    // The filter cutoff sweeps from its bright onset down to the settled tone.
+    let coefficient = voice.filter_coeff_base
+        + (voice.filter_coeff_peak - voice.filter_coeff_base) * voice.filter_env;
+    voice.filter_env *= voice.filter_env_coeff;
+
+    // Feeding the second stage's output back into the first puts a resonant
+    // peak at the corner, which is what makes the sweep read as a body rather
+    // than a blanket. The make-up gain restores what the feedback takes off.
+    let make_up = 1.0 + voice.resonance;
+    let level = voice.level();
+    let mut output = [0.0_f32; 2];
+    for channel in 0..2 {
+        let state = &mut voice.filter_state[channel];
+        let mixed = tone[channel] * tone_gain
+            + shaped * noise_amount * noise_gain[channel]
+            - voice.resonance * state[1];
+        state[0] += coefficient * (mixed - state[0]);
+        state[1] += coefficient * (state[0] - state[1]);
+        output[channel] = state[1] * make_up * level;
+    }
+    output
 }
 
 /// Equal-temperament frequency for a MIDI pitch, A4 = 440 Hz.
@@ -510,8 +716,15 @@ pub fn midi_to_frequency(pitch: u8) -> f32 {
 mod tests {
     use super::*;
 
+    /// Built once for the whole test binary: the tables cost real work to
+    /// build, and a test that rebuilds them per note takes minutes.
+    fn bank() -> Arc<GmBank> {
+        static BANK: std::sync::OnceLock<Arc<GmBank>> = std::sync::OnceLock::new();
+        Arc::clone(BANK.get_or_init(|| Arc::new(GmBank::new(SampleRate::DEFAULT))))
+    }
+
     fn synth() -> Synth {
-        Synth::new(SampleRate::DEFAULT, Arc::new(GmBank::new()))
+        Synth::new(SampleRate::DEFAULT, bank())
     }
 
     fn note(start: u64, end: u64, pitch: u8) -> ScheduledNote {
@@ -529,14 +742,29 @@ mod tests {
 
     /// Renders one note held for the whole block and returns the left channel.
     fn render_note(program: u8, drums: bool, pitch: u8, frames: usize) -> Vec<f32> {
+        render_stereo(program, drums, pitch, 100, frames).0
+    }
+
+    fn render_stereo(
+        program: u8,
+        drums: bool,
+        pitch: u8,
+        velocity: u8,
+        frames: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
         let mut synth = synth();
         synth.set_program(program);
         synth.set_drum_kit(drums);
-        let notes = [note(0, frames as u64, pitch)];
+        let notes = [ScheduledNote {
+            start_frame: 0,
+            end_frame: frames as u64,
+            pitch,
+            velocity,
+        }];
         let mut left = vec![0.0; frames];
         let mut right = vec![0.0; frames];
         synth.render(&notes, 0, &mut left, &mut right);
-        left
+        (left, right)
     }
 
     #[test]
@@ -588,6 +816,39 @@ mod tests {
     }
 
     #[test]
+    fn a_low_string_rings_far_longer_than_a_high_one() {
+        // Key-tracked decay. Both notes are held for the whole buffer, so any
+        // difference is the instrument's own, not the note length's.
+        let low = render_note(0, false, 33, 192_000);
+        let high = render_note(0, false, 93, 192_000);
+        let tail = |buffer: &[f32]| energy(&buffer[96_000..]);
+        let onset = |buffer: &[f32]| energy(&buffer[..8_000]);
+        let low_ratio = tail(&low) / onset(&low);
+        let high_ratio = tail(&high) / onset(&high);
+        assert!(
+            low_ratio > high_ratio * 4.0,
+            "the bottom of the keyboard ({low_ratio}) died as fast as the top ({high_ratio})"
+        );
+    }
+
+    #[test]
+    fn a_voice_reads_the_table_band_limited_for_its_own_pitch() {
+        // The mip levels exist so a bass note can keep the harmonics that make
+        // it an instrument rather than a hum, while a treble note stays under
+        // Nyquist. A voice has to pick the one for its own pitch.
+        let bank = bank();
+        let rate = SampleRate::DEFAULT.get() as f32;
+        let voice = |pitch: u8| new_voice(&note(0, 48_000, pitch), 0, bank.patch(0), false, rate);
+        let bass = voice(33).table;
+        let treble = voice(105).table;
+        assert_ne!(bass, treble, "both ends of the keyboard read one table");
+        assert!(
+            bank.table_at(bass).len() > bank.table_at(treble).len(),
+            "the bass note is as band-limited as the treble one"
+        );
+    }
+
+    #[test]
     fn drum_notes_play_a_kit_rather_than_pitches() {
         let kick = render_note(0, true, 36, 24_000);
         let snare = render_note(0, true, 38, 24_000);
@@ -597,6 +858,39 @@ mod tests {
         }
         let tail = |buffer: &[f32]| energy(&buffer[12_000..]);
         assert!(tail(&hat) < tail(&kick), "the hi-hat rang longer than the kick");
+    }
+
+    #[test]
+    fn a_hi_hat_is_brighter_than_a_kick() {
+        // The high-pass on the noise is what separates a cymbal from a hiss and
+        // a hiss from a thud.
+        let kick = render_stereo(0, true, 36, 100, 8_000).0;
+        let hat = render_stereo(0, true, 42, 100, 8_000).0;
+        assert!(
+            brightness(&hat[..2_000]) > brightness(&kick[..2_000]) * 4.0,
+            "the hi-hat is not sitting above the kick"
+        );
+    }
+
+    #[test]
+    fn repeated_drum_hits_are_not_identical() {
+        // A pattern of bit-identical hits is the machine-gun effect, and is the
+        // fastest way to hear that a kit is programmed rather than played.
+        let mut synth = synth();
+        synth.set_drum_kit(true);
+        let notes: Vec<ScheduledNote> = (0..2)
+            .map(|index| note(index * 8_000, index * 8_000 + 100, 42))
+            .collect();
+        let mut left = vec![0.0; 16_000];
+        let mut right = vec![0.0; 16_000];
+        synth.render(&notes, 0, &mut left, &mut right);
+        let first = energy(&left[..4_000]);
+        let second = energy(&left[8_000..12_000]);
+        assert!(first > 0.0 && second > 0.0, "a hit was silent");
+        assert!(
+            (first - second).abs() / first > 0.005,
+            "two hits came out identical: {first} and {second}"
+        );
     }
 
     #[test]
@@ -615,15 +909,71 @@ mod tests {
     }
 
     #[test]
-    fn the_two_output_channels_match() {
-        let mut synth = synth();
-        let notes = [note(0, 24_000, 64)];
-        let (mut left, mut right) = ([0.0; 256], [0.0; 256]);
-        synth.render(&notes, 0, &mut left, &mut right);
+    fn a_kick_drops_in_pitch_well_before_it_stops_sounding() {
+        // The pitch envelope is far shorter than the amplitude one; stretched
+        // over the whole decay it is a slide whistle, not a kick.
+        let rate = SampleRate::DEFAULT.get() as f32;
+        let mut voice = drum_voice_state(
+            gm::drum_voice(36),
+            rate,
+            1.0,
+            Variation {
+                tuning: 0.0,
+                level: 0.0,
+                timbre: 0.0,
+            },
+        );
+        let bank = bank();
+        for _ in 0..(rate * 0.1) as usize {
+            advance(&mut voice, bank.sine(), 0.0);
+        }
+        assert!(
+            voice.pitch_multiplier < voice.pitch_target * 1.05,
+            "the kick was still sliding a tenth of a second in"
+        );
+        assert!(voice.envelope > 0.15, "the kick had already stopped sounding");
+    }
+
+    #[test]
+    fn a_patch_without_width_stays_centred() {
+        // A flute is one player in one place.
+        let (left, right) = render_stereo(73, false, 64, 100, 4_096);
         assert!(
             left.iter()
                 .zip(right.iter())
-                .all(|(l, r)| (l - r).abs() < f32::EPSILON)
+                .all(|(l, r)| (l - r).abs() < 1e-6)
+        );
+    }
+
+    #[test]
+    fn an_ensemble_is_wider_than_a_soloist() {
+        // Detune heard in mono is beating; spread across the channels it is
+        // width, which is the whole difference between a section and a player.
+        let width = |(left, right): (Vec<f32>, Vec<f32>)| -> f32 {
+            let side: f32 = left.iter().zip(&right).map(|(l, r)| (l - r).abs()).sum();
+            let mid: f32 = left.iter().zip(&right).map(|(l, r)| (l + r).abs()).sum();
+            side / (mid + 1e-9)
+        };
+        let flute = width(render_stereo(73, false, 64, 100, 8_192));
+        let strings = width(render_stereo(48, false, 64, 100, 8_192));
+        assert!(
+            strings > flute + 0.1,
+            "the string section ({strings}) is no wider than the flute ({flute})"
+        );
+    }
+
+    #[test]
+    fn the_drum_kit_is_spread_across_the_stereo_field() {
+        let (hat_left, hat_right) = render_stereo(0, true, 42, 100, 8_000);
+        let (crash_left, crash_right) = render_stereo(0, true, 49, 100, 8_000);
+        let bias = |left: &[f32], right: &[f32]| energy(right) - energy(left);
+        assert!(
+            bias(&hat_left, &hat_right) > 0.0,
+            "the hats should sit to one side"
+        );
+        assert!(
+            bias(&crash_left, &crash_right) < 0.0,
+            "the crash should sit to the other"
         );
     }
 
@@ -677,7 +1027,7 @@ mod tests {
         let notes: Vec<ScheduledNote> = (0..8)
             .map(|index| note(index * 4_000, index * 4_000 + 3_000, 60 + index as u8))
             .collect();
-        let bank = Arc::new(GmBank::new());
+        let bank = bank();
 
         let mut whole = Synth::new(SampleRate::DEFAULT, Arc::clone(&bank));
         let (mut left_whole, mut right_whole) = (vec![0.0; 8_192], vec![0.0; 8_192]);
@@ -702,6 +1052,22 @@ mod tests {
     }
 
     #[test]
+    fn the_same_note_varies_but_the_same_render_does_not() {
+        // Humanisation must come from the note, not from a running counter, or
+        // rendering twice would give two different files.
+        let first = render_note(0, false, 60, 4_096);
+        let second = render_note(0, false, 60, 4_096);
+        assert_eq!(first, second, "the same render came out differently");
+
+        let one = variation(&note(0, 1_000, 60));
+        let other = variation(&note(48_000, 49_000, 60));
+        assert!(
+            (one.tuning - other.tuning).abs() > 1e-6,
+            "two notes were tuned identically"
+        );
+    }
+
+    #[test]
     fn more_notes_than_voices_does_not_overflow() {
         let mut synth = synth();
         synth.set_program(16);
@@ -716,20 +1082,45 @@ mod tests {
 
     #[test]
     fn output_stays_within_a_sane_range() {
-        let mut synth = synth();
-        synth.set_program(48);
-        let notes: Vec<ScheduledNote> = (0..MAX_VOICES)
-            .map(|index| ScheduledNote {
-                start_frame: 0,
-                end_frame: 96_000,
-                pitch: 40 + index as u8,
-                velocity: 127,
-            })
-            .collect();
-        let (mut left, mut right) = (vec![0.0; 8_192], vec![0.0; 8_192]);
-        synth.render(&notes, 0, &mut left, &mut right);
-        let peak = left.iter().fold(0.0_f32, |peak, value| peak.max(value.abs()));
-        assert!(peak.is_finite() && peak < 40.0, "peak was {peak}");
+        for program in 0..=127_u8 {
+            let mut synth = synth();
+            synth.set_program(program);
+            let notes: Vec<ScheduledNote> = (0..MAX_VOICES)
+                .map(|index| ScheduledNote {
+                    start_frame: 0,
+                    end_frame: 96_000,
+                    pitch: 40 + index as u8,
+                    velocity: 127,
+                })
+                .collect();
+            let (mut left, mut right) = (vec![0.0; 4_096], vec![0.0; 4_096]);
+            synth.render(&notes, 0, &mut left, &mut right);
+            let peak = left.iter().fold(0.0_f32, |peak, value| peak.max(value.abs()));
+            assert!(
+                peak.is_finite() && peak < 40.0,
+                "{} peaked at {peak}",
+                gm::program_name(program)
+            );
+        }
+    }
+
+    #[test]
+    fn a_resonant_filter_does_not_run_away() {
+        // The feedback path is only conditionally stable; every patch must sit
+        // well inside the stable region at every pitch.
+        for program in 0..=127_u8 {
+            for pitch in [24_u8, 60, 108] {
+                let buffer = render_stereo(program, false, pitch, 127, 8_000).0;
+                let peak = buffer
+                    .iter()
+                    .fold(0.0_f32, |peak, value| peak.max(value.abs()));
+                assert!(
+                    peak.is_finite() && peak < 4.0,
+                    "{} at pitch {pitch} peaked at {peak}",
+                    gm::program_name(program)
+                );
+            }
+        }
     }
 
     #[test]
@@ -767,10 +1158,45 @@ mod tests {
     }
 
     #[test]
-    fn noise_is_deterministic_across_runs() {
-        let first = render_note(73, false, 60, 2_048);
-        let second = render_note(73, false, 60, 2_048);
-        assert_eq!(first, second, "a breathy patch must render identically twice");
+    fn no_instrument_is_wildly_louder_than_another() {
+        // A transcription with a flute part and a guitar part has to balance
+        // without reaching for the faders, so every patch carries a level trim
+        // measured against the rest of the bank. Loudness is taken over the
+        // first half second, which is what the ear weights for a note that
+        // decays away rather than holding.
+        let head = SampleRate::DEFAULT.get() as usize / 2;
+        let mut quietest = (f32::MAX, 0_u8);
+        let mut loudest = (0.0_f32, 0_u8);
+        for program in 0..=127_u8 {
+            let rendered = render_stereo(program, false, 60, 100, head).0;
+            let rms =
+                (rendered.iter().map(|value| value * value).sum::<f32>() / head as f32).sqrt();
+            assert!(rms > 0.0, "{} is silent", gm::program_name(program));
+            if rms < quietest.0 {
+                quietest = (rms, program);
+            }
+            if rms > loudest.0 {
+                loudest = (rms, program);
+            }
+        }
+        assert!(
+            loudest.0 < quietest.0 * 3.0,
+            "{} ({}) drowns out {} ({})",
+            gm::program_name(loudest.1),
+            loudest.0,
+            gm::program_name(quietest.1),
+            quietest.0
+        );
+    }
+
+    #[test]
+    fn a_hall_instrument_is_sent_further_into_the_reverb_than_a_bass() {
+        let mut synth = synth();
+        synth.set_program(48);
+        let strings = synth.reverb_send();
+        synth.set_program(33);
+        let bass = synth.reverb_send();
+        assert!(strings > bass * 2.0, "strings {strings} against bass {bass}");
     }
 
     /// A spectral-tilt measure: energy of the sample-to-sample change over the
@@ -782,21 +1208,6 @@ mod tests {
         let change: f32 = buffer.windows(2).map(|pair| (pair[1] - pair[0]).powi(2)).sum();
         let energy: f32 = buffer.iter().map(|value| value * value).sum();
         change / (energy + 1e-12)
-    }
-
-    fn render_note_at(program: u8, pitch: u8, velocity: u8, frames: usize) -> Vec<f32> {
-        let mut synth = synth();
-        synth.set_program(program);
-        let notes = [ScheduledNote {
-            start_frame: 0,
-            end_frame: frames as u64,
-            pitch,
-            velocity,
-        }];
-        let mut left = vec![0.0; frames];
-        let mut right = vec![0.0; frames];
-        synth.render(&notes, 0, &mut left, &mut right);
-        left
     }
 
     #[test]
@@ -816,8 +1227,8 @@ mod tests {
     fn a_harder_hit_is_brighter_not_just_louder() {
         // Velocity must change timbre, not only level: a hard piano note is
         // brighter than a soft one over the same window.
-        let soft = render_note_at(0, 60, 30, 8_000);
-        let hard = render_note_at(0, 60, 120, 8_000);
+        let soft = render_stereo(0, false, 60, 30, 8_000).0;
+        let hard = render_stereo(0, false, 60, 120, 8_000).0;
         let soft_bright = brightness(&soft[500..4_500]);
         let hard_bright = brightness(&hard[500..4_500]);
         assert!(
@@ -827,10 +1238,50 @@ mod tests {
     }
 
     #[test]
+    fn a_struck_note_opens_with_a_transient_before_the_tone() {
+        // The hammer, then the string. Without the burst the onset is a pure
+        // tone fading up, which no acoustic instrument does. Rendering the same
+        // voice with and without it isolates the transient from the filter
+        // envelope, which brightens the onset for its own reasons.
+        let bank = bank();
+        let rate = SampleRate::DEFAULT.get() as f32;
+        let struck = note(0, 48_000, 60);
+        let render = |mut voice: Voice| -> Vec<f32> {
+            let table = bank.table_at(voice.table);
+            let mut noise = 0x2545_F491_u32;
+            (0..2_400)
+                .map(|_| advance(&mut voice, table, next_noise(&mut noise))[0])
+                .collect()
+        };
+        let hammered = render(new_voice(&struck, 0, bank.patch(0), false, rate));
+        let mut without = new_voice(&struck, 0, bank.patch(0), false, rate);
+        without.burst = 0.0;
+        let string_alone = render(without);
+
+        let difference = |range: std::ops::Range<usize>| -> f32 {
+            hammered[range.clone()]
+                .iter()
+                .zip(&string_alone[range])
+                .map(|(with, out)| (with - out).abs())
+                .sum()
+        };
+        let onset = difference(0..480);
+        let body = difference(1_920..2_400);
+        assert!(onset > 0.0, "the hammer made no sound at all");
+        assert!(
+            body < onset * 0.05,
+            "the transient ({onset}) was still going in the body ({body})"
+        );
+    }
+
+    #[test]
     fn sustained_instruments_waver_and_struck_ones_hold_steady() {
         let rate = SampleRate::DEFAULT.get().max(1) as f32;
-        let bank = GmBank::new();
-        let depth = |program: u8| new_voice(&note(0, 48_000, 60), bank.patch(program), false, rate).vibrato_depth;
+        let bank = bank();
+        let depth = |program: u8| {
+            new_voice(&note(0, 48_000, 60), program, bank.patch(program), false, rate)
+                .vibrato_depth
+        };
         // Strings and flute carry a vibrato; a piano and a pluck must not.
         assert!(depth(48) > 0.0, "strings should waver");
         assert!(depth(73) > 0.0, "a flute should waver");
@@ -841,9 +1292,9 @@ mod tests {
     #[test]
     fn the_vibrato_swells_in_rather_than_starting_at_full_depth() {
         let rate = SampleRate::DEFAULT.get().max(1) as f32;
-        let bank = GmBank::new();
-        let table = bank.table(48);
-        let mut voice = new_voice(&note(0, 96_000, 60), bank.patch(48), false, rate);
+        let bank = bank();
+        let table = bank.table(48, 60);
+        let mut voice = new_voice(&note(0, 96_000, 60), 48, bank.patch(48), false, rate);
         // Immediately after the onset the LFO has barely moved off its start;
         // a second later it is oscillating with real depth.
         for _ in 0..64 {
