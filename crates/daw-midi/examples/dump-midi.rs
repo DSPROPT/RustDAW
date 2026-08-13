@@ -7,7 +7,9 @@
 use anyhow::{Context, Result};
 
 fn main() -> Result<()> {
-    let path = std::env::args().nth(1).context("usage: dump-midi <file.mid>")?;
+    let path = std::env::args()
+        .nth(1)
+        .context("usage: dump-midi <file.mid>")?;
     let bytes = std::fs::read(&path).with_context(|| format!("failed to read {path}"))?;
     let file = daw_midi::smf::parse(&bytes)?;
 
@@ -28,23 +30,37 @@ fn main() -> Result<()> {
             track.notes.iter().map(|note| note.pitch).max(),
         ) {
             (Some(low), Some(high)) => {
-                format!("{} – {}", daw_midi::pitch_name(low), daw_midi::pitch_name(high))
+                format!(
+                    "{} – {}",
+                    daw_midi::pitch_name(low),
+                    daw_midi::pitch_name(high)
+                )
             }
             _ => "—".to_owned(),
         };
         println!(
             "  {:<12} {:>5} notes  {:<14} {}{}",
-            if track.name.is_empty() { "(unnamed)" } else { &track.name },
+            if track.name.is_empty() {
+                "(unnamed)"
+            } else {
+                &track.name
+            },
             track.notes.len(),
             range,
-            track
-                .channel
-                .map_or_else(|| "no channel".to_owned(), |channel| format!("ch{}", channel + 1)),
+            track.channel.map_or_else(
+                || "no channel".to_owned(),
+                |channel| format!("ch{}", channel + 1)
+            ),
             if track.is_drums() { "  [drums]" } else { "" }
         );
     }
 
-    let end = file.tracks.iter().map(daw_midi::SmfTrack::end_tick).max().unwrap_or(0);
+    let end = file
+        .tracks
+        .iter()
+        .map(daw_midi::SmfTrack::end_tick)
+        .max()
+        .unwrap_or(0);
     println!("length: {:.1} s", file.tempo_map.tick_to_seconds(end));
     Ok(())
 }

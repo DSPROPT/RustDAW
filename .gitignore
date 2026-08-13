@@ -1,8 +1,20 @@
 /target/
+
+# Session media and user content. Recordings and amp captures belong to the
+# person who made them, not to the repository.
 /Songs/
 /Amps/
+/Recordings/
+/Sessions/
 *.wav
 *.peak
 .rustdaw/
 
+# Credentials. See .env.example for the template.
 .env
+
+# Python worker
+__pycache__/
+*.py[cod]
+.venv/
+venv/

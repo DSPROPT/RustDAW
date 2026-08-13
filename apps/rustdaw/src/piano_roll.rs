@@ -183,10 +183,8 @@ pub fn show(
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, CornerRadius::ZERO, theme::PANEL);
 
-    let grid_rect = Rect::from_min_max(
-        Pos2::new(rect.min.x + KEYBOARD_WIDTH, rect.min.y),
-        rect.max,
-    );
+    let grid_rect =
+        Rect::from_min_max(Pos2::new(rect.min.x + KEYBOARD_WIDTH, rect.min.y), rect.max);
     let bottom_y = grid_rect.max.y;
     let origin_x = grid_rect.min.x;
 
@@ -200,8 +198,8 @@ pub fn show(
             )
         });
         if zoom_h && scroll.y != 0.0 {
-            state.pixels_per_quarter = (state.pixels_per_quarter * (1.0 + scroll.y * 0.006))
-                .clamp(8.0, 900.0);
+            state.pixels_per_quarter =
+                (state.pixels_per_quarter * (1.0 + scroll.y * 0.006)).clamp(8.0, 900.0);
         } else if zoom_v && scroll.y != 0.0 {
             state.row_height =
                 (state.row_height * (1.0 + scroll.y * 0.006)).clamp(MIN_ROW_HEIGHT, MAX_ROW_HEIGHT);
@@ -229,7 +227,9 @@ pub fn show(
             continue;
         }
         let x0 = state.x_at_tick(note.start_tick as f64, origin_x);
-        let x1 = state.x_at_tick(note.end_tick() as f64, origin_x).max(x0 + 2.0);
+        let x1 = state
+            .x_at_tick(note.end_tick() as f64, origin_x)
+            .max(x0 + 2.0);
         let y = state.y_at_pitch(f32::from(note.pitch), bottom_y);
         if y > grid_rect.max.y || y + state.row_height < grid_rect.min.y {
             continue;
@@ -254,7 +254,14 @@ pub fn show(
         painter.rect_stroke(
             note_rect,
             CornerRadius::same(2),
-            Stroke::new(1.0_f32, if selected { Color32::WHITE } else { theme::BORDER }),
+            Stroke::new(
+                1.0_f32,
+                if selected {
+                    Color32::WHITE
+                } else {
+                    theme::BORDER
+                },
+            ),
             StrokeKind::Inside,
         );
     }
@@ -271,15 +278,7 @@ pub fn show(
         );
     }
 
-    handle_input(
-        state,
-        ui,
-        &canvas,
-        clip,
-        origin_x,
-        bottom_y,
-        &mut response,
-    );
+    handle_input(state, ui, &canvas, clip, origin_x, bottom_y, &mut response);
 
     response.edited |= state.dirty;
     state.dirty = false;
@@ -288,11 +287,7 @@ pub fn show(
 
 fn toolbar(state: &mut PianoRollState, ui: &mut egui::Ui, clip: &MidiClip) {
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(&clip.name)
-                .strong()
-                .color(theme::BLUE),
-        );
+        ui.label(egui::RichText::new(&clip.name).strong().color(theme::BLUE));
         ui.label(
             egui::RichText::new(format!("{} notes", clip.notes.len()))
                 .small()
@@ -395,7 +390,7 @@ fn draw_grid_lines(
                 );
             }
             if on_bar {
-                                let bar = (tick / bar_ticks) as u64 + 1;
+                let bar = (tick / bar_ticks) as u64 + 1;
                 painter.text(
                     Pos2::new(x + 3.0, rect.min.y + 2.0),
                     egui::Align2::LEFT_TOP,
@@ -410,10 +405,7 @@ fn draw_grid_lines(
 }
 
 fn draw_keyboard(state: &PianoRollState, painter: &egui::Painter, rect: Rect, bottom_y: f32) {
-    let keys = Rect::from_min_max(
-        rect.min,
-        Pos2::new(rect.min.x + KEYBOARD_WIDTH, rect.max.y),
-    );
+    let keys = Rect::from_min_max(rect.min, Pos2::new(rect.min.x + KEYBOARD_WIDTH, rect.max.y));
     painter.rect_filled(keys, CornerRadius::ZERO, Color32::from_rgb(18, 21, 26));
     let rows = (rect.height() / state.row_height).ceil() as i32 + 1;
     for row in 0..rows {
@@ -560,19 +552,21 @@ fn handle_input(
         if state.drag.is_some() {
             // Moving a note can put it out of order; the scheduler and the
             // painter both assume start-tick order.
-            let selected_note: Option<Note> =
-                state.selected.and_then(|index| clip.notes.get(index).copied());
+            let selected_note: Option<Note> = state
+                .selected
+                .and_then(|index| clip.notes.get(index).copied());
             clip.resort();
-            state.selected = selected_note.and_then(|note| {
-                clip.notes.iter().position(|candidate| *candidate == note)
-            });
+            state.selected = selected_note
+                .and_then(|note| clip.notes.iter().position(|candidate| *candidate == note));
             state.dirty = true;
         }
         state.drag = None;
     }
 
     if canvas.hovered()
-        && ui.input(|input| input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace))
+        && ui.input(|input| {
+            input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace)
+        })
     {
         if let Some(index) = state.selected.take() {
             if index < clip.notes.len() {
@@ -595,7 +589,9 @@ fn note_at(
     // Later notes are drawn on top, so search backwards to match what is seen.
     for (index, note) in clip.notes.iter().enumerate().rev() {
         let x0 = state.x_at_tick(note.start_tick as f64, origin_x);
-        let x1 = state.x_at_tick(note.end_tick() as f64, origin_x).max(x0 + 2.0);
+        let x1 = state
+            .x_at_tick(note.end_tick() as f64, origin_x)
+            .max(x0 + 2.0);
         let y = state.y_at_pitch(f32::from(note.pitch), bottom_y);
         let rect = Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1, y + state.row_height));
         if rect.contains(pointer) {
@@ -647,7 +643,11 @@ mod tests {
         assert_eq!(state.snap_tick(100), 0);
         assert_eq!(state.snap_tick(130), 240);
         assert_eq!(state.snap_tick(239), 240);
-        assert_eq!(state.snap_tick(-50), 0, "notes cannot start before the clip");
+        assert_eq!(
+            state.snap_tick(-50),
+            0,
+            "notes cannot start before the clip"
+        );
     }
 
     #[test]

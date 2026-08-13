@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: Format, lint, and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the workspace and NeuralAmpModelerCore
+        uses: actions/checkout@v4
+        with:
+          # daw-nam compiles NeuralAmpModelerCore from source, and NAM carries
+          # Eigen, nlohmann and AudioDSPTools as submodules of its own.
+          submodules: recursive
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache the Cargo registry and build directory
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system libraries
+        # ALSA and PulseAudio for cpal, GL and xkbcommon for eframe, GTK for the
+        # native file dialogs. No audio device is opened during the test suite.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev \
+            libpulse-dev \
+            libgl1-mesa-dev \
+            libgtk-3-dev \
+            libxkbcommon-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+  package:
+    name: Build the Debian package
+    runs-on: ubuntu-latest
+    # Only worth the release build once the fast checks are green.
+    needs: check
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev \
+            libpulse-dev \
+            libgl1-mesa-dev \
+            libgtk-3-dev \
+            libxkbcommon-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
+      - name: Build the .deb
+        # The TONE3000 key is not needed to build: without one, GET AMPS opens
+        # the site in a browser instead of the in-app picker.
+        run: ./packaging/build-deb.sh
+
+      - name: Upload the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdaw-deb
+          path: dist/*.deb
+          if-no-files-found: error

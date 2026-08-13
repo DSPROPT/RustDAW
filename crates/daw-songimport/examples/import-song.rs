@@ -61,7 +61,10 @@ fn main() -> Result<()> {
                 .document
                 .tempo_map()
                 .tick_to_seconds(track.midi_end_tick());
-            println!("  {:8} {notes:>5} notes, ends {end:.1} s  [instrument]", track.name);
+            println!(
+                "  {:8} {notes:>5} notes, ends {end:.1} s  [instrument]",
+                track.name
+            );
             continue;
         }
         let frames: u64 = track

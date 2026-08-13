@@ -238,7 +238,9 @@ pub fn ingest_project(
                 } else {
                     let count = instrument_tracks.len();
                     document.tracks.extend(instrument_tracks);
-                    notes.push(format!("Imported {count} instrument track(s) from the transcription."));
+                    notes.push(format!(
+                        "Imported {count} instrument track(s) from the transcription."
+                    ));
                 }
             }
             Err(error) => notes.push(format!("MIDI could not be imported: {error}")),
@@ -319,7 +321,9 @@ fn detect_tempo(
             }
         }
         Err(error) => {
-            notes.push(format!("Tempo detection failed ({error}); left at 120 BPM."));
+            notes.push(format!(
+                "Tempo detection failed ({error}); left at 120 BPM."
+            ));
             let _ = target_rate;
             TempoDetection::fallback(120.0)
         }
@@ -388,12 +392,8 @@ fn detect_chord_chart(
     }
 
     let chromagram = daw_analysis::chroma::chromagram(&mixed, rate);
-    let (spans, key) = daw_analysis::chords::detect_chords(
-        &chromagram,
-        &grid.beat_times,
-        4,
-        grid.downbeat_index,
-    );
+    let (spans, key) =
+        daw_analysis::chords::detect_chords(&chromagram, &grid.beat_times, 4, grid.downbeat_index);
     // The audio was delayed to put its downbeat on bar 1; the chart has to move
     // with it or every chord would sit a fraction of a bar early.
     let chords = spans
@@ -440,8 +440,8 @@ fn import_midi_tracks(
     if !path.is_file() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let file = daw_midi::smf::parse(&bytes)?;
 
     // The file's ticks mean nothing on their own: they are relative to the
@@ -473,11 +473,7 @@ fn import_midi_tracks(
             })
             .collect();
         clip.resort();
-        clip.length_ticks = clip
-            .notes
-            .last()
-            .map_or(1, |note| note.end_tick())
-            .max(1);
+        clip.length_ticks = clip.notes.last().map_or(1, |note| note.end_tick()).max(1);
         // Channel 10 is the General MIDI drum kit, which the synth now plays.
         let mut track = if source.is_drums() {
             ProjectTrack::drum_track(name)
@@ -542,7 +538,12 @@ fn convert_audio(source: &Path, destination: &Path, target_rate: u32) -> Result<
         .args(["-c:a", "pcm_s24le"])
         .arg(destination)
         .output()
-        .with_context(|| format!("failed to run ffmpeg; install it with `{}`", ffmpeg_install_hint()))?;
+        .with_context(|| {
+            format!(
+                "failed to run ffmpeg; install it with `{}`",
+                ffmpeg_install_hint()
+            )
+        })?;
 
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr);
@@ -595,7 +596,10 @@ fn unique_directory(root: &Path, base: &str) -> Result<PathBuf> {
             return Ok(candidate);
         }
     }
-    bail!("could not find an unused folder name under {}", root.display())
+    bail!(
+        "could not find an unused folder name under {}",
+        root.display()
+    )
 }
 
 fn sanitize_file_name(name: &str) -> String {
@@ -684,7 +688,10 @@ mod tests {
 
     #[test]
     fn file_names_lose_separators_and_keep_spaces() {
-        assert_eq!(sanitize_file_name("AC/DC - Back in Black"), "AC_DC - Back in Black");
+        assert_eq!(
+            sanitize_file_name("AC/DC - Back in Black"),
+            "AC_DC - Back in Black"
+        );
         assert_eq!(sanitize_file_name("../../etc"), "______etc");
         assert_eq!(sanitize_file_name("   "), "Imported Song");
     }

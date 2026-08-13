@@ -136,8 +136,14 @@ mod tests {
             stack.process(&mut frames, bass, FLAT, FLAT);
             level(&frames)
         };
-        assert!(shaped(&low, MAX) > shaped(&low, FLAT) * 2.0, "bass did not lift");
-        assert!(shaped(&low, 0.0) < shaped(&low, FLAT) * 0.5, "bass did not cut");
+        assert!(
+            shaped(&low, MAX) > shaped(&low, FLAT) * 2.0,
+            "bass did not lift"
+        );
+        assert!(
+            shaped(&low, 0.0) < shaped(&low, FLAT) * 0.5,
+            "bass did not cut"
+        );
         let untouched = (shaped(&high, MAX) - shaped(&high, FLAT)).abs();
         assert!(
             untouched < shaped(&high, FLAT) * 0.1,
@@ -155,10 +161,19 @@ mod tests {
             stack.process(&mut frames, FLAT, FLAT, treble);
             level(&frames)
         };
-        assert!(shaped(&high, MAX) > shaped(&high, FLAT) * 2.0, "treble did not lift");
-        assert!(shaped(&high, 0.0) < shaped(&high, FLAT) * 0.5, "treble did not cut");
+        assert!(
+            shaped(&high, MAX) > shaped(&high, FLAT) * 2.0,
+            "treble did not lift"
+        );
+        assert!(
+            shaped(&high, 0.0) < shaped(&high, FLAT) * 0.5,
+            "treble did not cut"
+        );
         let untouched = (shaped(&low, MAX) - shaped(&low, FLAT)).abs();
-        assert!(untouched < shaped(&low, FLAT) * 0.1, "treble moved the bass band");
+        assert!(
+            untouched < shaped(&low, FLAT) * 0.1,
+            "treble moved the bass band"
+        );
     }
 
     #[test]

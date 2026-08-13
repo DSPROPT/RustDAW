@@ -309,11 +309,19 @@ impl ActiveNam {
 
         let amped = self.processor.process(&mut self.mono[..count]).is_ok();
         let level = if amped {
-            let normalize = if self.normalize { self.normalize_gain } else { 1.0 };
+            let normalize = if self.normalize {
+                self.normalize_gain
+            } else {
+                1.0
+            };
             self.output_gain * normalize
         } else {
             // Never silence: the player has to hear themselves whatever failed.
-            if self.input_gain > 1e-6 { 1.0 / self.input_gain } else { 1.0 }
+            if self.input_gain > 1e-6 {
+                1.0 / self.input_gain
+            } else {
+                1.0
+            }
         };
 
         for (frame, sample) in self.stereo[..count].iter_mut().zip(&self.mono[..count]) {
@@ -321,8 +329,12 @@ impl ActiveNam {
             *frame = [output, output];
         }
         if amped && self.tone_enabled {
-            self.tone
-                .process(&mut self.stereo[..count], self.bass, self.middle, self.treble);
+            self.tone.process(
+                &mut self.stereo[..count],
+                self.bass,
+                self.middle,
+                self.treble,
+            );
         }
         frames[..count].copy_from_slice(&self.stereo[..count]);
     }
@@ -447,8 +459,7 @@ impl AudioRuntime {
         // scope here — this path exists so playback works on any machine.)
         let sample_rate = SampleRate::new(output_default.sample_rate())
             .context("audio backend returned a zero output sample rate")?;
-        let input_rate =
-            SampleRate::new(input_default.sample_rate()).unwrap_or(sample_rate);
+        let input_rate = SampleRate::new(input_default.sample_rate()).unwrap_or(sample_rate);
 
         let shared = Arc::new(Shared::new());
         let playback_commands = Arc::new(ArrayQueue::new(PLAYBACK_COMMAND_CAPACITY));
@@ -818,7 +829,9 @@ impl AudioRuntime {
     ) -> Result<()> {
         self.collect_retired_playback();
         debug_assert!(
-            notes.windows(2).all(|pair| pair[0].start_frame <= pair[1].start_frame),
+            notes
+                .windows(2)
+                .all(|pair| pair[0].start_frame <= pair[1].start_frame),
             "notes must be sorted before reaching the audio thread"
         );
         self.playback_commands
@@ -873,6 +886,11 @@ impl AudioRuntime {
 
     /// Loads and activates a NAM capture for one guitar track. Model parsing and
     /// prewarming happen here, never in the audio callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the capture cannot be parsed or does not match the
+    /// session sample rate, or if the audio command queue is full.
     pub fn set_track_nam_model(
         &self,
         track_id: usize,
@@ -896,6 +914,11 @@ impl AudioRuntime {
     }
 
     /// Loads the NAM capture used by the currently monitored guitar input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the capture cannot be parsed or does not match the
+    /// session sample rate, or if the audio command queue is full.
     pub fn set_monitor_nam_model(
         &self,
         path: Option<&std::path::Path>,
@@ -1081,10 +1104,7 @@ impl AudioRuntime {
             transport,
             xruns: self.shared.xruns.load(Ordering::Relaxed),
             dropped_record_frames: self.shared.dropped_record_frames.load(Ordering::Relaxed),
-            trimmed_monitor_frames: self
-                .shared
-                .trimmed_monitor_frames
-                .load(Ordering::Relaxed),
+            trimmed_monitor_frames: self.shared.trimmed_monitor_frames.load(Ordering::Relaxed),
             monitor_amp_faults: self.shared.monitor_amp_faults.load(Ordering::Relaxed),
             disk_error: self.shared.disk_error.load(Ordering::Acquire),
         }
@@ -1215,6 +1235,10 @@ fn build_input(
     Ok(stream)
 }
 
+// The capture stream fans one input out to the recorder, the monitor path and
+// the tuner, each with its own lock-free queue. Boxing them into a struct would
+// only move the same arguments behind one more name.
+#[allow(clippy::too_many_arguments)]
 fn input_stream<T: cpal::SizedSample + Copy + Send + 'static>(
     device: &cpal::Device,
     config: StreamConfig,
@@ -1462,14 +1486,9 @@ fn output_stream<T: cpal::SizedSample + Copy + Send + 'static>(
                         PlaybackCommand::SetTrackEffects { track_id, params } => {
                             mixer.set_track_effects(track_id, params);
                         }
-                        PlaybackCommand::SetTrackNam {
-                            track_id,
-                            model,
-                        } => mixer.set_track_nam(
-                            track_id,
-                            model,
-                            &queues.retired_nam,
-                        ),
+                        PlaybackCommand::SetTrackNam { track_id, model } => {
+                            mixer.set_track_nam(track_id, model, &queues.retired_nam);
+                        }
                         PlaybackCommand::SetMonitorNam { model } => {
                             if let Some(old) = monitor_nam.take() {
                                 let _ = queues.retired_nam.push(old);
@@ -1538,10 +1557,24 @@ fn output_stream<T: cpal::SizedSample + Copy + Send + 'static>(
                         // Normal 1:1 path — unchanged, and the only path that can
                         // sound the stopped output-test tone.
                         render_source_block(
-                            position, frames, playing, click_enabled, click_level, tempo,
-                            meter_numerator, meter_denominator, sample_rate, &mut scratch_left,
-                            &mut scratch_right, &mut mixer, &playback_slots, &midi_slots, &shared,
-                            &queues.monitor, &mut monitor_effects, &mut monitor_nam,
+                            position,
+                            frames,
+                            playing,
+                            click_enabled,
+                            click_level,
+                            tempo,
+                            meter_numerator,
+                            meter_denominator,
+                            sample_rate,
+                            &mut scratch_left,
+                            &mut scratch_right,
+                            &mut mixer,
+                            &playback_slots,
+                            &midi_slots,
+                            &shared,
+                            &queues.monitor,
+                            &mut monitor_effects,
+                            &mut monitor_nam,
                         );
                         let test_frames = shared.output_test_frames.load(Ordering::Relaxed);
                         let rendered_test_frames =
@@ -1596,10 +1629,24 @@ fn output_stream<T: cpal::SizedSample + Copy + Send + 'static>(
                             ratio,
                             |count, source_left, source_right| {
                                 render_source_block(
-                                    position, count, true, false, click_level, tempo,
-                                    meter_numerator, meter_denominator, sample_rate, source_left,
-                                    source_right, &mut mixer, &playback_slots, &midi_slots, &shared,
-                                    &queues.monitor, &mut monitor_effects, &mut monitor_nam,
+                                    position,
+                                    count,
+                                    true,
+                                    false,
+                                    click_level,
+                                    tempo,
+                                    meter_numerator,
+                                    meter_denominator,
+                                    sample_rate,
+                                    source_left,
+                                    source_right,
+                                    &mut mixer,
+                                    &playback_slots,
+                                    &midi_slots,
+                                    &shared,
+                                    &queues.monitor,
+                                    &mut monitor_effects,
+                                    &mut monitor_nam,
                                 );
                                 position = position.saturating_add(count as u64);
                             },
@@ -2020,7 +2067,13 @@ impl TrackMixer {
         self.reverb_send[..frame_count].fill([0.0, 0.0]);
 
         self.render_notes(midi, block_start, frame_count, &mut track_used);
-        mix_clips(clips, block_start, frame_count, &mut self.scratch, &mut track_used);
+        mix_clips(
+            clips,
+            block_start,
+            frame_count,
+            &mut self.scratch,
+            &mut track_used,
+        );
 
         for track_id in 0..MIXER_TRACK_CAPACITY {
             if !track_used[track_id] {
@@ -2333,6 +2386,9 @@ fn float_to_i24(sample: f32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    // Test signals are generated from small loop counters, where the cast
+    // is exact and the precision warning has nothing to catch.
+    #![allow(clippy::cast_precision_loss)]
     use super::*;
 
     #[test]
@@ -2507,7 +2563,8 @@ mod tests {
             compressor_attack_ms: 1.0,
             ..ChannelStripParams::default()
         };
-        let mut mixer = TrackMixer::new(SampleRate::DEFAULT, None).expect("the synthesised bank always builds");
+        let mut mixer =
+            TrackMixer::new(SampleRate::DEFAULT, None).expect("the synthesised bank always builds");
         mixer.set_track_effects(2, params);
         let empty_midi: [Option<MidiPart>; MIDI_SLOT_CAPACITY] = std::array::from_fn(|_| None);
         let mut left = [0.0_f32; CLICK_SCRATCH_FRAMES];
@@ -2525,7 +2582,8 @@ mod tests {
 
     #[test]
     fn instrument_tracks_reach_the_mix_through_their_own_bus() {
-        let mut mixer = TrackMixer::new(SampleRate::DEFAULT, None).expect("the synthesised bank always builds");
+        let mut mixer =
+            TrackMixer::new(SampleRate::DEFAULT, None).expect("the synthesised bank always builds");
         let mut midi: [Option<MidiPart>; MIDI_SLOT_CAPACITY] = std::array::from_fn(|_| None);
         midi[0] = Some(MidiPart {
             track_id: 3,
@@ -2627,8 +2685,8 @@ mod tests {
 
     #[test]
     fn without_a_sound_font_the_synthesised_bank_plays() {
-        let mixer = TrackMixer::new(SampleRate::DEFAULT, None)
-            .expect("the synthesised bank always builds");
+        let mixer =
+            TrackMixer::new(SampleRate::DEFAULT, None).expect("the synthesised bank always builds");
         assert!(mixer.sampled.is_none());
     }
 
@@ -2636,8 +2694,8 @@ mod tests {
     fn instrument_tracks_ring_on_in_the_shared_reverb() {
         // The reverb is a bus, so its tail has to survive after the notes have
         // stopped and after the tracks that fed it have gone quiet.
-        let mut mixer = TrackMixer::new(SampleRate::DEFAULT, None)
-            .expect("the synthesised bank always builds");
+        let mut mixer =
+            TrackMixer::new(SampleRate::DEFAULT, None).expect("the synthesised bank always builds");
         let mut midi: [Option<MidiPart>; MIDI_SLOT_CAPACITY] = std::array::from_fn(|_| None);
         midi[0] = Some(MidiPart {
             track_id: 3,
@@ -2689,7 +2747,8 @@ mod tests {
 
     #[test]
     fn muting_an_instrument_track_silences_it_immediately() {
-        let mut mixer = TrackMixer::new(SampleRate::DEFAULT, None).expect("the synthesised bank always builds");
+        let mut mixer =
+            TrackMixer::new(SampleRate::DEFAULT, None).expect("the synthesised bank always builds");
         let mut midi: [Option<MidiPart>; MIDI_SLOT_CAPACITY] = std::array::from_fn(|_| None);
         midi[0] = Some(MidiPart {
             track_id: 1,
@@ -2762,7 +2821,14 @@ mod tests {
         let mut left = [0.0_f32; 256];
         let mut right = [0.0_f32; 256];
         let mut effects = ChannelStrip::new(SampleRate::DEFAULT, ChannelStripParams::default());
-        mix_monitoring(&shared, &queue, &mut left, &mut right, &mut effects, &mut None);
+        mix_monitoring(
+            &shared,
+            &queue,
+            &mut left,
+            &mut right,
+            &mut effects,
+            &mut None,
+        );
 
         assert!(queue.len() < deep, "the backlog was not trimmed");
         assert!(
@@ -2794,7 +2860,14 @@ mod tests {
         let mut left = [0.0_f32; 32];
         let mut right = [0.0_f32; 32];
         let mut effects = ChannelStrip::new(SampleRate::DEFAULT, ChannelStripParams::default());
-        mix_monitoring(&shared, &queue, &mut left, &mut right, &mut effects, &mut None);
+        mix_monitoring(
+            &shared,
+            &queue,
+            &mut left,
+            &mut right,
+            &mut effects,
+            &mut None,
+        );
 
         assert_eq!(
             shared.trimmed_monitor_frames.load(Ordering::Relaxed),
@@ -2839,7 +2912,14 @@ mod tests {
         let mut left = [0.0_f32; 256];
         let mut right = [0.0_f32; 256];
         let mut effects = ChannelStrip::new(SampleRate::DEFAULT, ChannelStripParams::default());
-        mix_monitoring(&shared, &queue, &mut left, &mut right, &mut effects, &mut nam);
+        mix_monitoring(
+            &shared,
+            &queue,
+            &mut left,
+            &mut right,
+            &mut effects,
+            &mut nam,
+        );
 
         assert!(left.iter().all(|value| value.is_finite()));
         let difference: f32 = left
@@ -2884,7 +2964,14 @@ mod tests {
         let mut left = [0.0_f32; 256];
         let mut right = [0.0_f32; 256];
         let mut effects = ChannelStrip::new(SampleRate::DEFAULT, ChannelStripParams::default());
-        mix_monitoring(&shared, &queue, &mut left, &mut right, &mut effects, &mut nam);
+        mix_monitoring(
+            &shared,
+            &queue,
+            &mut left,
+            &mut right,
+            &mut effects,
+            &mut nam,
+        );
 
         assert!(
             shared.monitor_amp_faults.load(Ordering::Relaxed) > 0,
@@ -2905,8 +2992,8 @@ mod tests {
     fn render_with_transport(playing: bool) -> (Vec<f32>, ArrayQueue<[f32; 2]>) {
         let shared = Shared::new();
         shared.monitoring.store(true, Ordering::Release);
-        let mut mixer = TrackMixer::new(SampleRate::DEFAULT, None)
-            .expect("the synthesised bank always builds");
+        let mut mixer =
+            TrackMixer::new(SampleRate::DEFAULT, None).expect("the synthesised bank always builds");
         let mut playback_slots: [Option<PlaybackClip>; PLAYBACK_SLOT_CAPACITY] =
             std::array::from_fn(|_| None);
         playback_slots[0] = Some(PlaybackClip {

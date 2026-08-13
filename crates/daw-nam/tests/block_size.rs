@@ -24,7 +24,11 @@ fn a_block_larger_than_the_prepared_size_is_refused() {
     let refused = processor.process(&mut audio);
     assert!(refused.is_err(), "an oversized block was accepted");
     // And the caller's audio is left exactly as it was, not half-written.
-    assert!(audio.iter().all(|sample| (*sample - 0.01).abs() < f32::EPSILON));
+    assert!(
+        audio
+            .iter()
+            .all(|sample| (*sample - 0.01).abs() < f32::EPSILON)
+    );
 }
 
 #[test]

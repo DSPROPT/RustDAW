@@ -425,9 +425,9 @@ fn pitched_voice_state(
     // heard — the band-limited tables have little energy above the nominal
     // cutoff, so the sweep has to move down into the harmonics, not up past
     // them, to change the timbre.
-    let peak_cutoff = (frequency * patch.brightness * velocity_scale
-        * (1.0 + variation.timbre * 0.06))
-        .clamp(60.0, ceiling);
+    let peak_cutoff =
+        (frequency * patch.brightness * velocity_scale * (1.0 + variation.timbre * 0.06))
+            .clamp(60.0, ceiling);
     let base_cutoff = (peak_cutoff / (1.0 + patch.filter_env)).clamp(60.0, ceiling);
 
     let vibrato_depth = cents_ratio(patch.vibrato_cents) - 1.0;
@@ -502,12 +502,7 @@ fn pitched_voice_state(
     voice
 }
 
-fn drum_voice_state(
-    drum: DrumVoice,
-    rate: f32,
-    amplitude: f32,
-    variation: Variation,
-) -> Voice {
+fn drum_voice_state(drum: DrumVoice, rate: f32, amplitude: f32, variation: Variation) -> Voice {
     // No two hits on a real kit are the same. Without this a hi-hat pattern is
     // instantly recognisable as a machine.
     let decay_seconds = (drum.decay_seconds * (1.0 + variation.level * 0.12)).max(0.005);
@@ -515,8 +510,7 @@ fn drum_voice_state(
     let frequency = drum.frequency * (1.0 + variation.tuning * 0.03);
     let ceiling = rate * 0.45;
     // A hard hit is brighter as well as louder, on a drum more than anything.
-    let cutoff = (drum.noise_cutoff * (0.55 + 0.45 * amplitude)
-        * (1.0 + variation.timbre * 0.08))
+    let cutoff = (drum.noise_cutoff * (0.55 + 0.45 * amplitude) * (1.0 + variation.timbre * 0.08))
         .clamp(200.0, ceiling);
 
     let mut voice = Voice {
@@ -561,10 +555,7 @@ fn drum_voice_state(
         voice.osc_gain[0] = gains;
         if drum.partial_ratio > 0.0 && drum.partial_level > 0.0 {
             voice.increment[1] = frequency * drum.partial_ratio / rate;
-            voice.osc_gain[1] = [
-                gains[0] * drum.partial_level,
-                gains[1] * drum.partial_level,
-            ];
+            voice.osc_gain[1] = [gains[0] * drum.partial_level, gains[1] * drum.partial_level];
         }
     }
     voice
@@ -612,8 +603,7 @@ fn advance(voice: &mut Voice, table: &Wavetable, noise: f32) -> [f32; 2] {
             // Towards the sustain level, by a constant fraction per frame. A
             // patch that does not sustain therefore approaches silence rather
             // than crossing it, and is retired at the audibility floor.
-            voice.envelope =
-                voice.sustain + (voice.envelope - voice.sustain) * voice.decay_coeff;
+            voice.envelope = voice.sustain + (voice.envelope - voice.sustain) * voice.decay_coeff;
             if voice.sustain > SILENCE {
                 if voice.envelope - voice.sustain <= SILENCE {
                     voice.envelope = voice.sustain;
@@ -637,8 +627,8 @@ fn advance(voice: &mut Voice, table: &Wavetable, noise: f32) -> [f32; 2] {
     // Pitched voices bend with the vibrato; drums fall towards their target.
     let pitch = if voice.is_drum {
         let multiplier = voice.pitch_multiplier;
-        voice.pitch_multiplier = voice.pitch_target
-            + (voice.pitch_multiplier - voice.pitch_target) * voice.pitch_coeff;
+        voice.pitch_multiplier =
+            voice.pitch_target + (voice.pitch_multiplier - voice.pitch_target) * voice.pitch_coeff;
         multiplier
     } else {
         // Rotate the quadrature LFO one step; a zero-Hz vibrato leaves it at
@@ -696,8 +686,7 @@ fn advance(voice: &mut Voice, table: &Wavetable, noise: f32) -> [f32; 2] {
     let mut output = [0.0_f32; 2];
     for channel in 0..2 {
         let state = &mut voice.filter_state[channel];
-        let mixed = tone[channel] * tone_gain
-            + shaped * noise_amount * noise_gain[channel]
+        let mixed = tone[channel] * tone_gain + shaped * noise_amount * noise_gain[channel]
             - voice.resonance * state[1];
         state[0] += coefficient * (mixed - state[0]);
         state[1] += coefficient * (state[0] - state[1]);
@@ -714,6 +703,9 @@ pub fn midi_to_frequency(pitch: u8) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    // Comparing a voice's vibrato depth to exactly zero is the assertion:
+    // a struck instrument must carry no vibrato at all, not merely little.
+    #![allow(clippy::float_cmp)]
     use super::*;
 
     /// Built once for the whole test binary: the tables cost real work to
@@ -800,9 +792,18 @@ mod tests {
         let difference = |left: &[f32], right: &[f32]| -> f32 {
             left.iter().zip(right).map(|(a, b)| (a - b).abs()).sum()
         };
-        assert!(difference(&piano, &organ) > 1.0, "piano and organ sound alike");
-        assert!(difference(&piano, &flute) > 1.0, "piano and flute sound alike");
-        assert!(difference(&organ, &flute) > 1.0, "organ and flute sound alike");
+        assert!(
+            difference(&piano, &organ) > 1.0,
+            "piano and organ sound alike"
+        );
+        assert!(
+            difference(&piano, &flute) > 1.0,
+            "piano and flute sound alike"
+        );
+        assert!(
+            difference(&organ, &flute) > 1.0,
+            "organ and flute sound alike"
+        );
     }
 
     #[test]
@@ -811,8 +812,14 @@ mod tests {
         let organ = render_note(16, false, 60, 96_000);
         let early = |buffer: &[f32]| energy(&buffer[4_000..8_000]);
         let late = |buffer: &[f32]| energy(&buffer[80_000..84_000]);
-        assert!(late(&piano) < early(&piano) * 0.6, "the piano did not decay");
-        assert!(late(&organ) > early(&organ) * 0.7, "the organ should have held");
+        assert!(
+            late(&piano) < early(&piano) * 0.6,
+            "the piano did not decay"
+        );
+        assert!(
+            late(&organ) > early(&organ) * 0.7,
+            "the organ should have held"
+        );
     }
 
     #[test]
@@ -857,7 +864,10 @@ mod tests {
             assert!(energy(buffer) > 0.5, "the {name} made no sound");
         }
         let tail = |buffer: &[f32]| energy(&buffer[12_000..]);
-        assert!(tail(&hat) < tail(&kick), "the hi-hat rang longer than the kick");
+        assert!(
+            tail(&hat) < tail(&kick),
+            "the hi-hat rang longer than the kick"
+        );
     }
 
     #[test]
@@ -931,7 +941,10 @@ mod tests {
             voice.pitch_multiplier < voice.pitch_target * 1.05,
             "the kick was still sliding a tenth of a second in"
         );
-        assert!(voice.envelope > 0.15, "the kick had already stopped sounding");
+        assert!(
+            voice.envelope > 0.15,
+            "the kick had already stopped sounding"
+        );
     }
 
     #[test]
@@ -982,14 +995,21 @@ mod tests {
         let mut synth = synth();
         let (mut left, mut right) = ([0.25_f32; 128], [0.25_f32; 128]);
         synth.render(&[], 0, &mut left, &mut right);
-        assert!(left.iter().all(|value| (*value - 0.25).abs() < f32::EPSILON));
+        assert!(
+            left.iter()
+                .all(|value| (*value - 0.25).abs() < f32::EPSILON)
+        );
     }
 
     #[test]
     fn a_chord_plays_every_note() {
         let mut synth = synth();
         synth.set_program(16);
-        let notes = [note(0, 24_000, 60), note(0, 24_000, 64), note(0, 24_000, 67)];
+        let notes = [
+            note(0, 24_000, 60),
+            note(0, 24_000, 64),
+            note(0, 24_000, 67),
+        ];
         let (mut left, mut right) = ([0.0; 256], [0.0; 256]);
         synth.render(&notes, 0, &mut left, &mut right);
         assert_eq!(synth.active_voices(), 3);
@@ -1095,7 +1115,9 @@ mod tests {
                 .collect();
             let (mut left, mut right) = (vec![0.0; 4_096], vec![0.0; 4_096]);
             synth.render(&notes, 0, &mut left, &mut right);
-            let peak = left.iter().fold(0.0_f32, |peak, value| peak.max(value.abs()));
+            let peak = left
+                .iter()
+                .fold(0.0_f32, |peak, value| peak.max(value.abs()));
             assert!(
                 peak.is_finite() && peak < 40.0,
                 "{} peaked at {peak}",
@@ -1154,7 +1176,11 @@ mod tests {
         synth.render(&notes, 0, &mut left, &mut right);
         assert!(synth.active_voices() > 0);
         synth.set_program(42);
-        assert_eq!(synth.active_voices(), 0, "a voice survived a program change");
+        assert_eq!(
+            synth.active_voices(),
+            0,
+            "a voice survived a program change"
+        );
     }
 
     #[test]
@@ -1196,7 +1222,10 @@ mod tests {
         let strings = synth.reverb_send();
         synth.set_program(33);
         let bass = synth.reverb_send();
-        assert!(strings > bass * 2.0, "strings {strings} against bass {bass}");
+        assert!(
+            strings > bass * 2.0,
+            "strings {strings} against bass {bass}"
+        );
     }
 
     /// A spectral-tilt measure: energy of the sample-to-sample change over the
@@ -1205,7 +1234,10 @@ mod tests {
     /// independent of how loud the window is, without being swamped by the
     /// fundamental the way a first-difference-over-level ratio is.
     fn brightness(buffer: &[f32]) -> f32 {
-        let change: f32 = buffer.windows(2).map(|pair| (pair[1] - pair[0]).powi(2)).sum();
+        let change: f32 = buffer
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).powi(2))
+            .sum();
         let energy: f32 = buffer.iter().map(|value| value * value).sum();
         change / (energy + 1e-12)
     }
@@ -1279,8 +1311,14 @@ mod tests {
         let rate = SampleRate::DEFAULT.get().max(1) as f32;
         let bank = bank();
         let depth = |program: u8| {
-            new_voice(&note(0, 48_000, 60), program, bank.patch(program), false, rate)
-                .vibrato_depth
+            new_voice(
+                &note(0, 48_000, 60),
+                program,
+                bank.patch(program),
+                false,
+                rate,
+            )
+            .vibrato_depth
         };
         // Strings and flute carry a vibrato; a piano and a pluck must not.
         assert!(depth(48) > 0.0, "strings should waver");
@@ -1304,7 +1342,10 @@ mod tests {
         for _ in 0..48_000 {
             advance(&mut voice, table, 0.0);
         }
-        assert!(voice.vibrato_ramp > 0.9, "the vibrato never reached full depth");
+        assert!(
+            voice.vibrato_ramp > 0.9,
+            "the vibrato never reached full depth"
+        );
         assert!(early < 0.1, "the vibrato did not delay its onset");
     }
 }

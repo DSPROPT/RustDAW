@@ -52,7 +52,11 @@ impl SongAnalysis {
 /// records a change; 3 BPM keeps genuine rubato while discarding tracking
 /// noise.
 #[must_use]
-pub fn analyse_samples(samples: &[f32], sample_rate: u32, tempo_tolerance_bpm: f64) -> SongAnalysis {
+pub fn analyse_samples(
+    samples: &[f32],
+    sample_rate: u32,
+    tempo_tolerance_bpm: f64,
+) -> SongAnalysis {
     let envelope = onset::onset_envelope(samples, sample_rate);
     let beats = beats::analyse(&envelope);
     let tempo_map = if beats.is_usable() {
@@ -100,11 +104,7 @@ pub fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, u32)> {
             reader
                 .samples::<i32>()
                 .filter_map(Result::ok)
-                .map(|sample| {
-                        {
-                        sample as f32 / scale
-                    }
-                })
+                .map(|sample| sample as f32 / scale)
                 .collect()
         }
     };

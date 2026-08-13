@@ -32,7 +32,10 @@ const MAX_REQUEST_BYTES: u64 = 8 * 1024;
 
 #[derive(Debug)]
 pub enum RedirectError {
-    Bind { port: u16, source: std::io::Error },
+    Bind {
+        port: u16,
+        source: std::io::Error,
+    },
     /// Nobody arrived before the deadline — the user closed the tab, or never
     /// finished signing in.
     TimedOut,
@@ -55,7 +58,10 @@ impl std::fmt::Display for RedirectError {
             Self::TimedOut => write!(formatter, "timed out waiting for TONE3000"),
             Self::Denied(reason) => write!(formatter, "TONE3000 refused the request: {reason}"),
             Self::StateMismatch => {
-                write!(formatter, "the reply did not match the request that was sent")
+                write!(
+                    formatter,
+                    "the reply did not match the request that was sent"
+                )
             }
             Self::Missing(field) => write!(formatter, "the reply carried no {field}"),
             Self::Io(error) => write!(formatter, "{error}"),
@@ -247,7 +253,10 @@ mod tests {
         // Without this check, any page the user visits could hand this listener
         // a code of its choosing.
         let result = callback("/?code=abc123&state=somebody-elses", "xyz");
-        assert!(matches!(result, Err(RedirectError::StateMismatch)), "{result:?}");
+        assert!(
+            matches!(result, Err(RedirectError::StateMismatch)),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -262,7 +271,10 @@ mod tests {
     #[test]
     fn a_callback_without_a_code_is_refused() {
         let result = callback("/?state=xyz", "xyz");
-        assert!(matches!(result, Err(RedirectError::Missing(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(RedirectError::Missing(_))),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -289,7 +301,11 @@ mod tests {
             server.redirect_uri(),
             format!("http://localhost:{}", server.port())
         );
-        assert_ne!(server.port(), 0, "the operating system should assign a port");
+        assert_ne!(
+            server.port(),
+            0,
+            "the operating system should assign a port"
+        );
     }
 
     #[test]

@@ -1,4 +1,8 @@
-#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 
 //! A stereo delay for the channel strip.
 //!
@@ -117,8 +121,7 @@ impl Delay {
             // in a path that feeds itself.
             let mut returned = [0.0_f32; 2];
             for channel in 0..2 {
-                self.damped[channel] +=
-                    self.damping * (delayed[channel] - self.damped[channel]);
+                self.damped[channel] += self.damping * (delayed[channel] - self.damped[channel]);
                 let blocked = self.damped[channel] - self.dc_input[channel]
                     + DC_POLE * self.dc_output[channel];
                 self.dc_input[channel] = self.damped[channel];
@@ -162,7 +165,10 @@ mod tests {
     }
 
     fn energy(frames: &[[f32; 2]]) -> f32 {
-        frames.iter().map(|frame| frame[0].abs() + frame[1].abs()).sum()
+        frames
+            .iter()
+            .map(|frame| frame[0].abs() + frame[1].abs())
+            .sum()
     }
 
     /// Feeds one impulse then silence, and returns the whole tail.
@@ -203,8 +209,18 @@ mod tests {
                 .fold(0.0_f32, |peak, frame| peak.max(frame[0].abs()))
         };
         assert!(peak(1) > 0.1 && peak(2) > 0.0, "the echo did not repeat");
-        assert!(peak(2) < peak(1), "the repeats grew: {} then {}", peak(1), peak(2));
-        assert!(peak(3) < peak(2), "the repeats grew: {} then {}", peak(2), peak(3));
+        assert!(
+            peak(2) < peak(1),
+            "the repeats grew: {} then {}",
+            peak(1),
+            peak(2)
+        );
+        assert!(
+            peak(3) < peak(2),
+            "the repeats grew: {} then {}",
+            peak(2),
+            peak(3)
+        );
         // And they are actually fading rather than creeping down.
         assert!(peak(3) < peak(1) * 0.5, "the tail is barely decaying");
     }

@@ -181,10 +181,14 @@ fn dial(ui: &mut egui::Ui, state: &TunerState) {
     if reading.is_some() {
         let half = 3.0 / DIAL_RANGE_CENTS * sweep * 0.5;
         for step in 0..=12_usize {
-            let angle = (half * 2.0).mul_add(step as f32 / 12.0, -std::f32::consts::FRAC_PI_2 - half);
+            let angle =
+                (half * 2.0).mul_add(step as f32 / 12.0, -std::f32::consts::FRAC_PI_2 - half);
             let direction = Vec2::new(angle.cos(), angle.sin());
             painter.line_segment(
-                [centre + direction * (radius - 20.0), centre + direction * radius],
+                [
+                    centre + direction * (radius - 20.0),
+                    centre + direction * radius,
+                ],
                 Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(120, 200, 120, 60)),
             );
         }
@@ -192,11 +196,16 @@ fn dial(ui: &mut egui::Ui, state: &TunerState) {
 
     // The needle.
     if reading.is_some() {
-        let cents = state.smoothed_cents.clamp(-DIAL_RANGE_CENTS, DIAL_RANGE_CENTS);
+        let cents = state
+            .smoothed_cents
+            .clamp(-DIAL_RANGE_CENTS, DIAL_RANGE_CENTS);
         let angle = -std::f32::consts::FRAC_PI_2 + cents / DIAL_RANGE_CENTS * sweep * 0.5;
         let direction = Vec2::new(angle.cos(), angle.sin());
         painter.line_segment(
-            [centre + direction * 60.0, centre + direction * (radius - 6.0)],
+            [
+                centre + direction * 60.0,
+                centre + direction * (radius - 6.0),
+            ],
             Stroke::new(3.0_f32, accent),
         );
     }
@@ -210,7 +219,11 @@ fn dial(ui: &mut egui::Ui, state: &TunerState) {
         Align2::CENTER_CENTER,
         label,
         FontId::proportional(46.0),
-        if reading.is_some() { accent } else { theme::MUTED },
+        if reading.is_some() {
+            accent
+        } else {
+            theme::MUTED
+        },
     );
 
     // Which way to turn, which is the thing a player actually needs.
@@ -249,11 +262,7 @@ fn strings(ui: &mut egui::Ui, state: &TunerState) {
             let lit = active == Some(index);
             let (rect, _) = ui.allocate_exact_size(Vec2::new(44.0, 30.0), Sense::hover());
             let painter = ui.painter();
-            painter.rect_filled(
-                rect,
-                4.0,
-                if lit { theme::PANEL_2 } else { theme::BG },
-            );
+            painter.rect_filled(rect, 4.0, if lit { theme::PANEL_2 } else { theme::BG });
             painter.rect_stroke(
                 rect,
                 4.0,
@@ -363,7 +372,10 @@ mod tests {
         state.window.resize(WINDOW_FRAMES, 0.0);
         // Held briefly, so a note decaying between plucks does not flicker.
         state.analyse(RATE, 0.2);
-        assert!(state.current().is_some(), "the reading vanished too eagerly");
+        assert!(
+            state.current().is_some(),
+            "the reading vanished too eagerly"
+        );
         state.analyse(RATE, HOLD_SECONDS + 0.1);
         assert!(state.current().is_none(), "the reading never cleared");
     }
@@ -411,7 +423,10 @@ mod tests {
     #[test]
     fn a_reading_knows_when_it_is_in_tune() {
         let reading = pitch::reading(
-            Pitch { hertz: 440.0, confidence: 1.0 },
+            Pitch {
+                hertz: 440.0,
+                confidence: 1.0,
+            },
             pitch::DEFAULT_REFERENCE_HZ,
         )
         .expect("named");

@@ -130,7 +130,11 @@ mod tests {
         gate.process(&mut [0.5_f32; 128], OPEN_THRESHOLD_DB);
         let mut samples = vec![0.5_f32; 256];
         gate.process(&mut samples, -40.0);
-        assert!(samples[0].abs() > 0.4, "the first sample was cut: {}", samples[0]);
+        assert!(
+            samples[0].abs() > 0.4,
+            "the first sample was cut: {}",
+            samples[0]
+        );
     }
 
     #[test]

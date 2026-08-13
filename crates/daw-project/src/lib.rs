@@ -226,6 +226,9 @@ impl ProjectTrack {
     }
 }
 
+// One flag per insert module. Grouping them into an enum would mean modules
+// could no longer be switched on independently, which is the whole point.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TrackEffects {
     #[serde(default)]
@@ -452,7 +455,10 @@ mod tests {
         let fresh = TrackEffects::default();
         assert!((effects.delay_time_ms - fresh.delay_time_ms).abs() < f32::EPSILON);
         assert!((effects.reverb_mix - fresh.reverb_mix).abs() < f32::EPSILON);
-        assert!(effects.delay_time_ms > 0.0, "an unset time must not be zero");
+        assert!(
+            effects.delay_time_ms > 0.0,
+            "an unset time must not be zero"
+        );
     }
 
     #[test]

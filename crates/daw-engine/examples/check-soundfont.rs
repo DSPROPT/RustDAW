@@ -31,10 +31,14 @@ const PROGRAMS: [u8; 12] = [0, 4, 12, 16, 24, 33, 40, 48, 56, 66, 71, 73];
 fn main() {
     let sample_rate = SampleRate::DEFAULT;
 
-    println!("{}: {}", SOUNDFONT_ENV, match std::env::var(SOUNDFONT_ENV) {
-        Ok(value) => value,
-        Err(_) => "unset (searching the usual places)".to_owned(),
-    });
+    println!(
+        "{}: {}",
+        SOUNDFONT_ENV,
+        match std::env::var(SOUNDFONT_ENV) {
+            Ok(value) => value,
+            Err(_) => "unset (searching the usual places)".to_owned(),
+        }
+    );
 
     let started = Instant::now();
     let Some(font) = SoundFontBank::discover() else {
@@ -61,7 +65,10 @@ fn main() {
         (buffer.iter().map(|value| value * value).sum::<f32>() / buffer.len() as f32).sqrt()
     };
 
-    println!("\n{:<26}{:>10}{:>10}{:>8}", "program", "synth", "font", "ratio");
+    println!(
+        "\n{:<26}{:>10}{:>10}{:>8}",
+        "program", "synth", "font", "ratio"
+    );
     let mut ratios = Vec::new();
     for program in PROGRAMS {
         let notes = [ScheduledNote {

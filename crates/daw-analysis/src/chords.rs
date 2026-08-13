@@ -32,16 +32,56 @@ pub struct Quality {
 
 /// Recognised chord types, commonest first.
 pub const QUALITIES: [Quality; 10] = [
-    Quality { suffix: "", intervals: &[0, 4, 7], prior: 1.0 },
-    Quality { suffix: "m", intervals: &[0, 3, 7], prior: 1.0 },
-    Quality { suffix: "7", intervals: &[0, 4, 7, 10], prior: 0.92 },
-    Quality { suffix: "m7", intervals: &[0, 3, 7, 10], prior: 0.92 },
-    Quality { suffix: "maj7", intervals: &[0, 4, 7, 11], prior: 0.88 },
-    Quality { suffix: "sus4", intervals: &[0, 5, 7], prior: 0.84 },
-    Quality { suffix: "sus2", intervals: &[0, 2, 7], prior: 0.8 },
-    Quality { suffix: "6", intervals: &[0, 4, 7, 9], prior: 0.8 },
-    Quality { suffix: "dim", intervals: &[0, 3, 6], prior: 0.78 },
-    Quality { suffix: "aug", intervals: &[0, 4, 8], prior: 0.72 },
+    Quality {
+        suffix: "",
+        intervals: &[0, 4, 7],
+        prior: 1.0,
+    },
+    Quality {
+        suffix: "m",
+        intervals: &[0, 3, 7],
+        prior: 1.0,
+    },
+    Quality {
+        suffix: "7",
+        intervals: &[0, 4, 7, 10],
+        prior: 0.92,
+    },
+    Quality {
+        suffix: "m7",
+        intervals: &[0, 3, 7, 10],
+        prior: 0.92,
+    },
+    Quality {
+        suffix: "maj7",
+        intervals: &[0, 4, 7, 11],
+        prior: 0.88,
+    },
+    Quality {
+        suffix: "sus4",
+        intervals: &[0, 5, 7],
+        prior: 0.84,
+    },
+    Quality {
+        suffix: "sus2",
+        intervals: &[0, 2, 7],
+        prior: 0.8,
+    },
+    Quality {
+        suffix: "6",
+        intervals: &[0, 4, 7, 9],
+        prior: 0.8,
+    },
+    Quality {
+        suffix: "dim",
+        intervals: &[0, 3, 6],
+        prior: 0.78,
+    },
+    Quality {
+        suffix: "aug",
+        intervals: &[0, 4, 8],
+        prior: 0.72,
+    },
 ];
 
 /// Number of decoder states: every root/quality pair, plus "no chord".
@@ -96,7 +136,10 @@ impl Chord {
         let suffix = QUALITIES[self.quality.min(QUALITIES.len() - 1)].suffix;
         match self.bass {
             Some(bass) if bass != self.root => {
-                format!("{root}{suffix}/{}", NOTE_NAMES[usize::from(bass) % PITCH_CLASSES])
+                format!(
+                    "{root}{suffix}/{}",
+                    NOTE_NAMES[usize::from(bass) % PITCH_CLASSES]
+                )
             }
             _ => format!("{root}{suffix}"),
         }
@@ -127,7 +170,8 @@ pub struct ChordSpan {
 impl ChordSpan {
     #[must_use]
     pub fn label(&self) -> String {
-        self.chord.map_or_else(|| "N.C.".to_owned(), |chord| chord.name())
+        self.chord
+            .map_or_else(|| "N.C.".to_owned(), |chord| chord.name())
     }
 }
 
@@ -182,7 +226,11 @@ pub fn detect_key(average: &[f32; PITCH_CLASSES]) -> Option<Key> {
     let mut best_score = f32::NEG_INFINITY;
     for tonic in 0..PITCH_CLASSES {
         for is_minor in [false, true] {
-            let profile = if is_minor { MINOR_PROFILE } else { MAJOR_PROFILE };
+            let profile = if is_minor {
+                MINOR_PROFILE
+            } else {
+                MAJOR_PROFILE
+            };
             let score = correlation(average, &profile, tonic);
             if score > best_score {
                 best_score = score;
@@ -447,7 +495,9 @@ fn build_spans(
                     == chord.map(|chord| (chord.root, chord.quality)) =>
             {
                 last.end_seconds = end;
-                last.confidence = last.confidence.max(confidences.get(index).copied().unwrap_or(0.0));
+                last.confidence = last
+                    .confidence
+                    .max(confidences.get(index).copied().unwrap_or(0.0));
             }
             _ => spans.push(ChordSpan {
                 start_seconds: start,
@@ -546,7 +596,10 @@ mod tests {
     #[test]
     fn a_progression_is_followed() {
         // C – Am – F – G, two seconds each.
-        let samples = play(&[&[60, 64, 67], &[57, 60, 64], &[53, 57, 60], &[55, 59, 62]], 2.0);
+        let samples = play(
+            &[&[60, 64, 67], &[57, 60, 64], &[53, 57, 60], &[55, 59, 62]],
+            2.0,
+        );
         let (spans, _) = detect_chords(&chromagram(&samples, RATE), &beats_over(8.0, 0.5), 4, 0);
         let found = labels(&spans);
         assert_eq!(
@@ -560,7 +613,12 @@ mod tests {
     fn a_held_chord_is_one_span_not_one_per_beat() {
         let samples = play(&[&[60, 64, 67]], 6.0);
         let (spans, _) = detect_chords(&chromagram(&samples, RATE), &beats_over(6.0, 0.5), 4, 0);
-        assert_eq!(spans.len(), 1, "a held chord split into {} spans", spans.len());
+        assert_eq!(
+            spans.len(),
+            1,
+            "a held chord split into {} spans",
+            spans.len()
+        );
     }
 
     #[test]
@@ -583,7 +641,10 @@ mod tests {
 
     #[test]
     fn the_key_of_a_diatonic_progression_is_found() {
-        let samples = play(&[&[60, 64, 67], &[57, 60, 64], &[53, 57, 60], &[55, 59, 62]], 2.0);
+        let samples = play(
+            &[&[60, 64, 67], &[57, 60, 64], &[53, 57, 60], &[55, 59, 62]],
+            2.0,
+        );
         let (_, key) = detect_chords(&chromagram(&samples, RATE), &beats_over(8.0, 0.5), 4, 0);
         let key = key.expect("no key was found");
         assert!(
@@ -595,7 +656,11 @@ mod tests {
 
     #[test]
     fn a_key_scale_contains_the_right_notes() {
-        let scale = Key { tonic: 0, is_minor: false }.scale();
+        let scale = Key {
+            tonic: 0,
+            is_minor: false,
+        }
+        .scale();
         // C major has no accidentals.
         assert!(scale[0] && scale[2] && scale[4] && scale[5] && scale[7] && scale[9] && scale[11]);
         assert!(!scale[1] && !scale[3] && !scale[6] && !scale[8] && !scale[10]);
@@ -603,15 +668,52 @@ mod tests {
 
     #[test]
     fn chord_names_read_the_way_musicians_write_them() {
-        assert_eq!(Chord { root: 0, quality: 0, bass: None }.name(), "C");
-        assert_eq!(Chord { root: 9, quality: 1, bass: None }.name(), "Am");
-        assert_eq!(Chord { root: 7, quality: 2, bass: None }.name(), "G7");
         assert_eq!(
-            Chord { root: 0, quality: 0, bass: Some(4) }.name(),
+            Chord {
+                root: 0,
+                quality: 0,
+                bass: None
+            }
+            .name(),
+            "C"
+        );
+        assert_eq!(
+            Chord {
+                root: 9,
+                quality: 1,
+                bass: None
+            }
+            .name(),
+            "Am"
+        );
+        assert_eq!(
+            Chord {
+                root: 7,
+                quality: 2,
+                bass: None
+            }
+            .name(),
+            "G7"
+        );
+        assert_eq!(
+            Chord {
+                root: 0,
+                quality: 0,
+                bass: Some(4)
+            }
+            .name(),
             "C/E"
         );
         // A bass equal to the root is not a slash chord.
-        assert_eq!(Chord { root: 0, quality: 0, bass: Some(0) }.name(), "C");
+        assert_eq!(
+            Chord {
+                root: 0,
+                quality: 0,
+                bass: Some(0)
+            }
+            .name(),
+            "C"
+        );
     }
 
     #[test]
@@ -622,6 +724,10 @@ mod tests {
         };
         assert!(detect_chords(&empty, &[], 4, 0).0.is_empty());
         let samples = play(&[&[60, 64, 67]], 2.0);
-        assert!(detect_chords(&chromagram(&samples, RATE), &[1.0], 4, 0).0.is_empty());
+        assert!(
+            detect_chords(&chromagram(&samples, RATE), &[1.0], 4, 0)
+                .0
+                .is_empty()
+        );
     }
 }

@@ -199,7 +199,6 @@ impl Track {
             drum_kit: false,
         }
     }
-
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -766,7 +765,10 @@ impl RustDawApp {
             runtime.set_track_effects(track_id, channel_strip_params(track.effects))?;
             runtime.set_track_nam_model(
                 track_id,
-                track.nam_model.as_deref().filter(|_| track.effects.nam_enabled),
+                track
+                    .nam_model
+                    .as_deref()
+                    .filter(|_| track.effects.nam_enabled),
                 channel_strip_params(track.effects),
             )?;
             for clip in &track.clips {
@@ -1200,8 +1202,7 @@ impl RustDawApp {
         match spawned {
             Ok(_) => {
                 self.amp_fetch = Some(receiver);
-                self.status_message =
-                    "Pick an amp in your browser — RustDAW is waiting".to_owned();
+                self.status_message = "Pick an amp in your browser — RustDAW is waiting".to_owned();
             }
             Err(error) => self.status_message = format!("TONE3000: {error}"),
         }
@@ -1397,9 +1398,7 @@ impl RustDawApp {
                             ui.add(egui::ProgressBar::new(fraction).show_percentage());
                         }
                         None => {
-                            ui.label(
-                                RichText::new("Working…").small().color(theme::MUTED),
-                            );
+                            ui.label(RichText::new("Working…").small().color(theme::MUTED));
                         }
                     }
                     ui.add_space(4.0);
@@ -1425,8 +1424,8 @@ impl RustDawApp {
                             .hint_text("https://www.youtube.com/watch?v=…")
                             .desired_width(340.0),
                     );
-                    let submitted = field.lost_focus()
-                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    let submitted =
+                        field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
                     let usable = self.song_import.url.trim().starts_with("http");
                     // A disabled button never reports a click, so `usable` is
                     // already implied on that side.
@@ -1438,9 +1437,11 @@ impl RustDawApp {
                     }
                 });
                 ui.label(
-                    RichText::new("A new song takes a few minutes: download, separation, then MIDI.")
-                        .small()
-                        .color(theme::MUTED),
+                    RichText::new(
+                        "A new song takes a few minutes: download, separation, then MIDI.",
+                    )
+                    .small()
+                    .color(theme::MUTED),
                 );
 
                 ui.add_space(6.0);
@@ -1491,29 +1492,31 @@ impl RustDawApp {
                                 .color(theme::MUTED),
                         );
                     } else {
-                        egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                            for project in catalog {
-                                ui.horizontal(|ui| {
-                                    if ui.button("IMPORT").clicked() {
-                                        requested = Some(ImportSource::ExistingProject(
-                                            project.id.clone(),
-                                        ));
-                                    }
-                                    ui.label(project.label());
-                                    if let Some(duration) = project.duration {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "{:.0}:{:02.0}",
-                                                (duration / 60.0).floor(),
-                                                duration % 60.0
-                                            ))
-                                            .small()
-                                            .color(theme::MUTED),
-                                        );
-                                    }
-                                });
-                            }
-                        });
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                for project in catalog {
+                                    ui.horizontal(|ui| {
+                                        if ui.button("IMPORT").clicked() {
+                                            requested = Some(ImportSource::ExistingProject(
+                                                project.id.clone(),
+                                            ));
+                                        }
+                                        ui.label(project.label());
+                                        if let Some(duration) = project.duration {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{:.0}:{:02.0}",
+                                                    (duration / 60.0).floor(),
+                                                    duration % 60.0
+                                                ))
+                                                .small()
+                                                .color(theme::MUTED),
+                                            );
+                                        }
+                                    });
+                                }
+                            });
                     }
                 } else {
                     ui.label(
@@ -1564,11 +1567,8 @@ impl RustDawApp {
 
     /// Opens the piano roll on the first instrument track that has notes.
     fn open_first_midi_clip(&mut self) {
-        let found = self
-            .tracks
-            .iter()
-            .enumerate()
-            .find_map(|(index, track)| {
+        let found =
+            self.tracks.iter().enumerate().find_map(|(index, track)| {
                 track.midi_clips.first().map(|clip| (index, clip.clone()))
             });
         if let Some((index, clip)) = found {
@@ -2068,11 +2068,12 @@ impl RustDawApp {
                                     // The model slot: step through the library
                                     // with the arrows, or pick from the list.
                                     ui.horizontal(|ui| {
-                                        let position = track.nam_model.as_deref().and_then(|path| {
-                                            amp_library
-                                                .iter()
-                                                .position(|model| model.path == path)
-                                        });
+                                        let position =
+                                            track.nam_model.as_deref().and_then(|path| {
+                                                amp_library
+                                                    .iter()
+                                                    .position(|model| model.path == path)
+                                            });
                                         let count = amp_library.len();
                                         // Wraps at both ends, so stepping
                                         // through a library is a loop rather
@@ -2080,12 +2081,15 @@ impl RustDawApp {
                                         let step = |forward: bool| -> Option<PathBuf> {
                                             let next = match position {
                                                 None => 0,
-                                                Some(index) if forward => (index + 1) % count.max(1),
+                                                Some(index) if forward => {
+                                                    (index + 1) % count.max(1)
+                                                }
                                                 Some(index) => (index + count - 1) % count.max(1),
                                             };
                                             amp_library.get(next).map(|model| model.path.clone())
                                         };
-                                        if ui.button("‹").on_hover_text("Previous amp").clicked() {
+                                        if ui.button("‹").on_hover_text("Previous amp").clicked()
+                                        {
                                             if let Some(path) = step(false) {
                                                 track.nam_model = Some(path);
                                                 track.effects.nam_enabled = true;
@@ -2115,8 +2119,7 @@ impl RustDawApp {
                                                         .selectable_label(chosen, &model.name)
                                                         .clicked()
                                                     {
-                                                        track.nam_model =
-                                                            Some(model.path.clone());
+                                                        track.nam_model = Some(model.path.clone());
                                                         track.effects.nam_enabled = true;
                                                     }
                                                 }
@@ -2134,8 +2137,7 @@ impl RustDawApp {
                                         }
                                     });
                                     ui.horizontal(|ui| {
-                                        let linked =
-                                            daw_tone3000::publishable_key().is_some();
+                                        let linked = daw_tone3000::publishable_key().is_some();
                                         let hint = if linked {
                                             "Pick an amp on TONE3000 and load it straight onto \
                                              this track"
@@ -2478,14 +2480,19 @@ impl RustDawApp {
                 {
                     match runtime.set_track_nam_model(
                         track_index,
-                        track.nam_model.as_deref().filter(|_| track.effects.nam_enabled),
+                        track
+                            .nam_model
+                            .as_deref()
+                            .filter(|_| track.effects.nam_enabled),
                         channel_strip_params(track.effects),
                     ) {
-                        Ok(()) => self.status_message = if track.effects.nam_enabled {
-                            "NAM guitar amp loaded".to_owned()
-                        } else {
-                            "NAM guitar amp bypassed".to_owned()
-                        },
+                        Ok(()) => {
+                            self.status_message = if track.effects.nam_enabled {
+                                "NAM guitar amp loaded".to_owned()
+                            } else {
+                                "NAM guitar amp bypassed".to_owned()
+                            }
+                        }
                         Err(error) => {
                             track.effects.nam_enabled = false;
                             self.status_message = format!("NAM model failed: {error}");
@@ -2498,7 +2505,10 @@ impl RustDawApp {
                         || before.nam_enabled != track.effects.nam_enabled
                     {
                         let _ = runtime.set_monitor_nam_model(
-                            track.nam_model.as_deref().filter(|_| track.effects.nam_enabled),
+                            track
+                                .nam_model
+                                .as_deref()
+                                .filter(|_| track.effects.nam_enabled),
                             channel_strip_params(track.effects),
                         );
                     }
@@ -2511,10 +2521,7 @@ impl RustDawApp {
         if rescan_amps {
             self.amp_library = daw_nam::discover();
             self.status_message = match self.amp_library.len() {
-                0 => format!(
-                    "No amp captures in {}",
-                    daw_nam::amp_dir().display()
-                ),
+                0 => format!("No amp captures in {}", daw_nam::amp_dir().display()),
                 1 => "Found 1 amp capture".to_owned(),
                 found => format!("Found {found} amp captures"),
             };
@@ -2748,15 +2755,12 @@ impl RustDawApp {
                         // The amp is on but not being heard; the dry signal is
                         // going through instead. Without this the only symptom
                         // is a guitar that sounds unplugged.
-                        ui.label(
-                            RichText::new("AMP BYPASSED")
-                                .color(theme::RED),
-                        )
-                        .on_hover_text(format!(
-                            "The monitoring amp failed on {} block(s) and passed the dry \
+                        ui.label(RichText::new("AMP BYPASSED").color(theme::RED))
+                            .on_hover_text(format!(
+                                "The monitoring amp failed on {} block(s) and passed the dry \
                              signal through. Check the model matches the session sample rate.",
-                            snapshot.monitor_amp_faults
-                        ));
+                                snapshot.monitor_amp_faults
+                            ));
                     }
                     if snapshot.disk_error {
                         ui.label(RichText::new("DISK WRITE ERROR").color(theme::RED));
@@ -2834,7 +2838,10 @@ impl RustDawApp {
                             let _ =
                                 runtime.set_monitor_effects(channel_strip_params(track.effects));
                             let _ = runtime.set_monitor_nam_model(
-                                track.nam_model.as_deref().filter(|_| track.effects.nam_enabled),
+                                track
+                                    .nam_model
+                                    .as_deref()
+                                    .filter(|_| track.effects.nam_enabled),
                                 channel_strip_params(track.effects),
                             );
                         }
@@ -2947,7 +2954,10 @@ impl RustDawApp {
                 // to must not drop the sound the player is monitoring through.
                 let _ = runtime.set_monitor_effects(channel_strip_params(track.effects));
                 let _ = runtime.set_monitor_nam_model(
-                    track.nam_model.as_deref().filter(|_| track.effects.nam_enabled),
+                    track
+                        .nam_model
+                        .as_deref()
+                        .filter(|_| track.effects.nam_enabled),
                     channel_strip_params(track.effects),
                 );
             }
@@ -3331,9 +3341,7 @@ impl eframe::App for RustDawApp {
                     }
                     if ui
                         .button("IMPORT SONG")
-                        .on_hover_text(
-                            "Separate a song into instrument tracks to play along with",
-                        )
+                        .on_hover_text("Separate a song into instrument tracks to play along with")
                         .clicked()
                     {
                         self.open_song_import(context);
@@ -3643,7 +3651,7 @@ fn mixer_channel(
                 ui.separator();
                 ui.label(RichText::new("INSERTS A–E").monospace().small());
                 let inserts = [
-                    ("A  EQ III", track.effects.eq_enabled, theme::BLUE),
+                    ("A  EQ", track.effects.eq_enabled, theme::BLUE),
                     ("B  COMP", track.effects.compressor_enabled, theme::YELLOW),
                     ("C  GATE", track.effects.gate_enabled, theme::GREEN),
                 ];

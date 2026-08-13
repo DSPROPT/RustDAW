@@ -231,9 +231,7 @@ mod tests {
 
     fn sine(hertz: f32, frames: usize) -> Vec<f32> {
         (0..frames)
-            .map(|index| {
-                (index as f32 / RATE * hertz * std::f32::consts::TAU).sin() * 0.3
-            })
+            .map(|index| (index as f32 / RATE * hertz * std::f32::consts::TAU).sin() * 0.3)
             .collect()
     }
 
@@ -247,7 +245,6 @@ mod tests {
             })
             .collect()
     }
-
 
     /// Genuine pseudo-random noise. An indexed expression like
     /// `index * k % n` repeats, and a repeating signal has a pitch — which is
@@ -380,9 +377,15 @@ mod tests {
     fn a_pitch_is_named_the_way_the_rest_of_the_application_names_notes() {
         // Scientific pitch: middle C is C4, a guitar's low E is E2.
         let named = |hertz: f32| {
-            reading(Pitch { hertz, confidence: 1.0 }, DEFAULT_REFERENCE_HZ)
-                .expect("named")
-                .label()
+            reading(
+                Pitch {
+                    hertz,
+                    confidence: 1.0,
+                },
+                DEFAULT_REFERENCE_HZ,
+            )
+            .expect("named")
+            .label()
         };
         assert_eq!(named(440.0), "A4");
         assert_eq!(named(261.626), "C4");
@@ -393,14 +396,43 @@ mod tests {
 
     #[test]
     fn cents_are_signed_the_way_a_needle_leans() {
-        let flat = reading(Pitch { hertz: 438.0, confidence: 1.0 }, 440.0).expect("named");
-        let sharp = reading(Pitch { hertz: 442.0, confidence: 1.0 }, 440.0).expect("named");
-        assert!(flat.cents < 0.0, "flat should read negative: {}", flat.cents);
-        assert!(sharp.cents > 0.0, "sharp should read positive: {}", sharp.cents);
+        let flat = reading(
+            Pitch {
+                hertz: 438.0,
+                confidence: 1.0,
+            },
+            440.0,
+        )
+        .expect("named");
+        let sharp = reading(
+            Pitch {
+                hertz: 442.0,
+                confidence: 1.0,
+            },
+            440.0,
+        )
+        .expect("named");
+        assert!(
+            flat.cents < 0.0,
+            "flat should read negative: {}",
+            flat.cents
+        );
+        assert!(
+            sharp.cents > 0.0,
+            "sharp should read positive: {}",
+            sharp.cents
+        );
         assert_eq!(flat.note_name(), "A");
         assert_eq!(sharp.note_name(), "A");
         assert!(!flat.in_tune() && !sharp.in_tune());
-        let spot_on = reading(Pitch { hertz: 440.0, confidence: 1.0 }, 440.0).expect("named");
+        let spot_on = reading(
+            Pitch {
+                hertz: 440.0,
+                confidence: 1.0,
+            },
+            440.0,
+        )
+        .expect("named");
         assert!(spot_on.in_tune());
         assert!(spot_on.cents.abs() < 1e-3);
     }
@@ -408,18 +440,38 @@ mod tests {
     #[test]
     fn moving_the_reference_moves_every_note_with_it() {
         // Tuning to A=432 must make 432 read as a dead-on A, not as a flat one.
-        let at_432 = reading(Pitch { hertz: 432.0, confidence: 1.0 }, 432.0).expect("named");
+        let at_432 = reading(
+            Pitch {
+                hertz: 432.0,
+                confidence: 1.0,
+            },
+            432.0,
+        )
+        .expect("named");
         assert_eq!(at_432.label(), "A4");
         assert!(at_432.in_tune());
-        let at_440 = reading(Pitch { hertz: 432.0, confidence: 1.0 }, 440.0).expect("named");
+        let at_440 = reading(
+            Pitch {
+                hertz: 432.0,
+                confidence: 1.0,
+            },
+            440.0,
+        )
+        .expect("named");
         assert!(at_440.cents < -30.0, "{} cents", at_440.cents);
     }
 
     #[test]
     fn a_reading_points_at_the_string_being_tuned() {
         let string_of = |hertz: f32| {
-            let reading = reading(Pitch { hertz, confidence: 1.0 }, DEFAULT_REFERENCE_HZ)
-                .expect("named");
+            let reading = reading(
+                Pitch {
+                    hertz,
+                    confidence: 1.0,
+                },
+                DEFAULT_REFERENCE_HZ,
+            )
+            .expect("named");
             nearest_string(&reading, &GUITAR_STRINGS)
         };
         assert_eq!(string_of(82.407), Some(0), "low E");
@@ -430,7 +482,11 @@ mod tests {
         // Inside the range every note is within a whole tone of some string —
         // the widest gap between two of them is five semitones — so naming one
         // is always a help. Outside it, naming one would be a guess.
-        assert_eq!(string_of(30.868), None, "a bass low B is not a guitar string");
+        assert_eq!(
+            string_of(30.868),
+            None,
+            "a bass low B is not a guitar string"
+        );
         assert_eq!(string_of(1_046.5), None, "two octaves above the top string");
     }
 

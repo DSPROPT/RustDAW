@@ -69,7 +69,12 @@ pub fn onset_envelope(samples: &[f32], sample_rate: u32) -> OnsetEnvelope {
         for (index, slot) in windowed.iter_mut().enumerate() {
             *slot = samples[start + index] * window[index];
         }
-        magnitude_spectrum(&windowed, &mut scratch_real, &mut scratch_imag, &mut spectrum);
+        magnitude_spectrum(
+            &windowed,
+            &mut scratch_real,
+            &mut scratch_imag,
+            &mut spectrum,
+        );
         // Compress the magnitudes. A snare 30 dB above a hi-hat should not
         // count thirty times as much: on a logarithmic scale both read as
         // onsets, which is how a listener hears them.
@@ -121,8 +126,11 @@ fn normalise(values: &mut [f32]) {
     }
 
     let mean = values.iter().sum::<f32>() / values.len() as f32;
-    let variance =
-        values.iter().map(|value| (value - mean).powi(2)).sum::<f32>() / values.len() as f32;
+    let variance = values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f32>()
+        / values.len() as f32;
     let deviation = variance.sqrt();
     if deviation > f32::EPSILON {
         for value in values.iter_mut() {
@@ -180,7 +188,11 @@ mod tests {
             })
             .collect();
         peaks.sort_unstable();
-        assert!(peaks.len() >= 6, "expected several onsets, found {}", peaks.len());
+        assert!(
+            peaks.len() >= 6,
+            "expected several onsets, found {}",
+            peaks.len()
+        );
         for peak in peaks {
             let seconds = envelope.seconds_at(peak);
             let distance = (seconds / 0.5 - (seconds / 0.5).round()).abs() * 0.5;

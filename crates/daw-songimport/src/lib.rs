@@ -137,7 +137,10 @@ pub fn list_ready_projects() -> Result<Vec<ProjectSummary>> {
         .collect())
 }
 
-fn ensure_worker(client: &WorkerClient, on_progress: &mut impl FnMut(ImportProgress)) -> Result<()> {
+fn ensure_worker(
+    client: &WorkerClient,
+    on_progress: &mut impl FnMut(ImportProgress),
+) -> Result<()> {
     if client.is_healthy() {
         return Ok(());
     }
@@ -146,8 +149,10 @@ fn ensure_worker(client: &WorkerClient, on_progress: &mut impl FnMut(ImportProgr
             "The song-import worker is not installed. Install it once with \
              `crates/daw-songimport/worker/install.sh` (macOS and Ubuntu); it sets up a Python \
              environment with Demucs and basic-pitch under {}.",
-            supervisor::data_dir()
-                .map_or_else(|| "the worker data directory".to_owned(), |dir| dir.display().to_string())
+            supervisor::data_dir().map_or_else(
+                || "the worker data directory".to_owned(),
+                |dir| dir.display().to_string()
+            )
         );
     }
     on_progress(ImportProgress::Status(

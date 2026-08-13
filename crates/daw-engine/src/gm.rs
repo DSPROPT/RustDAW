@@ -1249,9 +1249,7 @@ fn table_size(harmonics: usize) -> usize {
 /// `sin` call per point per harmonic.
 fn sine_table() -> Vec<f32> {
     (0..MAX_TABLE_SIZE)
-        .map(|index| {
-            (index as f32 / MAX_TABLE_SIZE as f32 * std::f32::consts::TAU).sin()
-        })
+        .map(|index| (index as f32 / MAX_TABLE_SIZE as f32 * std::f32::consts::TAU).sin())
         .collect()
 }
 
@@ -1280,7 +1278,9 @@ fn build_table(patch: &Patch, harmonics: usize, cycle: &[f32]) -> Wavetable {
     // spectrum's peak run past unity.
     let sum_of_squares: f32 = samples.iter().map(|value| value * value).sum();
     let rms = (sum_of_squares / size as f32).sqrt();
-    let peak = samples.iter().fold(0.0_f32, |peak, value| peak.max(value.abs()));
+    let peak = samples
+        .iter()
+        .fold(0.0_f32, |peak, value| peak.max(value.abs()));
     let scale = if rms > 0.0 && peak > 0.0 {
         (TARGET_RMS / rms).min(1.0 / peak)
     } else {
@@ -1297,48 +1297,148 @@ fn build_table(patch: &Patch, harmonics: usize, cycle: &[f32]) -> Wavetable {
 }
 
 /// The GM program name, for display.
+// One line per General MIDI program; the table is the function.
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn program_name(program: u8) -> &'static str {
     const NAMES: [&str; PROGRAM_COUNT] = [
-        "Acoustic Grand Piano", "Bright Acoustic Piano", "Electric Grand Piano", "Honky-tonk Piano",
-        "Electric Piano 1", "Electric Piano 2", "Harpsichord", "Clavinet",
-        "Celesta", "Glockenspiel", "Music Box", "Vibraphone",
-        "Marimba", "Xylophone", "Tubular Bells", "Dulcimer",
-        "Drawbar Organ", "Percussive Organ", "Rock Organ", "Church Organ",
-        "Reed Organ", "Accordion", "Harmonica", "Tango Accordion",
-        "Acoustic Guitar (nylon)", "Acoustic Guitar (steel)", "Electric Guitar (jazz)",
-        "Electric Guitar (clean)", "Electric Guitar (muted)", "Overdriven Guitar",
-        "Distortion Guitar", "Guitar Harmonics",
-        "Acoustic Bass", "Electric Bass (finger)", "Electric Bass (pick)", "Fretless Bass",
-        "Slap Bass 1", "Slap Bass 2", "Synth Bass 1", "Synth Bass 2",
-        "Violin", "Viola", "Cello", "Contrabass",
-        "Tremolo Strings", "Pizzicato Strings", "Orchestral Harp", "Timpani",
-        "String Ensemble 1", "String Ensemble 2", "Synth Strings 1", "Synth Strings 2",
-        "Choir Aahs", "Voice Oohs", "Synth Voice", "Orchestra Hit",
-        "Trumpet", "Trombone", "Tuba", "Muted Trumpet",
-        "French Horn", "Brass Section", "Synth Brass 1", "Synth Brass 2",
-        "Soprano Sax", "Alto Sax", "Tenor Sax", "Baritone Sax",
-        "Oboe", "English Horn", "Bassoon", "Clarinet",
-        "Piccolo", "Flute", "Recorder", "Pan Flute",
-        "Blown Bottle", "Shakuhachi", "Whistle", "Ocarina",
-        "Lead 1 (square)", "Lead 2 (sawtooth)", "Lead 3 (calliope)", "Lead 4 (chiff)",
-        "Lead 5 (charang)", "Lead 6 (voice)", "Lead 7 (fifths)", "Lead 8 (bass + lead)",
-        "Pad 1 (new age)", "Pad 2 (warm)", "Pad 3 (polysynth)", "Pad 4 (choir)",
-        "Pad 5 (bowed)", "Pad 6 (metallic)", "Pad 7 (halo)", "Pad 8 (sweep)",
-        "FX 1 (rain)", "FX 2 (soundtrack)", "FX 3 (crystal)", "FX 4 (atmosphere)",
-        "FX 5 (brightness)", "FX 6 (goblins)", "FX 7 (echoes)", "FX 8 (sci-fi)",
-        "Sitar", "Banjo", "Shamisen", "Koto",
-        "Kalimba", "Bag pipe", "Fiddle", "Shanai",
-        "Tinkle Bell", "Agogo", "Steel Drums", "Woodblock",
-        "Taiko Drum", "Melodic Tom", "Synth Drum", "Reverse Cymbal",
-        "Guitar Fret Noise", "Breath Noise", "Seashore", "Bird Tweet",
-        "Telephone Ring", "Helicopter", "Applause", "Gunshot",
+        "Acoustic Grand Piano",
+        "Bright Acoustic Piano",
+        "Electric Grand Piano",
+        "Honky-tonk Piano",
+        "Electric Piano 1",
+        "Electric Piano 2",
+        "Harpsichord",
+        "Clavinet",
+        "Celesta",
+        "Glockenspiel",
+        "Music Box",
+        "Vibraphone",
+        "Marimba",
+        "Xylophone",
+        "Tubular Bells",
+        "Dulcimer",
+        "Drawbar Organ",
+        "Percussive Organ",
+        "Rock Organ",
+        "Church Organ",
+        "Reed Organ",
+        "Accordion",
+        "Harmonica",
+        "Tango Accordion",
+        "Acoustic Guitar (nylon)",
+        "Acoustic Guitar (steel)",
+        "Electric Guitar (jazz)",
+        "Electric Guitar (clean)",
+        "Electric Guitar (muted)",
+        "Overdriven Guitar",
+        "Distortion Guitar",
+        "Guitar Harmonics",
+        "Acoustic Bass",
+        "Electric Bass (finger)",
+        "Electric Bass (pick)",
+        "Fretless Bass",
+        "Slap Bass 1",
+        "Slap Bass 2",
+        "Synth Bass 1",
+        "Synth Bass 2",
+        "Violin",
+        "Viola",
+        "Cello",
+        "Contrabass",
+        "Tremolo Strings",
+        "Pizzicato Strings",
+        "Orchestral Harp",
+        "Timpani",
+        "String Ensemble 1",
+        "String Ensemble 2",
+        "Synth Strings 1",
+        "Synth Strings 2",
+        "Choir Aahs",
+        "Voice Oohs",
+        "Synth Voice",
+        "Orchestra Hit",
+        "Trumpet",
+        "Trombone",
+        "Tuba",
+        "Muted Trumpet",
+        "French Horn",
+        "Brass Section",
+        "Synth Brass 1",
+        "Synth Brass 2",
+        "Soprano Sax",
+        "Alto Sax",
+        "Tenor Sax",
+        "Baritone Sax",
+        "Oboe",
+        "English Horn",
+        "Bassoon",
+        "Clarinet",
+        "Piccolo",
+        "Flute",
+        "Recorder",
+        "Pan Flute",
+        "Blown Bottle",
+        "Shakuhachi",
+        "Whistle",
+        "Ocarina",
+        "Lead 1 (square)",
+        "Lead 2 (sawtooth)",
+        "Lead 3 (calliope)",
+        "Lead 4 (chiff)",
+        "Lead 5 (charang)",
+        "Lead 6 (voice)",
+        "Lead 7 (fifths)",
+        "Lead 8 (bass + lead)",
+        "Pad 1 (new age)",
+        "Pad 2 (warm)",
+        "Pad 3 (polysynth)",
+        "Pad 4 (choir)",
+        "Pad 5 (bowed)",
+        "Pad 6 (metallic)",
+        "Pad 7 (halo)",
+        "Pad 8 (sweep)",
+        "FX 1 (rain)",
+        "FX 2 (soundtrack)",
+        "FX 3 (crystal)",
+        "FX 4 (atmosphere)",
+        "FX 5 (brightness)",
+        "FX 6 (goblins)",
+        "FX 7 (echoes)",
+        "FX 8 (sci-fi)",
+        "Sitar",
+        "Banjo",
+        "Shamisen",
+        "Koto",
+        "Kalimba",
+        "Bag pipe",
+        "Fiddle",
+        "Shanai",
+        "Tinkle Bell",
+        "Agogo",
+        "Steel Drums",
+        "Woodblock",
+        "Taiko Drum",
+        "Melodic Tom",
+        "Synth Drum",
+        "Reverse Cymbal",
+        "Guitar Fret Noise",
+        "Breath Noise",
+        "Seashore",
+        "Bird Tweet",
+        "Telephone Ring",
+        "Helicopter",
+        "Applause",
+        "Gunshot",
     ];
     NAMES[usize::from(program.min(127))]
 }
 
 #[cfg(test)]
 mod tests {
+    // Comparing a patch's vibrato depth to exactly zero is the assertion:
+    // a struck instrument must carry no vibrato at all, not merely little.
+    #![allow(clippy::float_cmp)]
     use super::*;
 
     #[test]
@@ -1358,7 +1458,10 @@ mod tests {
                 patch.harmonics.iter().any(|gain| *gain > 0.0),
                 "program {program} is silent"
             );
-            assert!(patch.attack_seconds > 0.0, "program {program} has no attack");
+            assert!(
+                patch.attack_seconds > 0.0,
+                "program {program} has no attack"
+            );
             assert!(patch.decay_seconds > 0.0, "program {program} has no decay");
             assert!((0.0..=1.0).contains(&patch.sustain));
             assert!(patch.release_seconds > 0.0);
@@ -1375,16 +1478,25 @@ mod tests {
             assert!(patch.filter_decay_seconds > 0.0);
             assert!((0.0..=1.0).contains(&patch.velocity_brightness));
             assert!((0.0..=1.0).contains(&patch.resonance), "program {program}");
-            assert!((0.0..=1.0).contains(&patch.attack_noise), "program {program}");
+            assert!(
+                (0.0..=1.0).contains(&patch.attack_noise),
+                "program {program}"
+            );
             assert!(patch.attack_noise_seconds > 0.0);
             assert!((0.0..=1.0).contains(&patch.stereo_spread));
             assert!((0.0..=1.0).contains(&patch.keyboard_spread));
-            assert!((0.0..=1.0).contains(&patch.reverb_send), "program {program}");
+            assert!(
+                (0.0..=1.0).contains(&patch.reverb_send),
+                "program {program}"
+            );
             assert!(patch.rolloff > 0.0, "program {program} has no rolloff");
             assert!((0.0..=1.0).contains(&patch.odd_bias));
             assert!(patch.humanise_cents >= 0.0);
             assert!(patch.vibrato_cents >= 0.0 && patch.vibrato_cents.is_finite());
-            assert!(patch.vibrato_hz > 0.0, "program {program} has a zero vibrato rate");
+            assert!(
+                patch.vibrato_hz > 0.0,
+                "program {program} has a zero vibrato rate"
+            );
             assert!(patch.vibrato_delay_seconds > 0.0);
         }
     }
@@ -1466,7 +1578,10 @@ mod tests {
     fn a_spectrum_reaches_far_past_its_named_harmonics() {
         // A bass note needs harmonics into the dozens or it is a muffled hum.
         let piano = patch_for_program(0);
-        assert!(piano.harmonic_gain(24) > 0.001, "the piano's spectrum stops short");
+        assert!(
+            piano.harmonic_gain(24) > 0.001,
+            "the piano's spectrum stops short"
+        );
         assert!(
             piano.harmonic_gain(24) < piano.harmonic_gain(12),
             "the spectrum must fall as it rises"
@@ -1530,7 +1645,10 @@ mod tests {
         let rate = 48_000.0;
         assert_eq!(harmonic_limit(2, rate), MAX_HARMONICS);
         let top = harmonic_limit(MIP_LEVELS - 1, rate);
-        assert!(top < 4, "the top octave kept {top} harmonics and will alias");
+        assert!(
+            top < 4,
+            "the top octave kept {top} harmonics and will alias"
+        );
         for level in 1..MIP_LEVELS {
             assert!(
                 harmonic_limit(level, rate) <= harmonic_limit(level - 1, rate),

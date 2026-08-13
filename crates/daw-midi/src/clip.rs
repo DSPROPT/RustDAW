@@ -191,7 +191,10 @@ mod tests {
         clip.length_ticks = u64::from(TICKS_PER_QUARTER); // user dragged it shorter
         let scheduled = clip.schedule(&tempo, 48_000);
         assert_eq!(scheduled.len(), 1);
-        assert_eq!(scheduled[0].end_frame, 24_000, "note must stop at the clip end");
+        assert_eq!(
+            scheduled[0].end_frame, 24_000,
+            "note must stop at the clip end"
+        );
     }
 
     #[test]
@@ -208,7 +211,10 @@ mod tests {
         use crate::tempo::TempoPoint;
         let tempo = TempoMap::new(
             vec![
-                TempoPoint { tick: 0, bpm: 120.0 },
+                TempoPoint {
+                    tick: 0,
+                    bpm: 120.0,
+                },
                 TempoPoint {
                     tick: u64::from(TICKS_PER_QUARTER) * 2,
                     bpm: 60.0,
@@ -217,7 +223,12 @@ mod tests {
             TICKS_PER_QUARTER,
         );
         let mut clip = MidiClip::new("Test", 0, 0);
-        clip.insert_note(Note::new(60, 100, u64::from(TICKS_PER_QUARTER) * 2, u64::from(TICKS_PER_QUARTER)));
+        clip.insert_note(Note::new(
+            60,
+            100,
+            u64::from(TICKS_PER_QUARTER) * 2,
+            u64::from(TICKS_PER_QUARTER),
+        ));
         let scheduled = clip.schedule(&tempo, 48_000);
         // Two quarters at 120 = 1 s; the note then lasts a full second at 60.
         assert_eq!(scheduled[0].start_frame, 48_000);

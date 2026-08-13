@@ -36,7 +36,10 @@ fn main() {
 
     let pkce = daw_tone3000::Pkce::generate().expect("entropy");
     let url = client.authorize_url(&redirect_uri, &pkce);
-    println!("\nauthorize endpoint: {}", url.split('?').next().unwrap_or(&url));
+    println!(
+        "\nauthorize endpoint: {}",
+        url.split('?').next().unwrap_or(&url)
+    );
 
     match ureq::get(&url).call() {
         Ok(response) => println!(

@@ -111,7 +111,7 @@ mod tests {
                 let mut re = 0.0;
                 let mut im = 0.0;
                 for (index, sample) in input.iter().enumerate() {
-                        let angle = -2.0 * PI * (bin * index) as f32 / n as f32;
+                    let angle = -2.0 * PI * (bin * index) as f32 / n as f32;
                     re += sample * angle.cos();
                     im += sample * angle.sin();
                 }

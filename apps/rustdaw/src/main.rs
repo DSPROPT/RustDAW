@@ -1,6 +1,6 @@
 mod piano_roll;
-mod tuner;
 mod theme;
+mod tuner;
 mod ui;
 
 use anyhow::Result;

@@ -190,6 +190,8 @@ mod tests {
     fn a_path_under_a_read_only_root_is_rejected() {
         // Nothing can create a directory directly under "/", which is exactly
         // the case that broke a Finder-launched app writing to /Songs.
-        assert!(!can_write_dir(Path::new("/rustdaw-should-not-be-creatable")));
+        assert!(!can_write_dir(Path::new(
+            "/rustdaw-should-not-be-creatable"
+        )));
     }
 }

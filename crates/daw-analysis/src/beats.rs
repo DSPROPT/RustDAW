@@ -206,15 +206,20 @@ pub fn track_beats(envelope: &OnsetEnvelope, bpm: f64) -> BeatAnalysis {
                 best_previous = previous;
             }
         }
-        score[frame] = strength + if best_previous == usize::MAX { 0.0 } else { best };
+        score[frame] = strength
+            + if best_previous == usize::MAX {
+                0.0
+            } else {
+                best
+            };
         backlink[frame] = best_previous;
     }
 
     // Start the backtrace from the best score in the final period, so the
     // chain is not cut short by a fade-out.
     let tail_start = values.len().saturating_sub(latest.max(1));
-    let Some(mut cursor) = (tail_start..values.len())
-        .max_by(|left, right| score[*left].total_cmp(&score[*right]))
+    let Some(mut cursor) =
+        (tail_start..values.len()).max_by(|left, right| score[*left].total_cmp(&score[*right]))
     else {
         return BeatAnalysis::unusable(bpm);
     };
@@ -234,12 +239,11 @@ pub fn track_beats(envelope: &OnsetEnvelope, bpm: f64) -> BeatAnalysis {
         return BeatAnalysis::unusable(bpm);
     }
 
-    let confidence = frames
+    let confidence = frames.iter().map(|frame| values[*frame]).sum::<f32>() / frames.len() as f32;
+    let beat_times: Vec<f64> = frames
         .iter()
-        .map(|frame| values[*frame])
-        .sum::<f32>()
-        / frames.len() as f32;
-    let beat_times: Vec<f64> = frames.iter().map(|frame| envelope.seconds_at(*frame)).collect();
+        .map(|frame| envelope.seconds_at(*frame))
+        .collect();
     let downbeat_index = estimate_downbeat(values, &frames, 4);
 
     BeatAnalysis {

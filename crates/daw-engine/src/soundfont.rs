@@ -81,10 +81,18 @@ pub const SOUNDFONT_ENV: &str = "RUSTDAW_SOUNDFONT";
 
 #[derive(Debug)]
 pub enum SoundFontError {
-    Unreadable { path: PathBuf, source: std::io::Error },
-    Malformed { path: PathBuf, reason: String },
+    Unreadable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Malformed {
+        path: PathBuf,
+        reason: String,
+    },
     /// The font parsed but has no presets, so it can make no sound.
-    Empty { path: PathBuf },
+    Empty {
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for SoundFontError {
@@ -94,7 +102,11 @@ impl fmt::Display for SoundFontError {
                 write!(formatter, "could not read {}: {source}", path.display())
             }
             Self::Malformed { path, reason } => {
-                write!(formatter, "{} is not a usable SoundFont: {reason}", path.display())
+                write!(
+                    formatter,
+                    "{} is not a usable SoundFont: {reason}",
+                    path.display()
+                )
             }
             Self::Empty { path } => {
                 write!(formatter, "{} contains no instruments", path.display())
@@ -148,8 +160,10 @@ impl SoundFontBank {
         }
         let name = font.get_info().get_bank_name().trim().to_owned();
         let name = if name.is_empty() {
-            path.file_name()
-                .map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
+            path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
         } else {
             name
         };
@@ -516,7 +530,7 @@ pub mod fixture {
     }
 
     #[must_use]
-pub fn soundfont() -> Vec<u8> {
+    pub fn soundfont() -> Vec<u8> {
         // INFO: version and a bank name.
         let mut info = Vec::new();
         info.extend_from_slice(&chunk(*b"ifil", &[2, 0, 1, 0]));
@@ -715,8 +729,15 @@ mod tests {
         let (mut player, path) = player();
         let (mut left, mut right) = (vec![0.25_f32; 256], vec![0.25_f32; 256]);
         player.render(&[], 0, &mut left, &mut right);
-        assert!(left.iter().all(|value| (*value - 0.25).abs() < f32::EPSILON));
-        assert!(right.iter().all(|value| (*value - 0.25).abs() < f32::EPSILON));
+        assert!(
+            left.iter()
+                .all(|value| (*value - 0.25).abs() < f32::EPSILON)
+        );
+        assert!(
+            right
+                .iter()
+                .all(|value| (*value - 0.25).abs() < f32::EPSILON)
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -778,7 +799,11 @@ mod tests {
             .collect();
         let (mut left, mut right) = (vec![0.0; 256], vec![0.0; 256]);
         player.render(&notes, 19_000, &mut left, &mut right);
-        assert_eq!(player.active_voices(), 0, "old hits were refired by the seek");
+        assert_eq!(
+            player.active_voices(),
+            0,
+            "old hits were refired by the seek"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -844,7 +869,10 @@ mod tests {
         // detected because the position was only advanced by the scratch.
         let (mut left, mut right) = (vec![0.0; 512], vec![0.0; 512]);
         player.render(&notes, frames as u64, &mut left, &mut right);
-        assert!(energy(&left) > 0.0, "the note was dropped at the block edge");
+        assert!(
+            energy(&left) > 0.0,
+            "the note was dropped at the block edge"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -870,7 +898,10 @@ mod tests {
         let strings = player.reverb_send();
         player.set_program(33);
         let bass = player.reverb_send();
-        assert!(strings > bass * 2.0, "strings {strings} against bass {bass}");
+        assert!(
+            strings > bass * 2.0,
+            "strings {strings} against bass {bass}"
+        );
         // A sample arrives with some of its own room on it, so it needs less
         // than the synthesised bank does.
         assert!(strings < gm::patch_for_program(48).reverb_send);

@@ -160,7 +160,12 @@ pub fn chromagram(samples: &[f32], sample_rate: u32) -> Chromagram {
         for (index, slot) in windowed.iter_mut().enumerate() {
             *slot = samples[start + index] * window[index];
         }
-        magnitude_spectrum(&windowed, &mut scratch_real, &mut scratch_imag, &mut spectrum);
+        magnitude_spectrum(
+            &windowed,
+            &mut scratch_real,
+            &mut scratch_imag,
+            &mut spectrum,
+        );
         frames.push(frame_chroma(&spectrum, &bands));
         start += HOP;
     }
@@ -356,7 +361,10 @@ mod tests {
     #[test]
     fn a_triad_shows_its_three_notes_above_the_rest() {
         // C major: C4, E4, G4.
-        let chromagram = chromagram(&mix(&[tone(60, 1.0, 3), tone(64, 1.0, 3), tone(67, 1.0, 3)]), RATE);
+        let chromagram = chromagram(
+            &mix(&[tone(60, 1.0, 3), tone(64, 1.0, 3), tone(67, 1.0, 3)]),
+            RATE,
+        );
         let chroma = Chroma::average(&chromagram.frames);
         let chord = [0_usize, 4, 7];
         let weakest_chord_tone = chord
@@ -379,12 +387,19 @@ mod tests {
         let samples = mix(&[tone(36, 1.0, 3), tone(76, 1.0, 3)]);
         let chromagram = chromagram(&samples, RATE);
         let chroma = Chroma::average(&chromagram.frames);
-        assert_eq!(chroma.bass_pitch_class(), Some(0), "the bass note was missed");
+        assert_eq!(
+            chroma.bass_pitch_class(),
+            Some(0),
+            "the bass note was missed"
+        );
     }
 
     #[test]
     fn tonal_material_scores_higher_than_noise() {
-        let chord = chromagram(&mix(&[tone(60, 1.0, 3), tone(64, 1.0, 3), tone(67, 1.0, 3)]), RATE);
+        let chord = chromagram(
+            &mix(&[tone(60, 1.0, 3), tone(64, 1.0, 3), tone(67, 1.0, 3)]),
+            RATE,
+        );
         let tonal = Chroma::average(&chord.frames).tonalness;
 
         let mut state = 12_345_u32;

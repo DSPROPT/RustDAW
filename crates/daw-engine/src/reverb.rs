@@ -301,7 +301,10 @@ mod tests {
         // Nothing arrives instantly: the first reflection is a comb delay away.
         assert!(energy(&left[..1_000]) < 1e-6, "the reverb has no pre-delay");
         assert!(energy(&left[1_200..8_000]) > 0.01, "no early reflections");
-        assert!(energy(&left[40_000..60_000]) > 1e-4, "the tail died too soon");
+        assert!(
+            energy(&left[40_000..60_000]) > 1e-4,
+            "the tail died too soon"
+        );
     }
 
     #[test]
@@ -311,7 +314,10 @@ mod tests {
         let middle = energy(&left[60_000..80_000]);
         let late = energy(&left[160_000..180_000]);
         assert!(middle < early, "the tail grew: {early} then {middle}");
-        assert!(late < middle * 0.5, "the tail is not decaying: {middle} then {late}");
+        assert!(
+            late < middle * 0.5,
+            "the tail is not decaying: {middle} then {late}"
+        );
     }
 
     #[test]
@@ -327,7 +333,10 @@ mod tests {
         // Real rooms lose treble first, which is what damping models.
         let (left, _) = impulse_response(96_000);
         let tilt = |window: &[f32]| -> f32 {
-            let change: f32 = window.windows(2).map(|pair| (pair[1] - pair[0]).powi(2)).sum();
+            let change: f32 = window
+                .windows(2)
+                .map(|pair| (pair[1] - pair[0]).powi(2))
+                .sum();
             let total: f32 = window.iter().map(|value| value * value).sum();
             change / (total + 1e-12)
         };
@@ -347,7 +356,10 @@ mod tests {
             .iter()
             .chain(right.iter())
             .fold(0.0_f32, |peak, value| peak.max(value.abs()));
-        assert!(peak.is_finite() && peak < 4.0, "the reverb peaked at {peak}");
+        assert!(
+            peak.is_finite() && peak < 4.0,
+            "the reverb peaked at {peak}"
+        );
     }
 
     #[test]
@@ -372,7 +384,10 @@ mod tests {
         let send = vec![[0.0_f32; 2]; 256];
         let (mut left, mut right) = (vec![0.25_f32; 256], vec![0.25_f32; 256]);
         reverb.process(&send, &mut left, &mut right);
-        assert!(left.iter().all(|value| (*value - 0.25).abs() < f32::EPSILON));
+        assert!(
+            left.iter()
+                .all(|value| (*value - 0.25).abs() < f32::EPSILON)
+        );
     }
 
     #[test]

@@ -2,8 +2,8 @@
 
 use anyhow::{Context, Result, bail};
 use daw_engine::{ChannelStrip, ChannelStripParams, NoiseGate, ToneStack};
-use daw_project::ProjectDocument;
 use daw_nam::NamProcessor;
+use daw_project::ProjectDocument;
 
 /// The loudness a normalised capture is brought to, matching the runtime so an
 /// export sounds like what was monitored.
@@ -16,6 +16,10 @@ use std::path::Path;
 ///
 /// Returns an error for missing/unsupported media, sample-rate mismatches, or
 /// output filesystem failures.
+// The offline mix is one pass over every clip through the full insert chain.
+// Splitting it would mean threading the whole per-track state through helpers
+// for no gain in clarity.
+#[allow(clippy::too_many_lines)]
 pub fn export_stereo(project: &ProjectDocument, destination: &Path) -> Result<u64> {
     let end_frame = project
         .tracks
@@ -105,7 +109,8 @@ pub fn export_stereo(project: &ProjectDocument, destination: &Path) -> Result<u6
                         *sample = (frame[0] + frame[1]) * 0.5 * input_gain;
                     }
                     gate.process(&mut mono[..block_len], track.effects.nam_gate_db);
-                    nam.process(&mut mono[..block_len]).map_err(anyhow::Error::msg)?;
+                    nam.process(&mut mono[..block_len])
+                        .map_err(anyhow::Error::msg)?;
                     for (frame, sample) in block.iter_mut().zip(&mono[..block_len]) {
                         *frame = [*sample * output_gain; 2];
                     }

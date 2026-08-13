@@ -314,8 +314,14 @@ mod tests {
         // One quarter note at 120 BPM is half a second.
         assert!((map.tick_to_seconds(u64::from(TICKS_PER_QUARTER)) - 0.5).abs() < 1e-12);
         assert_eq!(map.seconds_to_tick(0.5), u64::from(TICKS_PER_QUARTER));
-        assert_eq!(map.tick_to_frame(u64::from(TICKS_PER_QUARTER), 48_000), 24_000);
-        assert_eq!(map.frame_to_tick(24_000, 48_000), u64::from(TICKS_PER_QUARTER));
+        assert_eq!(
+            map.tick_to_frame(u64::from(TICKS_PER_QUARTER), 48_000),
+            24_000
+        );
+        assert_eq!(
+            map.frame_to_tick(24_000, 48_000),
+            u64::from(TICKS_PER_QUARTER)
+        );
         assert!(map.is_constant());
     }
 
@@ -324,7 +330,10 @@ mod tests {
         // Four quarters at 120 (2 s), then quarters at 60 (1 s each).
         let map = TempoMap::new(
             vec![
-                TempoPoint { tick: 0, bpm: 120.0 },
+                TempoPoint {
+                    tick: 0,
+                    bpm: 120.0,
+                },
                 TempoPoint {
                     tick: u64::from(TICKS_PER_QUARTER) * 4,
                     bpm: 60.0,
@@ -342,15 +351,28 @@ mod tests {
     fn conversion_round_trips_through_a_tempo_change() {
         let map = TempoMap::new(
             vec![
-                TempoPoint { tick: 0, bpm: 137.0 },
-                TempoPoint { tick: 5_000, bpm: 96.5 },
-                TempoPoint { tick: 40_000, bpm: 180.0 },
+                TempoPoint {
+                    tick: 0,
+                    bpm: 137.0,
+                },
+                TempoPoint {
+                    tick: 5_000,
+                    bpm: 96.5,
+                },
+                TempoPoint {
+                    tick: 40_000,
+                    bpm: 180.0,
+                },
             ],
             TICKS_PER_QUARTER,
         );
         for tick in [0_u64, 1, 4_999, 5_000, 5_001, 39_999, 40_000, 123_456] {
             let seconds = map.tick_to_seconds(tick);
-            assert_eq!(map.seconds_to_tick(seconds), tick, "tick {tick} did not round trip");
+            assert_eq!(
+                map.seconds_to_tick(seconds),
+                tick,
+                "tick {tick} did not round trip"
+            );
         }
     }
 
@@ -396,7 +418,13 @@ mod tests {
 
     #[test]
     fn a_map_always_starts_at_tick_zero() {
-        let map = TempoMap::new(vec![TempoPoint { tick: 4_000, bpm: 90.0 }], TICKS_PER_QUARTER);
+        let map = TempoMap::new(
+            vec![TempoPoint {
+                tick: 4_000,
+                bpm: 90.0,
+            }],
+            TICKS_PER_QUARTER,
+        );
         assert_eq!(map.points()[0].tick, 0);
         assert!((map.bpm_at_tick(0) - 90.0).abs() < f64::EPSILON);
     }
@@ -406,28 +434,49 @@ mod tests {
         let map = TempoMap::new(
             vec![
                 TempoPoint { tick: 0, bpm: 1e9 },
-                TempoPoint { tick: 500, bpm: f64::NAN },
-                TempoPoint { tick: 900, bpm: -4.0 },
-                TempoPoint { tick: 1_000, bpm: 0.001 },
+                TempoPoint {
+                    tick: 500,
+                    bpm: f64::NAN,
+                },
+                TempoPoint {
+                    tick: 900,
+                    bpm: -4.0,
+                },
+                TempoPoint {
+                    tick: 1_000,
+                    bpm: 0.001,
+                },
             ],
             TICKS_PER_QUARTER,
         );
-        assert!(map.points().iter().all(|point| point.bpm >= MIN_BPM && point.bpm <= MAX_BPM));
+        assert!(
+            map.points()
+                .iter()
+                .all(|point| point.bpm >= MIN_BPM && point.bpm <= MAX_BPM)
+        );
         assert!(map.points().iter().all(|point| point.bpm.is_finite()));
     }
 
     #[test]
     fn empty_beat_grids_fall_back_to_a_usable_tempo() {
         assert!((TempoMap::from_beat_times(&[], 0.5).bpm_at_tick(0) - 120.0).abs() < f64::EPSILON);
-        assert!((TempoMap::from_beat_times(&[1.0], 0.5).bpm_at_tick(0) - 120.0).abs() < f64::EPSILON);
+        assert!(
+            (TempoMap::from_beat_times(&[1.0], 0.5).bpm_at_tick(0) - 120.0).abs() < f64::EPSILON
+        );
     }
 
     #[test]
     fn serde_round_trip_rebuilds_the_second_offsets() {
         let map = TempoMap::new(
             vec![
-                TempoPoint { tick: 0, bpm: 100.0 },
-                TempoPoint { tick: 9_600, bpm: 140.0 },
+                TempoPoint {
+                    tick: 0,
+                    bpm: 100.0,
+                },
+                TempoPoint {
+                    tick: 9_600,
+                    bpm: 140.0,
+                },
             ],
             TICKS_PER_QUARTER,
         );

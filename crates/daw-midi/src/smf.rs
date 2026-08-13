@@ -34,7 +34,11 @@ impl SmfTrack {
 
     #[must_use]
     pub fn end_tick(&self) -> u64 {
-        self.notes.iter().map(|note| note.end_tick()).max().unwrap_or(0)
+        self.notes
+            .iter()
+            .map(|note| note.end_tick())
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -226,12 +230,13 @@ fn parse_track(
                 let data = reader.take(length)?;
                 match meta_type {
                     0x03 if track.name.is_empty() => {
-                        String::from_utf8_lossy(data).trim().clone_into(&mut track.name);
+                        String::from_utf8_lossy(data)
+                            .trim()
+                            .clone_into(&mut track.name);
                     }
                     0x51 if data.len() == 3 => {
-                        let microseconds = u32::from(data[0]) << 16
-                            | u32::from(data[1]) << 8
-                            | u32::from(data[2]);
+                        let microseconds =
+                            u32::from(data[0]) << 16 | u32::from(data[1]) << 8 | u32::from(data[2]);
                         tempo_events.push((tick, microseconds_to_bpm(microseconds)));
                     }
                     0x58 if data.len() >= 2 && tick == 0 => {
@@ -283,7 +288,12 @@ fn parse_track(
 
     // A note still sounding at the end of the track gets a short tail rather
     // than being thrown away.
-    let end_tick = track.notes.iter().map(|note| note.end_tick()).max().unwrap_or(0);
+    let end_tick = track
+        .notes
+        .iter()
+        .map(|note| note.end_tick())
+        .max()
+        .unwrap_or(0);
     for note in pending {
         let end = end_tick.max(note.start_tick + u64::from(TICKS_PER_QUARTER));
         track.notes.push(Note::new(
@@ -293,7 +303,9 @@ fn parse_track(
             end - note.start_tick,
         ));
     }
-    track.notes.sort_by_key(|note| (note.start_tick, note.pitch));
+    track
+        .notes
+        .sort_by_key(|note| (note.start_tick, note.pitch));
     Ok(track)
 }
 
@@ -301,7 +313,12 @@ fn close_note(pending: &mut Vec<PendingNote>, notes: &mut Vec<Note>, pitch: u8, 
     if let Some(index) = pending.iter().rposition(|note| note.pitch == pitch) {
         let note = pending.remove(index);
         let length = tick.saturating_sub(note.start_tick).max(1);
-        notes.push(Note::new(note.pitch, note.velocity, note.start_tick, length));
+        notes.push(Note::new(
+            note.pitch,
+            note.velocity,
+            note.start_tick,
+            length,
+        ));
     }
 }
 
@@ -481,7 +498,10 @@ mod tests {
         let tempo = TempoMap::new(
             vec![
                 TempoPoint { tick: 0, bpm: 96.0 },
-                TempoPoint { tick: 3_840, bpm: 144.0 },
+                TempoPoint {
+                    tick: 3_840,
+                    bpm: 144.0,
+                },
             ],
             TICKS_PER_QUARTER,
         );
@@ -518,7 +538,12 @@ mod tests {
 
         let parsed = parse(&file).unwrap();
         assert_eq!(parsed.tracks[0].notes.len(), 2);
-        assert!(parsed.tracks[0].notes.iter().all(|note| note.length_ticks == 480));
+        assert!(
+            parsed.tracks[0]
+                .notes
+                .iter()
+                .all(|note| note.length_ticks == 480)
+        );
     }
 
     #[test]

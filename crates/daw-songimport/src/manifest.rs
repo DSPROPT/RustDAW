@@ -178,7 +178,8 @@ impl BeatGrid {
         if intervals.is_empty() {
             return None;
         }
-        intervals.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+        intervals
+            .sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
         let median = intervals[intervals.len() / 2];
         if median <= 0.0 {
             return None;
@@ -224,8 +225,7 @@ impl DetectedTempo {
     /// leaves the downbeat tens of milliseconds off the very first bar.
     #[must_use]
     pub fn bar_alignment_offset(self) -> f64 {
-        let seconds_per_bar =
-            60.0 / f64::from(self.rounded_bpm()) * f64::from(self.beats_per_bar);
+        let seconds_per_bar = 60.0 / f64::from(self.rounded_bpm()) * f64::from(self.beats_per_bar);
         if seconds_per_bar <= 0.0 {
             return 0.0;
         }

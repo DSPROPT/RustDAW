@@ -69,7 +69,10 @@ pub enum Error {
     Redirect(RedirectError),
     Random(std::io::Error),
     /// The service answered, but not with what was asked for.
-    Api { status: u16, detail: String },
+    Api {
+        status: u16,
+        detail: String,
+    },
     Transport(String),
     /// The chosen tone has no model file behind it.
     NoModel,
@@ -216,12 +219,7 @@ impl Client {
     }
 
     /// Redeems the authorisation code, proving ownership with the verifier.
-    fn exchange(
-        &self,
-        code: &str,
-        verifier: &str,
-        redirect_uri: &str,
-    ) -> Result<String, Error> {
+    fn exchange(&self, code: &str, verifier: &str, redirect_uri: &str) -> Result<String, Error> {
         let body = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("grant_type", "authorization_code")
             .append_pair("code", code)
@@ -431,7 +429,10 @@ mod tests {
             file_name_for("1966 Marshall 1962 Bluesbreaker", "https://x/y/abc123.nam"),
             "1966-marshall-1962-bluesbreaker.nam"
         );
-        assert_eq!(file_name_for("Vox AC30/6", "https://x/y/z.nam"), "vox-ac30-6.nam");
+        assert_eq!(
+            file_name_for("Vox AC30/6", "https://x/y/z.nam"),
+            "vox-ac30-6.nam"
+        );
     }
 
     #[test]
@@ -457,7 +458,10 @@ mod tests {
 
     #[test]
     fn an_extension_is_taken_from_the_stored_file_when_it_has_one() {
-        assert_eq!(file_name_for("Amp", "https://x/y/model.wavenet"), "amp.wavenet");
+        assert_eq!(
+            file_name_for("Amp", "https://x/y/model.wavenet"),
+            "amp.wavenet"
+        );
         // And falls back rather than inventing something unusable.
         assert_eq!(file_name_for("Amp", "https://x/y/model"), "amp.nam");
         assert_eq!(file_name_for("Amp", ""), "amp.nam");

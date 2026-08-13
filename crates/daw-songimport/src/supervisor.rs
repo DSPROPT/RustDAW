@@ -51,7 +51,10 @@ fn data_dir_candidates(home: &Path) -> Vec<PathBuf> {
     #[allow(unused_mut)]
     let mut candidates = vec![home.join(".local/share").join(DATA_DIR_NAME)];
     #[cfg(target_os = "macos")]
-    candidates.insert(0, home.join("Library/Application Support").join(DATA_DIR_NAME));
+    candidates.insert(
+        0,
+        home.join("Library/Application Support").join(DATA_DIR_NAME),
+    );
     candidates
 }
 

@@ -96,7 +96,11 @@ impl TimeStretcher {
     /// Fills the ring forward until at least `until` absolute frames exist,
     /// pulling from `render`, which writes `n` fresh source frames into the two
     /// slices it is given.
-    fn ensure_filled(&mut self, until: u64, render: &mut impl FnMut(usize, &mut [f32], &mut [f32])) {
+    fn ensure_filled(
+        &mut self,
+        until: u64,
+        render: &mut impl FnMut(usize, &mut [f32], &mut [f32]),
+    ) {
         let mut scratch_left = [0.0_f32; HOP];
         let mut scratch_right = [0.0_f32; HOP];
         while self.filled < until {
@@ -241,7 +245,12 @@ mod tests {
             let mut stretcher = TimeStretcher::new();
             let mut out_left = vec![0.0_f32; 48_000];
             let mut out_right = vec![0.0_f32; 48_000];
-            stretcher.process(&mut out_left, &mut out_right, ratio, sine_source(440.0, rate));
+            stretcher.process(
+                &mut out_left,
+                &mut out_right,
+                ratio,
+                sine_source(440.0, rate),
+            );
             // Skip the first window where the tail primes from silence.
             let crossings = zero_crossings(&out_left[FRAME..]);
             let seconds = (out_left.len() - FRAME) as f32 / rate;
@@ -258,18 +267,23 @@ mod tests {
         // At ratio 2 the stretcher must read about twice as far through the
         // source as at ratio 1 for the same amount of output.
         let rate = 48_000.0;
-        let mut buffer_left = vec![0.0_f32; 24_000];
-        let mut buffer_right = vec![0.0_f32; 24_000];
+        let buffer_left = vec![0.0_f32; 24_000];
+        let buffer_right = vec![0.0_f32; 24_000];
         let consume = |ratio: f64| -> usize {
             let mut stretcher = TimeStretcher::new();
             let mut total = 0usize;
             let mut source = sine_source(220.0, rate);
             let mut left = buffer_left.clone();
             let mut right = buffer_right.clone();
-            stretcher.process(&mut left, &mut right, ratio, |count, dst_left, dst_right| {
-                total += count;
-                source(count, dst_left, dst_right);
-            });
+            stretcher.process(
+                &mut left,
+                &mut right,
+                ratio,
+                |count, dst_left, dst_right| {
+                    total += count;
+                    source(count, dst_left, dst_right);
+                },
+            );
             total
         };
         let slow = consume(1.0);
@@ -286,7 +300,16 @@ mod tests {
         let mut stretcher = TimeStretcher::new();
         let mut out_left = vec![0.0_f32; 10_000];
         let mut out_right = vec![0.0_f32; 10_000];
-        stretcher.process(&mut out_left, &mut out_right, 1.3, sine_source(1000.0, rate));
-        assert!(out_left.iter().all(|value| value.is_finite() && value.abs() <= 2.0));
+        stretcher.process(
+            &mut out_left,
+            &mut out_right,
+            1.3,
+            sine_source(1000.0, rate),
+        );
+        assert!(
+            out_left
+                .iter()
+                .all(|value| value.is_finite() && value.abs() <= 2.0)
+        );
     }
 }
