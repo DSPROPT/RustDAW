@@ -2,17 +2,31 @@
 //!
 //! ```text
 //! cargo run --release -p daw-analysis --example detect-tempo -- drums.wav
+//! cargo run --release -p daw-analysis --example detect-tempo -- drums.wav 174
 //! ```
+//!
+//! The optional second argument says roughly where to expect the tempo. It
+//! only settles a song that fits two readings equally — drum and bass at 174
+//! reads as 87 without it.
 
 use anyhow::{Context, Result};
 use std::time::Instant;
 
 fn main() -> Result<()> {
     let mut arguments = std::env::args().skip(1);
-    let path = arguments.next().context("usage: detect-tempo <file.wav>")?;
+    let path = arguments
+        .next()
+        .context("usage: detect-tempo <file.wav> [expected-bpm]")?;
+    let hint = match arguments.next() {
+        Some(text) => daw_analysis::TempoHint::around(
+            text.parse()
+                .context("the expected tempo must be a number")?,
+        ),
+        None => daw_analysis::TempoHint::default(),
+    };
 
     let started = Instant::now();
-    let analysis = daw_analysis::analyse_wav(std::path::Path::new(&path), 3.0)?;
+    let analysis = daw_analysis::analyse_wav_with(std::path::Path::new(&path), 3.0, hint)?;
     let elapsed = started.elapsed();
 
     println!(

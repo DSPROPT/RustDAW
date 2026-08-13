@@ -102,6 +102,9 @@ struct SongImportState {
     include_drumkit: bool,
     align_to_bar: bool,
     import_midi: bool,
+    /// Index into `TempoHint::PRESETS`. Roughly where to expect the tempo:
+    /// fast music imports at half speed without it.
+    tempo_hint: usize,
     /// Songs the pipeline has already processed; `None` until first loaded.
     catalog: Option<Vec<ProjectSummary>>,
     catalog_error: Option<String>,
@@ -125,6 +128,7 @@ impl Default for SongImportState {
             include_drumkit: false,
             align_to_bar: true,
             import_midi: true,
+            tempo_hint: 0,
             catalog: None,
             catalog_error: None,
             catalog_receiver: None,
@@ -140,6 +144,15 @@ impl Default for SongImportState {
 }
 
 impl SongImportState {
+    /// The hint the user picked, as the analysis crate wants it.
+    fn selected_tempo_hint(&self) -> daw_analysis::TempoHint {
+        let (_, centre) = daw_analysis::TempoHint::PRESETS
+            .get(self.tempo_hint)
+            .copied()
+            .unwrap_or(daw_analysis::TempoHint::PRESETS[0]);
+        daw_analysis::TempoHint::around(centre)
+    }
+
     fn is_running(&self) -> bool {
         self.job_receiver.is_some()
     }
@@ -1137,6 +1150,7 @@ impl RustDawApp {
             align_to_bar: self.song_import.align_to_bar,
             skip_silent: true,
             detect_tempo: true,
+            tempo_hint: self.song_import.selected_tempo_hint(),
             import_midi: self.song_import.import_midi,
             detect_chords: true,
         };
@@ -1472,6 +1486,42 @@ impl RustDawApp {
                         "Adds kick, snare, toms and cymbals as their own tracks. They sum to the \
                          drum stem, so mute the Drums track if you enable this.",
                     );
+                });
+
+                // A tempo and its double fit the audio equally well, so fast
+                // music is read at half speed unless someone says otherwise.
+                // The person importing the song knows what it is.
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Expected tempo");
+                    let presets = daw_analysis::TempoHint::PRESETS;
+                    let selected = presets
+                        .get(self.song_import.tempo_hint)
+                        .copied()
+                        .unwrap_or(presets[0]);
+                    egui::ComboBox::from_id_salt("tempo-hint")
+                        .selected_text(selected.0)
+                        .width(240.0)
+                        .show_ui(ui, |ui| {
+                            for (index, (label, centre)) in presets.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut self.song_import.tempo_hint,
+                                    index,
+                                    if index == 0 {
+                                        (*label).to_owned()
+                                    } else {
+                                        format!("{label}  (~{centre:.0} BPM)")
+                                    },
+                                );
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Which tempo to prefer when a song fits two readings equally — \
+                             174 BPM and 87 BPM describe the same drum and bass track.\nThe \
+                             tempo is still measured from the audio; this only settles the tie, \
+                             so a slow song picked as \"very fast\" still reports its own tempo.",
+                        );
                 });
 
                 ui.separator();

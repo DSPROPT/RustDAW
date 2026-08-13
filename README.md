@@ -9,7 +9,7 @@
 [![CI](https://github.com/DSPROPT/RustDAW/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DSPROPT/RustDAW/actions/workflows/ci.yml)
 [![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-[![Download](https://img.shields.io/badge/download-.deb%20v0.8.0-4ac470.svg)](#install-on-ubuntu)
+[![Download](https://img.shields.io/badge/download-.deb%20v0.8.1-4ac470.svg)](#install-on-ubuntu)
 
 </div>
 
@@ -27,7 +27,7 @@ track: a NAM capture of a Peavey 5150 through a Marshall cabinet, 3-band EQ,
 compressor, noise gate, delay and reverb — and the source WAV still dry.</sub>
 </div>
 
-**27,566 lines of Rust across 13 workspace packages, 379 tests, 18 released `.deb`
+**27,987 lines of Rust across 13 workspace packages, 383 tests, 19 released `.deb`
 packages — built by one person in about 50 hours, directing
 [Claude Code](https://claude.com/claude-code).**
 
@@ -60,8 +60,8 @@ and [The timeline](#the-timeline). Everything above it is the manual.
 No Rust toolchain needed. Download the package and install it:
 
 ```bash
-wget https://github.com/DSPROPT/RustDAW/raw/main/dist/rustdaw_0.8.0_amd64.deb
-sudo apt install ./rustdaw_0.8.0_amd64.deb
+wget https://github.com/DSPROPT/RustDAW/raw/main/dist/rustdaw_0.8.1_amd64.deb
+sudo apt install ./rustdaw_0.8.1_amd64.deb
 ```
 
 Then launch **RustDAW** from the applications menu, or run `rustdaw` from a
@@ -315,7 +315,36 @@ one tempo instead of recording the tracker's own error as tempo change.
 
 ```bash
 cargo run --release -p daw-analysis --example detect-tempo -- drums.wav
+cargo run --release -p daw-analysis --example detect-tempo -- drums.wav 174
 cargo run -p daw-midi --example dump-midi -- song.mid
+```
+
+**A tempo and its double fit the audio equally well.** 174 BPM and 87 BPM
+describe the same drum and bass track, and no amount of analysis separates them
+— which is why listeners sometimes disagree about a track's tempo too. What
+settles it is a prior, and by default that prior sits at 120 BPM, where most
+music is. Fast music is not most music: drum and bass at 174 is nearer 120 when
+halved, so it imports at 87 unless something says otherwise.
+
+So **IMPORT SONG** has an *Expected tempo* menu — Auto, slow, moderate, fast,
+very fast — that moves the prior. It does not override the audio; it only
+settles the tie. A 90 BPM song reads 90 under every setting, and a 124 BPM song
+reads 124 under all but "slow":
+
+| Source | Auto | Slow | Moderate | Fast | Very fast |
+|---|---|---|---|---|---|
+| 174 BPM | 87.0 | 58.0 | 87.0 | **173.9** | **173.9** |
+| 190 BPM | 94.9 | 94.9 | 94.9 | **190.7** | **190.7** |
+| 124 BPM | **124.0** | 62.0 | **124.0** | **124.0** | **124.0** |
+| 90 BPM | **90.0** | **90.0** | **90.0** | **90.0** | **90.0** |
+
+Measured across the local song-import corpus, the default setting is unchanged
+from before the menu existed — the hint only does something where the ambiguity
+is real.
+
+```bash
+cargo run --release -p daw-analysis --example tempo-hint       # the table above
+cargo run --release -p daw-analysis --example tempo-benchmark  # your own songs
 ```
 
 Measured against the kick-drum onsets of real songs, where 25% of a beat is what
@@ -550,12 +579,12 @@ Build the optimized `.deb` from a source checkout with:
 ./packaging/build-deb.sh
 ```
 
-The package is written to `dist/rustdaw_0.8.0_amd64.deb` and installs the `rustdaw`
+The package is written to `dist/rustdaw_0.8.1_amd64.deb` and installs the `rustdaw`
 executable, desktop launcher, and application icon. Installation is explicit and
 remains under the user's control:
 
 ```bash
-sudo apt install ./dist/rustdaw_0.8.0_amd64.deb
+sudo apt install ./dist/rustdaw_0.8.1_amd64.deb
 ```
 
 The native window embeds the RustDAW icon and the desktop launcher declares
@@ -577,7 +606,7 @@ and the plug-in format.
 | [`crates/daw-engine`](crates/daw-engine) | 6,001 | Transport, metronome, channel strip (EQ / compressor / gate), tone stack, delay, reverb, the General MIDI synth bank, SoundFont playback |
 | [`apps/rustdaw`](apps/rustdaw) | 5,826 | The egui desktop application: timeline, mixer, piano roll, tuner, theme |
 | [`crates/daw-audio-linux`](crates/daw-audio-linux) | 3,784 | The real-time runtime — PipeWire/Pulse via cpal, lock-free command and metering channels, disk writers, time stretching |
-| [`crates/daw-analysis`](crates/daw-analysis) | 3,011 | In-house FFT, spectral-flux onsets, beat tracking, chromagram, Viterbi chord decoding, YIN pitch detection |
+| [`crates/daw-analysis`](crates/daw-analysis) | 3,367 | In-house FFT, spectral-flux onsets, beat tracking, chromagram, Viterbi chord decoding, YIN pitch detection |
 | [`crates/daw-master`](crates/daw-master) | 2,135 | Reference mastering: level matching, the log-grid matching EQ, LOWESS, cubic splines, the brickwall limiter |
 | [`crates/daw-songimport`](crates/daw-songimport) | 1,918 | Worker supervision, manifest parsing, stem/MIDI ingest (+655 lines of Python worker) |
 | [`crates/daw-midi`](crates/daw-midi) | 1,377 | Standard MIDI file reading, clips in ticks, tempo maps |
@@ -588,7 +617,7 @@ and the plug-in format.
 | [`crates/daw-core`](crates/daw-core) | 195 | Shared types |
 | [`apps/hardware-probe`](apps/hardware-probe) | 83 | Read-only device enumeration |
 
-**379 test functions.** The product principles the whole thing was built against
+**383 test functions.** The product principles the whole thing was built against
 are in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md): never lose or corrupt a
 recording; the audio callback must be deterministic — no allocation, locks, file
 access, logging, or blocking system calls; editing is non-destructive and
@@ -668,7 +697,7 @@ compiled into a desktop binary. Judged every build by ear.
 Wrote the FFT. Wrote the Viterbi decoder. Wrote the 128-program synthesis bank.
 Wrote the C++ bridge to NeuralAmpModelerCore. Wrote the OAuth PKCE flow, the
 loopback redirect server, the lock-free command queues, the session migrations,
-the not-a-knot spline and the LOWESS smoother, the 379 tests. Held 27,000 lines of Rust in view at once and kept the real-time
+the not-a-knot spline and the LOWESS smoother, the 383 tests. Held 27,000 lines of Rust in view at once and kept the real-time
 callback allocation-free while doing it.
 
 Neither half of that produces a DAW alone.
@@ -738,10 +767,11 @@ timestamps, and the git history.
 | 11:00 | **Public**, at [github.com/DSPROPT/RustDAW](https://github.com/DSPROPT/RustDAW). |
 | 12:03 | [Reference mastering](#reference-mastering) — Matchering's algorithm ported to Rust: a cubic spline, a LOWESS smoother, the log-grid matching EQ and a brickwall limiter, none of which existed in the codebase that morning. Checked against the Python original on the same files: identical to 0.01 dB. |
 | **12:33** | **`rustdaw_0.8.0_amd64.deb`.** The eighteenth release. |
+| 13:18 | An *Expected tempo* menu on song import. A tempo and its double fit the audio equally well, so the fast end of the range imported at half speed; the person importing the song is the one who knows which it is. **`rustdaw_0.8.1_amd64.deb`.** |
 
 ### The release history
 
-Eighteen packages, all of them in [`dist/`](dist/), all of them installable.
+Nineteen packages, all of them in [`dist/`](dist/), all of them installable.
 
 | Version | Built | Version | Built |
 |---|---|---|---|
@@ -754,6 +784,7 @@ Eighteen packages, all of them in [`dist/`](dist/), all of them installable.
 | 0.3.2 | Aug 10, 23:55 | 0.6.1 | Aug 11, 18:06 |
 | 0.4.0 | Aug 11, 00:03 | 0.7.0 | Aug 12, 23:47 |
 | 0.4.1 | Aug 11, 00:10 | 0.8.0 | Aug 13, 12:33 |
+| | | 0.8.1 | Aug 13, 13:18 |
 
 ---
 
@@ -771,8 +802,8 @@ Historically that is a team, and years.
 
 Here is what came out of three days instead:
 
-- **11 crates and 2 applications, 27,566 lines of Rust**, `unsafe` forbidden at
-  the workspace level, `clippy::pedantic` clean, 379 tests.
+- **11 crates and 2 applications, 27,987 lines of Rust**, `unsafe` forbidden at
+  the workspace level, `clippy::pedantic` clean, 383 tests.
 - **A real-time engine** with lock-free command queues, disk-writer threads,
   crash recovery, and a soak test.
 - **DSP written from first principles** — its own FFT, its own onset detector, its
@@ -792,7 +823,7 @@ Here is what came out of three days instead:
   judgement to keep the secret key out of the binary.
 - **A cross-platform ML pipeline** — Demucs and basic-pitch, local-only, nothing
   uploaded, CUDA and Apple Silicon and CPU.
-- **Eighteen installable packages** and a macOS bundle script.
+- **Nineteen installable packages** and a macOS bundle script.
 
 The interesting part is not the volume. It is that none of the hard decisions were
 outsourced. The tone stack is separate from the channel EQ for a reason someone

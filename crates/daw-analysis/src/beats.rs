@@ -23,10 +23,69 @@ use crate::onset::OnsetEnvelope;
 /// half-time feel of something inside it.
 pub const MIN_BPM: f64 = 50.0;
 pub const MAX_BPM: f64 = 210.0;
-/// Tempo the prior treats as most likely, in BPM.
+/// Tempo the prior treats as most likely when nothing else is known, in BPM.
 const PRIOR_CENTRE_BPM: f64 = 120.0;
 /// Width of the prior in octaves.
 const PRIOR_WIDTH_OCTAVES: f64 = 1.05;
+
+/// Roughly where the tempo is expected to be.
+///
+/// Autocorrelation cannot tell a tempo from its double: both line up with the
+/// beats, and a song at 174 correlates at 87 just as strongly. Something has to
+/// break that tie, and by default it is a prior centred at 120 BPM — the tempo
+/// most music is nearest to.
+///
+/// Which is wrong for the music that is not. Drum and bass at 174 is closer to
+/// 120 when halved to 87, so the halved answer wins on the prior even though
+/// the evidence is even, and the detector reports a grid at half speed. The
+/// same happens to hardcore, and to anything else living at the fast end.
+///
+/// No amount of cleverness fixes this from the audio alone — the two readings
+/// are genuinely equally consistent with it, which is why listeners sometimes
+/// disagree about a track's tempo too. What resolves it is knowing what kind of
+/// music it is, and the person importing the song already does. So they can say
+/// so, and the prior moves to where they said.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TempoHint {
+    centre_bpm: f64,
+}
+
+impl TempoHint {
+    /// Named starting points, for a menu. The tempo is still detected from the
+    /// audio — these only move where the tie is broken, so a house track
+    /// imported as "drum and bass" still reports its own tempo.
+    pub const PRESETS: [(&'static str, f64); 5] = [
+        ("Auto", PRIOR_CENTRE_BPM),
+        ("Slow — ballad, boom bap", 80.0),
+        ("Moderate — pop, rock, house", 120.0),
+        ("Fast — trap, techno, dubstep", 145.0),
+        ("Very fast — drum & bass, hardcore", 174.0),
+    ];
+
+    /// A hint centred on `bpm`, clamped to the searchable range.
+    #[must_use]
+    pub fn around(bpm: f64) -> Self {
+        Self {
+            centre_bpm: if bpm.is_finite() {
+                bpm.clamp(MIN_BPM, MAX_BPM)
+            } else {
+                PRIOR_CENTRE_BPM
+            },
+        }
+    }
+
+    /// Where the prior is centred.
+    #[must_use]
+    pub fn centre_bpm(self) -> f64 {
+        self.centre_bpm
+    }
+}
+
+impl Default for TempoHint {
+    fn default() -> Self {
+        Self::around(PRIOR_CENTRE_BPM)
+    }
+}
 /// How strongly the tracker resists straying from the estimated period.
 const TIGHTNESS: f64 = 380.0;
 /// Resolution of the tempo search, in envelope frames.
@@ -80,16 +139,25 @@ const HARMONIC_WEIGHTS: [f64; 4] = [1.0, 0.5, 0.25, 0.125];
 /// Estimates a single global tempo from an onset envelope.
 #[must_use]
 pub fn estimate_tempo(envelope: &OnsetEnvelope) -> f64 {
+    estimate_tempo_with(envelope, TempoHint::default())
+}
+
+/// Estimates a single global tempo, told roughly where to expect it.
+///
+/// See [`TempoHint`] for why the hint is the only thing that can settle a
+/// tempo against its double.
+#[must_use]
+pub fn estimate_tempo_with(envelope: &OnsetEnvelope, hint: TempoHint) -> f64 {
     let values = &envelope.values;
     let fps = envelope.frames_per_second;
     if values.len() < 32 || fps <= 0.0 {
-        return PRIOR_CENTRE_BPM;
+        return hint.centre_bpm();
     }
 
     let min_lag = ((fps * 60.0 / MAX_BPM).floor() as usize).max(1);
     let max_lag = ((fps * 60.0 / MIN_BPM).ceil() as usize).min(values.len() / 2);
     if max_lag <= min_lag {
-        return PRIOR_CENTRE_BPM;
+        return hint.centre_bpm();
     }
 
     // Autocorrelate once, out to the highest multiple any candidate needs.
@@ -103,7 +171,7 @@ pub fn estimate_tempo(envelope: &OnsetEnvelope) -> f64 {
     let mut best_score = f64::NEG_INFINITY;
     let mut period = min_lag as f64;
     while period <= max_lag as f64 {
-        let score = harmonic_score(&correlation, period) * tempo_prior(fps * 60.0 / period);
+        let score = harmonic_score(&correlation, period) * tempo_prior(fps * 60.0 / period, hint);
         if score > best_score {
             best_score = score;
             best_period = period;
@@ -156,10 +224,10 @@ fn harmonic_score(correlation: &[f64], period: f64) -> f64 {
         .sum()
 }
 
-/// Log-normal weighting: tempi near 120 BPM are more likely a priori, which
-/// breaks the tie between a tempo and its double.
-fn tempo_prior(bpm: f64) -> f64 {
-    let octaves = (bpm / PRIOR_CENTRE_BPM).log2() / PRIOR_WIDTH_OCTAVES;
+/// Log-normal weighting: tempi near the hint's centre are more likely a
+/// priori, which breaks the tie between a tempo and its double.
+fn tempo_prior(bpm: f64, hint: TempoHint) -> f64 {
+    let octaves = (bpm / hint.centre_bpm()).log2() / PRIOR_WIDTH_OCTAVES;
     (-0.5 * octaves * octaves).exp()
 }
 
@@ -280,7 +348,14 @@ fn estimate_downbeat(values: &[f32], frames: &[usize], beats_per_bar: usize) -> 
 /// Runs the whole chain: onsets, tempo, beats.
 #[must_use]
 pub fn analyse(envelope: &OnsetEnvelope) -> BeatAnalysis {
-    let bpm = estimate_tempo(envelope);
+    analyse_with(envelope, TempoHint::default())
+}
+
+/// Estimates the tempo and tracks the beats, told roughly where to expect the
+/// tempo. See [`TempoHint`].
+#[must_use]
+pub fn analyse_with(envelope: &OnsetEnvelope, hint: TempoHint) -> BeatAnalysis {
+    let bpm = estimate_tempo_with(envelope, hint);
     track_beats(envelope, bpm)
 }
 
@@ -407,9 +482,59 @@ mod tests {
     }
 
     #[test]
+    fn a_hint_settles_a_tempo_against_its_double() {
+        // 93.75 fps; a spike every 15 frames is 375 BPM, every 30 is 187.5.
+        // Use 32 frames: 175.8 BPM, which the default prior halves.
+        let envelope = pulse_envelope(32, 80, 93.75);
+        let default = estimate_tempo(&envelope);
+        let fast = estimate_tempo_with(&envelope, TempoHint::around(174.0));
+        assert!(
+            default < 110.0,
+            "the default prior should read this as halved, got {default:.1}"
+        );
+        assert!(
+            fast > 160.0,
+            "a fast hint should read the true tempo, got {fast:.1}"
+        );
+    }
+
+    #[test]
+    fn a_hint_does_not_override_the_audio() {
+        // A hint moves where ties are broken; it cannot invent a tempo the
+        // evidence does not support. 120 BPM material stays 120 under a hint
+        // one octave away only because 60 is a real alternative reading — so
+        // check a hint in the same octave changes nothing.
+        let envelope = pulse_envelope(47, 60, 93.75);
+        let plain = estimate_tempo(&envelope);
+        let nudged = estimate_tempo_with(&envelope, TempoHint::around(130.0));
+        assert!(
+            (plain - nudged).abs() < 1.0,
+            "a hint near the truth must not move it: {plain:.1} then {nudged:.1}"
+        );
+    }
+
+    #[test]
+    fn the_default_hint_is_the_original_prior() {
+        // The whole corpus was measured against this; it must not drift.
+        assert!((TempoHint::default().centre_bpm() - PRIOR_CENTRE_BPM).abs() < f64::EPSILON);
+        assert!((TempoHint::PRESETS[0].1 - PRIOR_CENTRE_BPM).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_hint_is_clamped_to_the_searchable_range() {
+        assert!((TempoHint::around(5.0).centre_bpm() - MIN_BPM).abs() < f64::EPSILON);
+        assert!((TempoHint::around(9_000.0).centre_bpm() - MAX_BPM).abs() < f64::EPSILON);
+        assert!((TempoHint::around(f64::NAN).centre_bpm() - PRIOR_CENTRE_BPM).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn the_prior_is_strongest_at_its_centre() {
-        assert!(tempo_prior(120.0) > tempo_prior(60.0));
-        assert!(tempo_prior(120.0) > tempo_prior(240.0));
-        assert!((tempo_prior(120.0) - 1.0).abs() < 1e-12);
+        let hint = TempoHint::default();
+        assert!(tempo_prior(120.0, hint) > tempo_prior(60.0, hint));
+        assert!(tempo_prior(120.0, hint) > tempo_prior(240.0, hint));
+        assert!((tempo_prior(120.0, hint) - 1.0).abs() < 1e-12);
+        // And the peak follows the hint.
+        let fast = TempoHint::around(174.0);
+        assert!(tempo_prior(174.0, fast) > tempo_prior(87.0, fast));
     }
 }

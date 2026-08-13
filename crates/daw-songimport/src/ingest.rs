@@ -37,6 +37,10 @@ pub struct IngestOptions {
     pub skip_silent: bool,
     /// Detect tempo natively instead of trusting the pipeline's beat grid.
     pub detect_tempo: bool,
+    /// Roughly where to expect the tempo. Fast music is reported at half speed
+    /// without this, because the audio alone cannot settle a tempo against its
+    /// double — see [`daw_analysis::TempoHint`].
+    pub tempo_hint: daw_analysis::TempoHint,
     /// Import the transcription as instrument tracks.
     pub import_midi: bool,
     /// Detect the chord chart and the key.
@@ -51,6 +55,7 @@ impl Default for IngestOptions {
             align_to_bar: true,
             skip_silent: true,
             detect_tempo: true,
+            tempo_hint: daw_analysis::TempoHint::default(),
             import_midi: true,
             detect_chords: true,
         }
@@ -272,6 +277,16 @@ fn detect_tempo(
     if !options.detect_tempo {
         return TempoDetection::fallback(120.0);
     }
+    // A hint that is not the default is worth recording: it changes the answer,
+    // and someone reading the import notes later should know it was asked for.
+    if (options.tempo_hint.centre_bpm() - daw_analysis::TempoHint::default().centre_bpm()).abs()
+        > f64::EPSILON
+    {
+        notes.push(format!(
+            "Tempo was detected expecting around {:.0} BPM.",
+            options.tempo_hint.centre_bpm()
+        ));
+    }
     let candidates = ["drums.wav", "other.wav", "bass.wav"];
     let Some(source) = candidates
         .iter()
@@ -285,7 +300,7 @@ fn detect_tempo(
     // A wider tolerance keeps a steady song on one tempo: real recordings jitter
     // by a few BPM per beat, and a tight threshold turns that noise into a string
     // of spurious tempo changes that the click can never follow.
-    match daw_analysis::analyse_wav(&source, 6.0) {
+    match daw_analysis::analyse_wav_with(&source, 6.0, options.tempo_hint) {
         Ok(analysis) => {
             if !analysis.beats.is_usable() {
                 notes.push(

@@ -24,7 +24,7 @@ pub mod pitch;
 use anyhow::{Context, Result};
 use std::path::Path;
 
-pub use beats::BeatAnalysis;
+pub use beats::{BeatAnalysis, TempoHint};
 pub use onset::OnsetEnvelope;
 pub use pitch::{Pitch, detect};
 
@@ -57,8 +57,27 @@ pub fn analyse_samples(
     sample_rate: u32,
     tempo_tolerance_bpm: f64,
 ) -> SongAnalysis {
+    analyse_samples_with(
+        samples,
+        sample_rate,
+        tempo_tolerance_bpm,
+        TempoHint::default(),
+    )
+}
+
+/// Analyses mono samples, told roughly where to expect the tempo.
+///
+/// See [`TempoHint`]: a song at the fast end of the range is reported at half
+/// speed without one, because the audio alone cannot settle it.
+#[must_use]
+pub fn analyse_samples_with(
+    samples: &[f32],
+    sample_rate: u32,
+    tempo_tolerance_bpm: f64,
+    hint: TempoHint,
+) -> SongAnalysis {
     let envelope = onset::onset_envelope(samples, sample_rate);
-    let beats = beats::analyse(&envelope);
+    let beats = beats::analyse_with(&envelope, hint);
     let tempo_map = if beats.is_usable() {
         TempoMap::from_beat_times(&beats.beat_times, tempo_tolerance_bpm)
     } else {
@@ -82,8 +101,26 @@ pub fn analyse_samples(
 ///
 /// Returns an error if the file cannot be opened or decoded.
 pub fn analyse_wav(path: &Path, tempo_tolerance_bpm: f64) -> Result<SongAnalysis> {
+    analyse_wav_with(path, tempo_tolerance_bpm, TempoHint::default())
+}
+
+/// Analyses a WAV file, told roughly where to expect the tempo.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or decoded.
+pub fn analyse_wav_with(
+    path: &Path,
+    tempo_tolerance_bpm: f64,
+    hint: TempoHint,
+) -> Result<SongAnalysis> {
     let (samples, sample_rate) = read_wav_mono(path)?;
-    Ok(analyse_samples(&samples, sample_rate, tempo_tolerance_bpm))
+    Ok(analyse_samples_with(
+        &samples,
+        sample_rate,
+        tempo_tolerance_bpm,
+        hint,
+    ))
 }
 
 /// Reads a WAV file as mono f32 at its own sample rate.
