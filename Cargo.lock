@@ -874,16 +874,17 @@ checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
 name = "daw-analysis"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "daw-midi",
+ "daw-project",
  "hound",
 ]
 
 [[package]]
 name = "daw-audio-linux"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "cpal",
@@ -897,14 +898,14 @@ dependencies = [
 
 [[package]]
 name = "daw-core"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "daw-engine"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "daw-core",
  "daw-midi",
@@ -914,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "daw-master"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "daw-analysis",
@@ -923,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "daw-midi"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "serde",
@@ -933,7 +934,7 @@ dependencies = [
 
 [[package]]
 name = "daw-nam"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "cc",
  "daw-core",
@@ -941,7 +942,7 @@ dependencies = [
 
 [[package]]
 name = "daw-project"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "daw-core",
@@ -953,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "daw-render"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "daw-core",
@@ -967,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "daw-songimport"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "daw-analysis",
@@ -983,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "daw-tone3000"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "base64",
  "serde",
@@ -1700,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "hardware-probe"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "daw-audio-linux",
@@ -3006,7 +3007,7 @@ dependencies = [
 
 [[package]]
 name = "rustdaw"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "daw-analysis",

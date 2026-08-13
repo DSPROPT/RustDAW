@@ -1,5 +1,9 @@
 //! Versioned `RustDAW` project documents and atomic persistence.
 
+pub mod chart;
+
+pub use chart::{ChartBeat, chord_chart, format_chart};
+
 use anyhow::{Context, Result, bail};
 use daw_core::ChannelLayout;
 use daw_midi::{MidiClip, TempoMap};

@@ -53,16 +53,27 @@ fn main() -> Result<()> {
         "key: {}",
         key.map_or_else(|| "unknown".to_owned(), |key| key.name())
     );
-    println!("{} chord span(s):", spans.len());
-    for span in &spans {
-        println!(
-            "  {:7.2}–{:7.2}  {:8}  confidence {:.2}",
-            span.start_seconds,
-            span.end_seconds,
-            span.label(),
-            span.confidence
-        );
-    }
+    // The chart as a musician would read it: one cell per beat, the chord
+    // printed only where it changes.
+    let events: Vec<daw_project::ChordEvent> = spans
+        .iter()
+        .map(|span| daw_project::ChordEvent {
+            start_seconds: span.start_seconds,
+            end_seconds: span.end_seconds,
+            label: span.label(),
+            confidence: span.confidence,
+        })
+        .collect();
+    let end = events.last().map_or(0.0, |event| event.end_seconds);
+    let chart = daw_project::chord_chart(&events, &beats.tempo_map, 4, end);
+
+    let printed = chart.iter().filter(|beat| beat.is_change()).count();
+    println!(
+        "\n{} raw span(s) -> {printed} change(s) over {} beats\n",
+        spans.len(),
+        chart.len()
+    );
+    println!("{}", daw_project::format_chart(&chart, 4));
     Ok(())
 }
 

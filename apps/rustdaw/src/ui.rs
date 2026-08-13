@@ -234,6 +234,13 @@ pub struct RustDawApp {
     /// The record the exported mix is matched to. `None` exports the mix as it
     /// was mixed.
     master_reference: Option<PathBuf>,
+    /// The detected chord chart, in timeline order, and the detected key.
+    /// Carried here so saving the session keeps them: they cost real analysis
+    /// to produce and were previously discarded on the first save.
+    chords: Vec<daw_project::ChordEvent>,
+    detected_key: Option<String>,
+    /// Whether the chord lane is shown above the tracks.
+    chords_open: bool,
     selected_clip: Option<(usize, usize)>,
     dragged_clip: Option<(usize, usize, u64, Vec2)>,
     dirty: bool,
@@ -320,6 +327,9 @@ impl RustDawApp {
             current_recording_path: None,
             session_path,
             master_reference: document.master_reference.clone(),
+            chords: document.chords.clone(),
+            detected_key: document.key.clone(),
+            chords_open: true,
             selected_clip: None,
             dragged_clip: None,
             dirty: false,
@@ -943,6 +953,8 @@ impl RustDawApp {
             click_enabled: self.click_enabled,
             tempo_map: Some(self.tempo_map.clone()),
             master_reference: self.master_reference.clone(),
+            chords: self.chords.clone(),
+            key: self.detected_key.clone(),
             tracks: self.tracks.iter().map(track_to_project).collect(),
             ..ProjectDocument::default()
         }
@@ -1010,6 +1022,8 @@ impl RustDawApp {
                 self.meter_denominator = document.meter_denominator;
                 self.click_enabled = document.click_enabled;
                 self.master_reference = document.master_reference.clone();
+                self.chords = document.chords.clone();
+                self.detected_key = document.key.clone();
                 self.tracks = document
                     .tracks
                     .into_iter()
@@ -1694,6 +1708,97 @@ impl RustDawApp {
         }
     }
 
+    /// The chord chart, drawn as a lane of marks under the ruler.
+    ///
+    /// One cell per beat, on the same grid and the same scroll offset as the
+    /// tracks below, so a chord sits over the audio it belongs to. A chord is
+    /// printed where it changes and dotted where it is held — the way a chart
+    /// is written, and the way the eye reads one, which is by looking for the
+    /// changes.
+    fn chord_lane(&mut self, ui: &mut egui::Ui, left: f32, width: f32) {
+        const LANE_HEIGHT: f32 = 26.0;
+        if !self.chords_open || self.chords.is_empty() {
+            return;
+        }
+
+        let (lane, response) =
+            ui.allocate_exact_size(Vec2::new(width, LANE_HEIGHT), Sense::click());
+        let painter = ui.painter_at(lane);
+        painter.rect_filled(lane, 0.0, theme::PANEL);
+
+        let visible_start = f64::from(self.timeline_scroll_x / self.pixels_per_second);
+        let visible_end = visible_start + f64::from(width / self.pixels_per_second);
+        let chart = daw_project::chord_chart(
+            &self.chords,
+            &self.tempo_map,
+            self.meter_numerator,
+            visible_end + 1.0,
+        );
+
+        // Below this, beats are closer together than their labels are wide and
+        // the lane becomes unreadable; only the changes are drawn.
+        let beat_width = self.pixels_per_second * 60.0 / f32::from(self.tempo.max(1));
+        let crowded = beat_width < 26.0;
+
+        for beat in &chart {
+            if beat.seconds < visible_start - 1.0 || beat.seconds > visible_end {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let x = left + beat.seconds as f32 * self.pixels_per_second - self.timeline_scroll_x;
+            if x < left - 40.0 || x > lane.right() {
+                continue;
+            }
+
+            // Bar lines, so the chart is countable.
+            if beat.is_downbeat() {
+                painter.line_segment(
+                    [Pos2::new(x, lane.top()), Pos2::new(x, lane.bottom())],
+                    Stroke::new(1.0_f32, theme::BORDER),
+                );
+            }
+
+            match &beat.label {
+                Some(label) => {
+                    // A change: the chord itself, and a tick marking the beat
+                    // it lands on.
+                    painter.line_segment(
+                        [
+                            Pos2::new(x, lane.bottom() - 4.0),
+                            Pos2::new(x, lane.bottom()),
+                        ],
+                        Stroke::new(1.5_f32, theme::BLUE),
+                    );
+                    let faded = beat.confidence < 0.4;
+                    painter.text(
+                        Pos2::new(x + 3.0, lane.center().y),
+                        Align2::LEFT_CENTER,
+                        label,
+                        FontId::proportional(12.0),
+                        if faded { theme::MUTED } else { theme::TEXT },
+                    );
+                }
+                None if !crowded => {
+                    // Held: a dot, meaning "still the last one".
+                    painter.circle_filled(
+                        Pos2::new(x + 6.0, lane.center().y + 1.0),
+                        1.2,
+                        theme::MUTED,
+                    );
+                }
+                None => {}
+            }
+        }
+
+        let mut hint = "The detected chord chart. A chord is shown where it changes; a dot means \
+                        it is still playing."
+            .to_owned();
+        if let Some(key) = &self.detected_key {
+            hint = format!("Key: {key}.\n{hint}");
+        }
+        response.on_hover_text(hint);
+    }
+
     fn export_mix(&mut self) {
         if matches!(
             self.snapshot().transport,
@@ -1785,6 +1890,8 @@ impl RustDawApp {
         self.meter_denominator = 4;
         self.click_enabled = true;
         self.master_reference = None;
+        self.chords.clear();
+        self.detected_key = None;
         self.playback_synced = true;
         self.session_needs_save_as = true;
         self.dirty = true;
@@ -3591,6 +3698,8 @@ impl eframe::App for RustDawApp {
                         );
                     }
                 }
+                self.chord_lane(ui, ruler.left(), ruler.width());
+
                 // While the transport runs, keep the playhead in view by
                 // scrolling the timeline so it sits near the centre. The user
                 // can turn this off, or it yields as soon as playback stops.

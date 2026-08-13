@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 daw-midi = { path = "../daw-midi" }
+daw-project = { path = "../daw-project" }
 hound.workspace = true
 
 [lints]

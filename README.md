@@ -9,7 +9,7 @@
 [![CI](https://github.com/DSPROPT/RustDAW/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DSPROPT/RustDAW/actions/workflows/ci.yml)
 [![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-[![Download](https://img.shields.io/badge/download-.deb%20v0.8.1-4ac470.svg)](#install-on-ubuntu)
+[![Download](https://img.shields.io/badge/download-.deb%20v0.8.2-4ac470.svg)](#install-on-ubuntu)
 
 </div>
 
@@ -27,7 +27,7 @@ track: a NAM capture of a Peavey 5150 through a Marshall cabinet, 3-band EQ,
 compressor, noise gate, delay and reverb — and the source WAV still dry.</sub>
 </div>
 
-**27,987 lines of Rust across 13 workspace packages, 383 tests, 19 released `.deb`
+**28398 lines of Rust across 13 workspace packages, 392 tests, 20 released `.deb`
 packages — built by one person in about 50 hours, directing
 [Claude Code](https://claude.com/claude-code).**
 
@@ -60,8 +60,8 @@ and [The timeline](#the-timeline). Everything above it is the manual.
 No Rust toolchain needed. Download the package and install it:
 
 ```bash
-wget https://github.com/DSPROPT/RustDAW/raw/main/dist/rustdaw_0.8.1_amd64.deb
-sudo apt install ./rustdaw_0.8.1_amd64.deb
+wget https://github.com/DSPROPT/RustDAW/raw/main/dist/rustdaw_0.8.2_amd64.deb
+sudo apt install ./rustdaw_0.8.2_amd64.deb
 ```
 
 Then launch **RustDAW** from the applications menu, or run `rustdaw` from a
@@ -425,6 +425,36 @@ sustained harmony and a chart with 155 chord changes is describing noise.
 cargo run --release -p daw-analysis --example detect-chords -- <project-dir>
 ```
 
+### The chord lane
+
+The chart is drawn above the tracks, on the same grid and the same scroll as
+the audio, so a chord sits over the bar it belongs to. One cell per quarter
+note, and a chord is printed only where it **changes** — a dot means it is
+still playing, the way a lead sheet is written:
+
+```text
+   1 | C#m       .         .         .         |
+   2 | .         .         .         .         |
+   6 | .         .         G#sus4/D# .         |
+   7 | C#m       .         .         .         |
+  10 | .         .         D#maj7    .         |
+```
+
+Repeating `C#m C#m C#m C#m` would be noise on the page; the eye is looking for
+the changes anyway. Bar lines are drawn at each downbeat, and a chord the
+detector is unsure of is printed dimmed rather than hidden.
+
+Resolving onto the beat grid is a correctness fix as much as a display one: a
+span that begins 40 ms before the beat is describing the analysis rather than
+the music, and on the grid it lands where the band played it. It merges only
+2–8% of spans across the local corpus, so the honest claim is that it fixes
+*placement* and readability, not the number of chords found.
+
+Chords and the detected key are now kept in the session. They were being
+detected at import, written to the session file, and then discarded the first
+time the session was saved from the application, which meant the chart quietly
+disappeared.
+
 ## Tuner
 
 **TUNER** in the bottom bar opens a needle dial that reads the armed input: the
@@ -579,12 +609,12 @@ Build the optimized `.deb` from a source checkout with:
 ./packaging/build-deb.sh
 ```
 
-The package is written to `dist/rustdaw_0.8.1_amd64.deb` and installs the `rustdaw`
+The package is written to `dist/rustdaw_0.8.2_amd64.deb` and installs the `rustdaw`
 executable, desktop launcher, and application icon. Installation is explicit and
 remains under the user's control:
 
 ```bash
-sudo apt install ./dist/rustdaw_0.8.1_amd64.deb
+sudo apt install ./dist/rustdaw_0.8.2_amd64.deb
 ```
 
 The native window embeds the RustDAW icon and the desktop launcher declares
@@ -611,13 +641,13 @@ and the plug-in format.
 | [`crates/daw-songimport`](crates/daw-songimport) | 1,918 | Worker supervision, manifest parsing, stem/MIDI ingest (+655 lines of Python worker) |
 | [`crates/daw-midi`](crates/daw-midi) | 1,377 | Standard MIDI file reading, clips in ticks, tempo maps |
 | [`crates/daw-tone3000`](crates/daw-tone3000) | 1,002 | OAuth PKCE, the loopback redirect server, capture download |
-| [`crates/daw-project`](crates/daw-project) | 615 | The versioned session document and its migrations |
+| [`crates/daw-project`](crates/daw-project) | 919 | The versioned session document and its migrations |
 | [`crates/daw-nam`](crates/daw-nam) | 563 | The C++ bridge to NeuralAmpModelerCore, plus the amp library scanner |
 | [`crates/daw-render`](crates/daw-render) | 291 | Deterministic offline stereo export |
 | [`crates/daw-core`](crates/daw-core) | 195 | Shared types |
 | [`apps/hardware-probe`](apps/hardware-probe) | 83 | Read-only device enumeration |
 
-**383 test functions.** The product principles the whole thing was built against
+**392 test functions.** The product principles the whole thing was built against
 are in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md): never lose or corrupt a
 recording; the audio callback must be deterministic — no allocation, locks, file
 access, logging, or blocking system calls; editing is non-destructive and
@@ -697,7 +727,7 @@ compiled into a desktop binary. Judged every build by ear.
 Wrote the FFT. Wrote the Viterbi decoder. Wrote the 128-program synthesis bank.
 Wrote the C++ bridge to NeuralAmpModelerCore. Wrote the OAuth PKCE flow, the
 loopback redirect server, the lock-free command queues, the session migrations,
-the not-a-knot spline and the LOWESS smoother, the 383 tests. Held 27,000 lines of Rust in view at once and kept the real-time
+the not-a-knot spline and the LOWESS smoother, the 392 tests. Held 27,000 lines of Rust in view at once and kept the real-time
 callback allocation-free while doing it.
 
 Neither half of that produces a DAW alone.
@@ -771,7 +801,7 @@ timestamps, and the git history.
 
 ### The release history
 
-Nineteen packages, all of them in [`dist/`](dist/), all of them installable.
+Twenty packages, all of them in [`dist/`](dist/), all of them installable.
 
 | Version | Built | Version | Built |
 |---|---|---|---|
@@ -785,6 +815,7 @@ Nineteen packages, all of them in [`dist/`](dist/), all of them installable.
 | 0.4.0 | Aug 11, 00:03 | 0.7.0 | Aug 12, 23:47 |
 | 0.4.1 | Aug 11, 00:10 | 0.8.0 | Aug 13, 12:33 |
 | | | 0.8.1 | Aug 13, 13:18 |
+| | | 0.8.2 | Aug 13, 14:02 |
 
 ---
 
@@ -802,8 +833,8 @@ Historically that is a team, and years.
 
 Here is what came out of three days instead:
 
-- **11 crates and 2 applications, 27,987 lines of Rust**, `unsafe` forbidden at
-  the workspace level, `clippy::pedantic` clean, 383 tests.
+- **11 crates and 2 applications, 28398 lines of Rust**, `unsafe` forbidden at
+  the workspace level, `clippy::pedantic` clean, 392 tests.
 - **A real-time engine** with lock-free command queues, disk-writer threads,
   crash recovery, and a soak test.
 - **DSP written from first principles** — its own FFT, its own onset detector, its
@@ -823,7 +854,7 @@ Here is what came out of three days instead:
   judgement to keep the secret key out of the binary.
 - **A cross-platform ML pipeline** — Demucs and basic-pitch, local-only, nothing
   uploaded, CUDA and Apple Silicon and CPU.
-- **Nineteen installable packages** and a macOS bundle script.
+- **Twenty installable packages** and a macOS bundle script.
 
 The interesting part is not the volume. It is that none of the hard decisions were
 outsourced. The tone stack is separate from the channel EQ for a reason someone
