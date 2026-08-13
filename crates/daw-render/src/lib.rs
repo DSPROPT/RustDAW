@@ -148,6 +148,12 @@ pub fn export_stereo(project: &ProjectDocument, destination: &Path) -> Result<u6
         }
     }
 
+    // The master stage. Everything above is the mix; this is the one thing
+    // that looks at it whole, so it runs last and only on the way out.
+    if let Some(reference) = &project.master_reference {
+        master_to_reference(&mut mix, reference, project.sample_rate)?;
+    }
+
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -166,6 +172,25 @@ pub fn export_stereo(project: &ProjectDocument, destination: &Path) -> Result<u6
     }
     writer.finalize().context("failed to finalize mix WAV")?;
     Ok(end_frame)
+}
+
+/// Matches the finished mix to a reference record.
+///
+/// Failures here are reported against the reference rather than the export: a
+/// missing or mismatched reference is something the user chose and can fix,
+/// and silently exporting an unmastered mix under a name they expected to be
+/// mastered would be worse than refusing.
+fn master_to_reference(mix: &mut Vec<[f32; 2]>, reference: &Path, sample_rate: u32) -> Result<()> {
+    let loaded = daw_master::load_reference(reference, sample_rate).with_context(|| {
+        format!(
+            "failed to read the mastering reference {}",
+            reference.display()
+        )
+    })?;
+    #[allow(clippy::cast_precision_loss)]
+    let rate = sample_rate as f32;
+    daw_master::master(mix, &loaded, rate, &daw_master::Config::default())
+        .context("failed to master the mix against the reference")
 }
 
 fn read_wav(path: &Path, expected_rate: u32) -> Result<Vec<[f32; 2]>> {
@@ -247,6 +272,115 @@ mod tests {
     fn integer_conversion_clamps() {
         assert_eq!(float_to_i24(2.0), 8_388_607);
         assert_eq!(float_to_i24(-2.0), -8_388_607);
+    }
+
+    /// Writes a 48 kHz stereo WAV of `seconds` of decaying noise at `level`.
+    fn write_noise(path: &Path, seconds: usize, level: f32) {
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 24,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        let mut state = 0x1234_5678_9abc_def0_u64;
+        for _ in 0..48_000 * seconds {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            #[allow(clippy::cast_precision_loss)]
+            let sample = ((state >> 40) as f32 / 8_388_608.0 - 1.0) * level;
+            writer.write_sample(float_to_i24(sample)).unwrap();
+            writer.write_sample(float_to_i24(sample * 0.9)).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    #[test]
+    fn a_mastering_reference_changes_the_export_and_holds_the_ceiling() {
+        let stem = format!("rustdaw-master-test-{}", std::process::id());
+        let temp = std::env::temp_dir();
+        let source = temp.join(format!("{stem}-source.wav"));
+        let reference = temp.join(format!("{stem}-reference.wav"));
+        let plain = temp.join(format!("{stem}-plain.wav"));
+        let mastered = temp.join(format!("{stem}-mastered.wav"));
+
+        // A quiet mix and a loud reference: mastering must close the gap.
+        write_noise(&source, 2, 0.05);
+        write_noise(&reference, 2, 0.7);
+
+        let mut track = ProjectTrack::new("Mix", ChannelLayout::Stereo);
+        track.clips.push(ProjectClip {
+            id: uuid::Uuid::new_v4(),
+            name: "Take".to_owned(),
+            path: source.clone(),
+            start_frame: 0,
+            end_frame: 48_000 * 2,
+        });
+        let project = ProjectDocument {
+            tracks: vec![track],
+            ..ProjectDocument::default()
+        };
+        export_stereo(&project, &plain).unwrap();
+
+        let with_reference = ProjectDocument {
+            master_reference: Some(reference.clone()),
+            ..project
+        };
+        export_stereo(&with_reference, &mastered).unwrap();
+
+        let peak_of = |path: &Path| {
+            let mut reader = hound::WavReader::open(path).unwrap();
+            reader
+                .samples::<i32>()
+                .map(|sample| sample.unwrap().abs())
+                .max()
+                .unwrap_or(0)
+        };
+        let quiet = peak_of(&plain);
+        let loud = peak_of(&mastered);
+
+        assert!(
+            loud > quiet * 2,
+            "mastering should bring the quiet mix up: {quiet} then {loud}"
+        );
+        assert!(loud <= 8_388_607, "and must not exceed full scale: {loud}");
+
+        for path in [source, reference, plain, mastered] {
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    #[test]
+    fn a_missing_reference_fails_the_export_rather_than_exporting_unmastered() {
+        let stem = format!("rustdaw-master-missing-{}", std::process::id());
+        let temp = std::env::temp_dir();
+        let source = temp.join(format!("{stem}-source.wav"));
+        let output = temp.join(format!("{stem}-out.wav"));
+        write_noise(&source, 1, 0.3);
+
+        let mut track = ProjectTrack::new("Mix", ChannelLayout::Stereo);
+        track.clips.push(ProjectClip {
+            id: uuid::Uuid::new_v4(),
+            name: "Take".to_owned(),
+            path: source.clone(),
+            start_frame: 0,
+            end_frame: 48_000,
+        });
+        let project = ProjectDocument {
+            tracks: vec![track],
+            master_reference: Some(temp.join("no-such-reference.wav")),
+            ..ProjectDocument::default()
+        };
+
+        let error = export_stereo(&project, &output).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("reference"),
+            "the error should name the reference: {error:#}"
+        );
+
+        std::fs::remove_file(source).ok();
+        std::fs::remove_file(output).ok();
     }
 
     #[test]

@@ -34,6 +34,12 @@ pub struct ProjectDocument {
     /// The detected key, e.g. "E minor".
     #[serde(default)]
     pub key: Option<String>,
+    /// A record the exported mix is matched to, if one has been chosen.
+    ///
+    /// Additive and optional, so a session written before mastering existed
+    /// still opens: absent means the mix is exported as it was mixed.
+    #[serde(default)]
+    pub master_reference: Option<PathBuf>,
     pub tracks: Vec<ProjectTrack>,
 }
 
@@ -70,6 +76,7 @@ impl Default for ProjectDocument {
             tempo_map: None,
             chords: Vec::new(),
             key: None,
+            master_reference: None,
             tracks: vec![ProjectTrack::new("Audio 1", ChannelLayout::Mono)],
         }
     }

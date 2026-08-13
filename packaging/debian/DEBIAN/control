@@ -7,7 +7,7 @@ Maintainer: RustDAW Project
 Depends: libasound2, libpulse0, libgl1
 Recommends: ffmpeg
 Suggests: fluid-soundfont-gm
-Description: Ubuntu-first digital audio workstation
+Description: Digital audio workstation for Ubuntu
  RustDAW provides mono and stereo recording, low-latency monitoring,
  metronome, timeline editing, session persistence, and stereo export.
  .
@@ -18,6 +18,10 @@ Description: Ubuntu-first digital audio workstation
  Instrument tracks play from a SoundFont when one is installed and from a
  built-in General MIDI bank synthesised in Rust when one is not, so nothing
  has to be downloaded for a session to open and sound.
+ .
+ The exported mix can be mastered against a reference record, matching its
+ loudness, tonal balance and stereo width. The analysis runs natively and
+ needs nothing installed.
  .
  Song import needs ffmpeg for sample-rate conversion, and a local DSPRO
  Studio worker for the stem separation itself.

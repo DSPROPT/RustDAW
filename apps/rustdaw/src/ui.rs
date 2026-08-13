@@ -218,6 +218,9 @@ pub struct RustDawApp {
     recording_began: bool,
     current_recording_path: Option<PathBuf>,
     session_path: PathBuf,
+    /// The record the exported mix is matched to. `None` exports the mix as it
+    /// was mixed.
+    master_reference: Option<PathBuf>,
     selected_clip: Option<(usize, usize)>,
     dragged_clip: Option<(usize, usize, u64, Vec2)>,
     dirty: bool,
@@ -303,6 +306,7 @@ impl RustDawApp {
             recording_began: false,
             current_recording_path: None,
             session_path,
+            master_reference: document.master_reference.clone(),
             selected_clip: None,
             dragged_clip: None,
             dirty: false,
@@ -925,6 +929,7 @@ impl RustDawApp {
             meter_denominator: self.meter_denominator,
             click_enabled: self.click_enabled,
             tempo_map: Some(self.tempo_map.clone()),
+            master_reference: self.master_reference.clone(),
             tracks: self.tracks.iter().map(track_to_project).collect(),
             ..ProjectDocument::default()
         }
@@ -991,6 +996,7 @@ impl RustDawApp {
                 self.meter_numerator = document.meter_numerator;
                 self.meter_denominator = document.meter_denominator;
                 self.click_enabled = document.click_enabled;
+                self.master_reference = document.master_reference.clone();
                 self.tracks = document
                     .tracks
                     .into_iter()
@@ -1647,15 +1653,58 @@ impl RustDawApp {
             return;
         }
         let destination = daw_core::media_dir("Exports").join("Current Mix.wav");
+        if self.master_reference.is_some() {
+            // Mastering analyses the whole mix twice over and convolves it, so
+            // on a long song this is seconds rather than instant.
+            self.status_message = "Exporting and mastering…".to_owned();
+        }
         match daw_render::export_stereo(&self.project_document(), &destination) {
             Ok(frames) => {
+                let mastered = if self.master_reference.is_some() {
+                    " (mastered)"
+                } else {
+                    ""
+                };
                 self.status_message = format!(
-                    "Exported {:.2} s to {}",
+                    "Exported {:.2} s{mastered} to {}",
                     frames as f64 / 48_000.0,
                     destination.display()
                 );
             }
-            Err(error) => self.status_message = error.to_string(),
+            Err(error) => self.status_message = format!("{error:#}"),
+        }
+    }
+
+    /// Chooses the record the exported mix is matched to.
+    ///
+    /// The reference has to be at the session rate for the same reason every
+    /// other file does: the engine does not resample, and a reference
+    /// converted on the way in would be measured through whatever the
+    /// converter did to it.
+    fn choose_master_reference(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Choose a reference track to master against")
+            .add_filter("WAV audio", &["wav"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        let rate = self
+            .runtime
+            .as_ref()
+            .map_or(48_000, |runtime| runtime.sample_rate().get());
+        match daw_master::load_reference(&path, rate) {
+            Ok(_) => {
+                let name = path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                self.master_reference = Some(path);
+                self.dirty = true;
+                self.status_message = format!("Mastering against {name}");
+            }
+            Err(error) => self.status_message = format!("{error:#}"),
         }
     }
 
@@ -1685,6 +1734,7 @@ impl RustDawApp {
         self.meter_numerator = 4;
         self.meter_denominator = 4;
         self.click_enabled = true;
+        self.master_reference = None;
         self.playback_synced = true;
         self.session_needs_save_as = true;
         self.dirty = true;
@@ -3371,6 +3421,41 @@ impl eframe::App for RustDawApp {
                     }
                     if ui.button("EXPORT MIX").clicked() {
                         self.export_mix();
+                    }
+                    // The mastering reference sits next to EXPORT MIX because
+                    // that is the only thing it affects: it is a property of
+                    // the bounce, not of the mix.
+                    let reference_name = self.master_reference.as_ref().map(|path| {
+                        path.file_stem().map_or_else(
+                            || path.display().to_string(),
+                            |stem| stem.to_string_lossy().into_owned(),
+                        )
+                    });
+                    let (label, hint) = match &reference_name {
+                        Some(name) => (
+                            format!("MASTER: {name}"),
+                            "The exported mix is matched to this record's loudness, tone and \
+                             stereo width.\nClick to choose another; right-click to export dry."
+                                .to_owned(),
+                        ),
+                        None => (
+                            "MASTER…".to_owned(),
+                            "Match the exported mix to a reference record — a track you want \
+                             yours to sound like.\nThe reference must be a WAV at the session \
+                             sample rate."
+                                .to_owned(),
+                        ),
+                    };
+                    let master_button = ui
+                        .selectable_label(reference_name.is_some(), label)
+                        .on_hover_text(hint);
+                    if master_button.clicked() {
+                        self.choose_master_reference();
+                    }
+                    if master_button.secondary_clicked() && self.master_reference.is_some() {
+                        self.master_reference = None;
+                        self.dirty = true;
+                        self.status_message = "Mastering off — exports the mix as mixed".to_owned();
                     }
                     if ui.button("AUDIO SETTINGS").clicked() {
                         self.audio_settings_open = true;

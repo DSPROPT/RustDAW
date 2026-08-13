@@ -9,15 +9,15 @@
 [![CI](https://github.com/DSPROPT/RustDAW/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DSPROPT/RustDAW/actions/workflows/ci.yml)
 [![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-[![Download](https://img.shields.io/badge/download-.deb%20v0.7.0-4ac470.svg)](#install-on-ubuntu)
+[![Download](https://img.shields.io/badge/download-.deb%20v0.8.0-4ac470.svg)](#install-on-ubuntu)
 
 </div>
 
 Multitrack recording through a Focusrite Scarlett Solo, non-destructive editing,
 a console mixer, a channel strip with EQ / compressor / gate / delay / reverb,
 Neural Amp Modeler guitar amps, a General MIDI synthesiser written from scratch,
-a piano roll, an instrument tuner, and native tempo, beat and chord detection
-that holds its own against commercial tools.
+a piano roll, an instrument tuner, reference mastering, and native tempo, beat
+and chord detection that holds its own against commercial tools.
 
 ![RustDAW — the timeline with a separated song loaded, and the channel strip open on a guitar track running a Neural Amp Modeler capture](docs/images/channel-strip.png)
 
@@ -27,7 +27,7 @@ track: a NAM capture of a Peavey 5150 through a Marshall cabinet, 3-band EQ,
 compressor, noise gate, delay and reverb — and the source WAV still dry.</sub>
 </div>
 
-**24,257 lines of Rust across 12 workspace packages, 329 tests, 17 released `.deb`
+**27,566 lines of Rust across 13 workspace packages, 379 tests, 18 released `.deb`
 packages — built by one person in about 50 hours, directing
 [Claude Code](https://claude.com/claude-code).**
 
@@ -45,6 +45,7 @@ and [The timeline](#the-timeline). Everything above it is the manual.
 - [MIDI, the piano roll, and tempo](#midi-the-piano-roll-and-tempo)
 - [Instruments and chords](#instruments-and-chords)
 - [Tuner](#tuner)
+- [Reference mastering](#reference-mastering)
 - [Song import](#song-import)
 - [Building the package yourself](#building-the-package-yourself)
 - [Architecture](#architecture)
@@ -59,8 +60,8 @@ and [The timeline](#the-timeline). Everything above it is the manual.
 No Rust toolchain needed. Download the package and install it:
 
 ```bash
-wget https://github.com/DSPROPT/RustDAW/raw/main/dist/rustdaw_0.7.0_amd64.deb
-sudo apt install ./rustdaw_0.7.0_amd64.deb
+wget https://github.com/DSPROPT/RustDAW/raw/main/dist/rustdaw_0.8.0_amd64.deb
+sudo apt install ./rustdaw_0.8.0_amd64.deb
 ```
 
 Then launch **RustDAW** from the applications menu, or run `rustdaw` from a
@@ -415,6 +416,67 @@ Readings are smoothed before they are drawn — a new note snaps, the same note 
 followed — because pitch on a plucked string is noisy for the first moments while
 the harmonics settle.
 
+## Reference mastering
+
+**MASTER…** in the bottom bar, next to **EXPORT MIX**, matches your bounce to a
+record you want yours to sound like. Pick a WAV at the session rate and the
+export is measured against it and brought to meet it — loudness, tone, stereo
+width and peaks. Right-click the button to go back to exporting the mix dry.
+The choice is saved with the session.
+
+It is not a mastering engineer. What it does is the part of the job that is
+measurement rather than judgement:
+
+1. **Levels.** The loudest parts of both songs — the choruses, not the intros —
+   are found and matched, so the tonal comparison that follows is between two
+   songs at the same level.
+2. **Tone.** The average spectrum of each is taken and divided, giving the EQ
+   curve that turns one into the other. That curve is resampled onto a
+   logarithmic frequency grid before it is smoothed, because ears hear
+   frequency logarithmically and smoothing on the FFT's linear grid would leave
+   the bass untouched and scrub the treble flat. Smoothed with LOWESS, so the
+   filter follows the broad tonal difference and ignores the spikes — following
+   the raw ratio builds a comb filter that rings.
+3. **Levels again**, four times, because equalising moves them.
+4. **Peaks**, through a brickwall limiter whose gain envelope is the maximum of
+   a hard-clip curve, a zero-phase attack curve that starts reducing *before*
+   the peak arrives, and a hold/release curve that rides a run of peaks instead
+   of pumping between them.
+
+Mid and side are carried separately the whole way, each with its own EQ curve.
+That is what matches stereo width: a wider reference produces a side curve that
+lifts the side channel, and the mix widens without anything being told to widen.
+
+```bash
+cargo run --release -p daw-master --example master-to-reference -- \
+    mix.wav reference.wav mastered.wav
+```
+
+The algorithm is [Matchering](https://github.com/sergree/matchering) by Sergree,
+GPL-3.0, © 2016-2022 — **ported to Rust**, not called out to. RustDAW is
+GPL-3.0-or-later, so the licence permits the port outright. Verified against
+upstream on the same pair of files at 48 kHz:
+
+| | Upstream Matchering | RustDAW |
+|---|---|---|
+| Peak | −0.45 dBFS | −0.45 dBFS |
+| RMS | −14.74 dBFS | −14.74 dBFS |
+| Tonal distance to the reference | 1.08 dB | **1.08 dB** |
+| Mean spectral difference from upstream | — | **0.01 dB** |
+| Waveform correlation with upstream | — | **1.0000** |
+
+The unmastered mix sits 4.20 dB from the reference's tone; both bring it to
+1.08 dB. Eight seconds of audio masters in 0.08 s.
+
+Two deliberate differences from upstream. It runs at the **session's sample
+rate** rather than resampling to 44.1 kHz, because the engine refuses to
+resample media and would rather master at 48 kHz than convert twice around a
+fixed-rate stage — every constant is specified in milliseconds or hertz, so
+they carry over unchanged. And there is **no Python**: the FFT, the cubic
+spline, the LOWESS smoother and the limiter are all in
+[`crates/daw-master`](crates/daw-master), so mastering works on a machine with
+nothing installed.
+
 ## Song import
 
 **IMPORT SONG** in the bottom bar turns a song into instrument tracks you can play
@@ -488,12 +550,12 @@ Build the optimized `.deb` from a source checkout with:
 ./packaging/build-deb.sh
 ```
 
-The package is written to `dist/rustdaw_0.7.0_amd64.deb` and installs the `rustdaw`
+The package is written to `dist/rustdaw_0.8.0_amd64.deb` and installs the `rustdaw`
 executable, desktop launcher, and application icon. Installation is explicit and
 remains under the user's control:
 
 ```bash
-sudo apt install ./dist/rustdaw_0.7.0_amd64.deb
+sudo apt install ./dist/rustdaw_0.8.0_amd64.deb
 ```
 
 The native window embeds the RustDAW icon and the desktop launcher declares
@@ -515,7 +577,8 @@ and the plug-in format.
 | [`crates/daw-engine`](crates/daw-engine) | 6,001 | Transport, metronome, channel strip (EQ / compressor / gate), tone stack, delay, reverb, the General MIDI synth bank, SoundFont playback |
 | [`apps/rustdaw`](apps/rustdaw) | 5,826 | The egui desktop application: timeline, mixer, piano roll, tuner, theme |
 | [`crates/daw-audio-linux`](crates/daw-audio-linux) | 3,784 | The real-time runtime — PipeWire/Pulse via cpal, lock-free command and metering channels, disk writers, time stretching |
-| [`crates/daw-analysis`](crates/daw-analysis) | 2,602 | In-house FFT, spectral-flux onsets, beat tracking, chromagram, Viterbi chord decoding, YIN pitch detection |
+| [`crates/daw-analysis`](crates/daw-analysis) | 3,011 | In-house FFT, spectral-flux onsets, beat tracking, chromagram, Viterbi chord decoding, YIN pitch detection |
+| [`crates/daw-master`](crates/daw-master) | 2,135 | Reference mastering: level matching, the log-grid matching EQ, LOWESS, cubic splines, the brickwall limiter |
 | [`crates/daw-songimport`](crates/daw-songimport) | 1,918 | Worker supervision, manifest parsing, stem/MIDI ingest (+655 lines of Python worker) |
 | [`crates/daw-midi`](crates/daw-midi) | 1,377 | Standard MIDI file reading, clips in ticks, tempo maps |
 | [`crates/daw-tone3000`](crates/daw-tone3000) | 1,002 | OAuth PKCE, the loopback redirect server, capture download |
@@ -525,7 +588,7 @@ and the plug-in format.
 | [`crates/daw-core`](crates/daw-core) | 195 | Shared types |
 | [`apps/hardware-probe`](apps/hardware-probe) | 83 | Read-only device enumeration |
 
-**329 test functions.** The product principles the whole thing was built against
+**379 test functions.** The product principles the whole thing was built against
 are in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md): never lose or corrupt a
 recording; the audio callback must be deterministic — no allocation, locks, file
 access, logging, or blocking system calls; editing is non-destructive and
@@ -579,13 +642,17 @@ The tool was [Claude Code](https://claude.com/claude-code). The method was not
    can't resolve a cent at 82 Hz, a global tempo decided before beat fitting
    because otherwise you record the tracker's own error as tempo change,
    band-limited mip-mapped wavetables because a bass note has to keep its
-   harmonics. That domain reasoning is written into the source as comments, and
-   it is why the benchmark tables above read the way they do.
+   harmonics. Reference mastering could have shelled out to Python — instead
+   the algorithm was ported, which meant writing a cubic spline and a LOWESS
+   smoother from the papers. That domain reasoning is written into the source
+   as comments, and it is why the benchmark tables above read the way they
+   do.
 
 5. **Measure against the competition.** Tempo detection is scored against DSPRO
    Studio and librosa on real songs. Chord detection is scored against
-   independently transcribed MIDI. Not "it works" — numbers, on a table, some of
-   which RustDAW loses.
+   independently transcribed MIDI. The mastering port is diffed against the
+   Python original sample by sample. Not "it works" — numbers, on a table, some
+   of which RustDAW loses.
 
 ### What the human did
 
@@ -601,7 +668,7 @@ compiled into a desktop binary. Judged every build by ear.
 Wrote the FFT. Wrote the Viterbi decoder. Wrote the 128-program synthesis bank.
 Wrote the C++ bridge to NeuralAmpModelerCore. Wrote the OAuth PKCE flow, the
 loopback redirect server, the lock-free command queues, the session migrations,
-the 329 tests. Held 24,000 lines of Rust in view at once and kept the real-time
+the not-a-knot spline and the LOWESS smoother, the 379 tests. Held 27,000 lines of Rust in view at once and kept the real-time
 callback allocation-free while doing it.
 
 Neither half of that produces a DAW alone.
@@ -662,15 +729,19 @@ timestamps, and the git history.
 | 23:46 | `apps/rustdaw/tuner.rs` — the needle dial. |
 | **23:47** | **`rustdaw_0.7.0_amd64.deb`.** The seventeenth release. |
 
-### Day 4 — Thursday, 13 August, 00:04
+### Day 4 — Thursday, 13 August: the tuner, then going public
 
-**Commit:** "Add tuner functionality and pitch detection module."
-
-Fifty hours and thirty minutes after the first line of the plan.
+| Time | What happened |
+|---|---|
+| **00:04** | **Commit:** "Add tuner functionality and pitch detection module." Fifty hours and thirty minutes after the first line of the plan. |
+| 10:30 | Preparing to open the repository: the GPL-3.0 text the manifest had always declared, `.env.example`, a CI workflow, and a pass that cleared fourteen lint findings so the first build a stranger saw would be green. |
+| 11:00 | **Public**, at [github.com/DSPROPT/RustDAW](https://github.com/DSPROPT/RustDAW). |
+| 12:03 | [Reference mastering](#reference-mastering) — Matchering's algorithm ported to Rust: a cubic spline, a LOWESS smoother, the log-grid matching EQ and a brickwall limiter, none of which existed in the codebase that morning. Checked against the Python original on the same files: identical to 0.01 dB. |
+| **12:33** | **`rustdaw_0.8.0_amd64.deb`.** The eighteenth release. |
 
 ### The release history
 
-Seventeen packages, all of them in [`dist/`](dist/), all of them installable.
+Eighteen packages, all of them in [`dist/`](dist/), all of them installable.
 
 | Version | Built | Version | Built |
 |---|---|---|---|
@@ -682,7 +753,7 @@ Seventeen packages, all of them in [`dist/`](dist/), all of them installable.
 | 0.3.1 | Aug 10, 23:42 | 0.6.0 | Aug 11, 09:49 |
 | 0.3.2 | Aug 10, 23:55 | 0.6.1 | Aug 11, 18:06 |
 | 0.4.0 | Aug 11, 00:03 | 0.7.0 | Aug 12, 23:47 |
-| 0.4.1 | Aug 11, 00:10 | | |
+| 0.4.1 | Aug 11, 00:10 | 0.8.0 | Aug 13, 12:33 |
 
 ---
 
@@ -700,14 +771,17 @@ Historically that is a team, and years.
 
 Here is what came out of three days instead:
 
-- **10 crates and 2 applications, 24,257 lines of Rust**, `unsafe` forbidden at
-  the workspace level, `clippy::pedantic` clean, 329 tests.
+- **11 crates and 2 applications, 27,566 lines of Rust**, `unsafe` forbidden at
+  the workspace level, `clippy::pedantic` clean, 379 tests.
 - **A real-time engine** with lock-free command queues, disk-writer threads,
   crash recovery, and a soak test.
 - **DSP written from first principles** — its own FFT, its own onset detector, its
   own beat tracker, its own chromagram, its own Viterbi chord decoder, its own YIN
   pitch detector, its own 128-program General MIDI synthesis bank, its own reverb,
-  delay, EQ, compressor, gate and tone stack.
+  delay, EQ, compressor, gate and tone stack, its own cubic spline and LOWESS
+  smoother.
+- **Reference mastering matching a published tool to 0.01 dB**, ported rather
+  than called, so it needs nothing installed.
 - **Tempo detection that beats librosa and a commercial product** on every song
   measured, by a factor of two or more.
 - **Chord detection ahead of a commercial product on average**, published with the
@@ -718,7 +792,7 @@ Here is what came out of three days instead:
   judgement to keep the secret key out of the binary.
 - **A cross-platform ML pipeline** — Demucs and basic-pitch, local-only, nothing
   uploaded, CUDA and Apple Silicon and CPU.
-- **Seventeen installable packages** and a macOS bundle script.
+- **Eighteen installable packages** and a macOS bundle script.
 
 The interesting part is not the volume. It is that none of the hard decisions were
 outsourced. The tone stack is separate from the channel EQ for a reason someone
@@ -754,3 +828,8 @@ Third-party components keep their own terms:
 - **SoundFonts are not bundled either.** RustDAW uses whichever `.sf2` your
   system has installed, and falls back to its own synthesised bank when there
   is none.
+- **Reference mastering** is a Rust port of
+  [Matchering](https://github.com/sergree/matchering) by Sergree, GPL-3.0,
+  © 2016-2022. The port is covered by the same licence; see
+  [`crates/daw-master`](crates/daw-master) for the algorithm and its
+  attribution in each module.
