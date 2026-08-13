@@ -165,6 +165,10 @@ struct AudioPreferences {
     output_device: String,
     buffer_frames: u32,
     input_labels: [String; 4],
+    /// How large the chord chart is drawn, as a multiple of its base size.
+    /// A display preference rather than session data: it belongs to the person
+    /// and the screen, not to the song.
+    chord_lane_scale: f32,
 }
 
 impl Default for AudioPreferences {
@@ -174,6 +178,7 @@ impl Default for AudioPreferences {
             output_device: "Scarlett Solo".to_owned(),
             buffer_frames: 256,
             input_labels: std::array::from_fn(|index| format!("Input {}", index + 1)),
+            chord_lane_scale: 1.0,
         }
     }
 }
@@ -241,6 +246,9 @@ pub struct RustDawApp {
     detected_key: Option<String>,
     /// Whether the chord lane is shown above the tracks.
     chords_open: bool,
+    /// A chord-lane size the wheel has changed but that is not on disk yet.
+    /// Written once the wheel stops rather than on every notch.
+    chord_scale_unsaved: bool,
     selected_clip: Option<(usize, usize)>,
     dragged_clip: Option<(usize, usize, u64, Vec2)>,
     dirty: bool,
@@ -330,6 +338,7 @@ impl RustDawApp {
             chords: document.chords.clone(),
             detected_key: document.key.clone(),
             chords_open: true,
+            chord_scale_unsaved: false,
             selected_clip: None,
             dragged_clip: None,
             dirty: false,
@@ -1715,14 +1724,56 @@ impl RustDawApp {
     /// printed where it changes and dotted where it is held — the way a chart
     /// is written, and the way the eye reads one, which is by looking for the
     /// changes.
+    /// The smallest and largest the chord chart can be drawn, as a multiple of
+    /// its base size. The bottom is where the text stops being legible; the top
+    /// is where the lane starts eating the timeline.
+    const CHORD_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.7..=3.0;
+
+    /// The chord chart, drawn as a lane of marks under the ruler.
+    ///
+    /// One cell per beat, on the same grid and the same scroll offset as the
+    /// tracks below, so a chord sits over the audio it belongs to. A chord is
+    /// printed where it changes and dotted where it is held — the way a chart
+    /// is written, and the way the eye reads one, which is by looking for the
+    /// changes.
+    ///
+    /// Scrolling over the lane resizes it. Reading a chart is something people
+    /// do at a glance from a distance, sometimes with a guitar in their hands,
+    /// so how big it wants to be is a matter of the room and the eyes rather
+    /// than anything this can pick correctly on their behalf.
     fn chord_lane(&mut self, ui: &mut egui::Ui, left: f32, width: f32) {
-        const LANE_HEIGHT: f32 = 26.0;
         if !self.chords_open || self.chords.is_empty() {
             return;
         }
 
+        let scale = self.audio_preferences.chord_lane_scale.clamp(
+            *Self::CHORD_SCALE_RANGE.start(),
+            *Self::CHORD_SCALE_RANGE.end(),
+        );
+        let text_size = 12.0 * scale;
+        let lane_height = (text_size + 14.0).max(22.0);
+
         let (lane, response) =
-            ui.allocate_exact_size(Vec2::new(width, LANE_HEIGHT), Sense::click());
+            ui.allocate_exact_size(Vec2::new(width, lane_height), Sense::click_and_drag());
+
+        // Resize by scrolling over the lane. Multiplying rather than adding
+        // keeps each notch the same proportional step at every size.
+        if response.hovered() {
+            let wheel = ui.input(|input| input.smooth_scroll_delta.y);
+            if wheel.abs() > 0.1 {
+                let adjusted = (scale * (1.0 + wheel * 0.0015)).clamp(
+                    *Self::CHORD_SCALE_RANGE.start(),
+                    *Self::CHORD_SCALE_RANGE.end(),
+                );
+                if (adjusted - scale).abs() > f32::EPSILON {
+                    self.audio_preferences.chord_lane_scale = adjusted;
+                    // Written once the wheel stops, not on every notch.
+                    self.chord_scale_unsaved = true;
+                    self.status_message = format!("Chord chart at {:.0}%", adjusted * 100.0);
+                }
+            }
+        }
+
         let painter = ui.painter_at(lane);
         painter.rect_filled(lane, 0.0, theme::PANEL);
 
@@ -1736,9 +1787,10 @@ impl RustDawApp {
         );
 
         // Below this, beats are closer together than their labels are wide and
-        // the lane becomes unreadable; only the changes are drawn.
+        // the lane becomes unreadable; only the changes are drawn. The bigger
+        // the text, the sooner that happens.
         let beat_width = self.pixels_per_second * 60.0 / f32::from(self.tempo.max(1));
-        let crowded = beat_width < 26.0;
+        let crowded = beat_width < text_size * 2.2;
 
         for beat in &chart {
             if beat.seconds < visible_start - 1.0 || beat.seconds > visible_end {
@@ -1746,7 +1798,7 @@ impl RustDawApp {
             }
             #[allow(clippy::cast_possible_truncation)]
             let x = left + beat.seconds as f32 * self.pixels_per_second - self.timeline_scroll_x;
-            if x < left - 40.0 || x > lane.right() {
+            if x < left - 40.0 * scale || x > lane.right() {
                 continue;
             }
 
@@ -1764,25 +1816,25 @@ impl RustDawApp {
                     // it lands on.
                     painter.line_segment(
                         [
-                            Pos2::new(x, lane.bottom() - 4.0),
+                            Pos2::new(x, lane.bottom() - 4.0 * scale),
                             Pos2::new(x, lane.bottom()),
                         ],
-                        Stroke::new(1.5_f32, theme::BLUE),
+                        Stroke::new(1.5_f32 * scale, theme::BLUE),
                     );
                     let faded = beat.confidence < 0.4;
                     painter.text(
-                        Pos2::new(x + 3.0, lane.center().y),
+                        Pos2::new(x + 3.0 * scale, lane.center().y),
                         Align2::LEFT_CENTER,
                         label,
-                        FontId::proportional(12.0),
+                        FontId::proportional(text_size),
                         if faded { theme::MUTED } else { theme::TEXT },
                     );
                 }
                 None if !crowded => {
                     // Held: a dot, meaning "still the last one".
                     painter.circle_filled(
-                        Pos2::new(x + 6.0, lane.center().y + 1.0),
-                        1.2,
+                        Pos2::new(x + 6.0 * scale, lane.center().y + 1.0),
+                        1.2 * scale,
                         theme::MUTED,
                     );
                 }
@@ -1791,7 +1843,7 @@ impl RustDawApp {
         }
 
         let mut hint = "The detected chord chart. A chord is shown where it changes; a dot means \
-                        it is still playing."
+                        it is still playing.\n\nScroll here to resize it."
             .to_owned();
         if let Some(key) = &self.detected_key {
             hint = format!("Key: {key}.\n{hint}");
@@ -3451,6 +3503,17 @@ impl RustDawApp {
 impl eframe::App for RustDawApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         context.request_repaint_after(Duration::from_millis(33));
+
+        // The chord-lane size is written once the wheel comes to rest, so a
+        // long adjustment is one file write rather than one per notch.
+        if self.chord_scale_unsaved
+            && context.input(|input| input.smooth_scroll_delta.y.abs() < 0.1)
+        {
+            self.chord_scale_unsaved = false;
+            if let Err(error) = save_audio_preferences(&self.audio_preferences) {
+                self.status_message = format!("Chord chart size was not saved: {error}");
+            }
+        }
         let dropped_audio = context.input(|input| {
             input
                 .raw
@@ -4742,6 +4805,32 @@ fn moved_start_frame(origin: u64, frame_delta: i64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_settings_file_written_before_the_chord_lane_still_loads() {
+        // `#[serde(default)]` on the struct is what makes this true; without
+        // it an older config would fail to parse and the user would silently
+        // lose their device choices.
+        let older = r#"{"input_device":"Scarlett Solo","output_device":"Scarlett Solo",
+                        "buffer_frames":256,"input_labels":["a","b","c","d"]}"#;
+        let preferences: AudioPreferences = serde_json::from_str(older).expect("older config");
+        assert_eq!(preferences.buffer_frames, 256);
+        assert!(
+            (preferences.chord_lane_scale - 1.0).abs() < f32::EPSILON,
+            "a missing size falls back to the base size"
+        );
+    }
+
+    #[test]
+    fn the_chord_lane_size_round_trips() {
+        let preferences = AudioPreferences {
+            chord_lane_scale: 1.8,
+            ..AudioPreferences::default()
+        };
+        let text = serde_json::to_string(&preferences).expect("serialises");
+        let back: AudioPreferences = serde_json::from_str(&text).expect("parses");
+        assert!((back.chord_lane_scale - 1.8).abs() < f32::EPSILON);
+    }
+
     use super::*;
 
     #[test]
