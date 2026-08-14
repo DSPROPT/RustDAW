@@ -1679,6 +1679,37 @@ impl RustDawApp {
                         requested = Some(ImportSource::Url(self.song_import.url.trim().to_owned()));
                     }
                 });
+                ui.horizontal(|ui| {
+                    ui.label("File");
+                    if ui
+                        .button("CHOOSE FILE & IMPORT")
+                        .on_hover_text(
+                            "Separates a song you already have. Any format ffmpeg reads works.",
+                        )
+                        .clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .set_title("Choose a song to separate")
+                            .add_filter(
+                                "Audio",
+                                &[
+                                    "mp3", "wav", "wave", "flac", "m4a", "aac", "ogg", "opus",
+                                    "wma", "aiff", "aif", "mp4", "webm", "mkv",
+                                ],
+                            )
+                            // The pipeline decodes with ffmpeg, which reads far
+                            // more than the list above; this is the way out for
+                            // anything it can read that is not named here.
+                            .add_filter("Any file (*.*)", &["*"])
+                            .pick_file()
+                    {
+                        requested = Some(ImportSource::LocalFile(path));
+                    }
+                    ui.label(
+                        RichText::new("…or separate a song from this disk")
+                            .small()
+                            .color(theme::MUTED),
+                    );
+                });
                 ui.label(
                     RichText::new(
                         "A new song takes a few minutes: download, separation, then MIDI.",

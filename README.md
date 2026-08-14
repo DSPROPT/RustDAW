@@ -9,7 +9,7 @@
 [![CI](https://github.com/DSPROPT/RustDAW/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DSPROPT/RustDAW/actions/workflows/ci.yml)
 [![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-[![Download](https://img.shields.io/badge/download-.deb%20v0.10.3-4ac470.svg)](#install-on-ubuntu)
+[![Download](https://img.shields.io/badge/download-.deb%20v0.10.4-4ac470.svg)](#install-on-ubuntu)
 
 </div>
 
@@ -60,8 +60,8 @@ and [The timeline](#the-timeline). Everything above it is the manual.
 No Rust toolchain needed. Download the package and install it:
 
 ```bash
-wget https://github.com/DSPROPT/RustDAW/raw/main/dist/rustdaw_0.10.3_amd64.deb
-sudo apt install ./rustdaw_0.10.3_amd64.deb
+wget https://github.com/DSPROPT/RustDAW/raw/main/dist/rustdaw_0.10.4_amd64.deb
+sudo apt install ./rustdaw_0.10.4_amd64.deb
 ```
 
 Then launch **RustDAW** from the applications menu, or run `rustdaw` from a
@@ -617,12 +617,15 @@ nothing installed.
 ## Song import
 
 **IMPORT SONG** in the bottom bar turns a song into instrument tracks you can play
-along with. Paste a link and the song is downloaded and separated on this machine
-(a CUDA GPU or Apple Silicon where available, otherwise the CPU) into drums, bass,
-guitar, piano, other and vocals; each stem becomes a stereo track, and the session
-tempo and meter come from the detected beat grid. Songs that have already been
-processed are listed in the same window and import in about a second, because only
-format conversion is left to do.
+along with. Paste a link, or press **CHOOSE FILE & IMPORT** to pick a song already
+on this disk — MP3, WAV, FLAC, M4A, or anything else ffmpeg decodes. Either way the
+song is separated on this machine (a CUDA GPU or Apple Silicon where available,
+otherwise the CPU) into drums, bass, guitar, piano, other and vocals; each stem
+becomes a stereo track, and the session tempo and meter come from the detected beat
+grid. A local file takes the same path as a link with the download step replaced by
+a copy, so tempo, chords and transcription all work the same. Songs that have
+already been processed are listed in the same window and import in about a second,
+because only format conversion is left to do.
 
 When transcription is available, it is imported too: each pitched MIDI track
 becomes an instrument track you can edit in the piano roll and hear against the
@@ -687,12 +690,12 @@ Build the optimized `.deb` from a source checkout with:
 ./packaging/build-deb.sh
 ```
 
-The package is written to `dist/rustdaw_0.10.3_amd64.deb` and installs the `rustdaw`
+The package is written to `dist/rustdaw_0.10.4_amd64.deb` and installs the `rustdaw`
 executable, desktop launcher, and application icon. Installation is explicit and
 remains under the user's control:
 
 ```bash
-sudo apt install ./dist/rustdaw_0.10.3_amd64.deb
+sudo apt install ./dist/rustdaw_0.10.4_amd64.deb
 ```
 
 The native window embeds the RustDAW icon and the desktop launcher declares

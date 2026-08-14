@@ -1,8 +1,9 @@
 //! Importing a song into `RustDAW` as separated instrument tracks.
 //!
-//! A `YouTube` link (or an already-processed project) becomes a session with one
-//! stereo track per instrument, at the session's sample rate, with the tempo
-//! and meter the pipeline detected. You can then arm a track and play along.
+//! A `YouTube` link, an audio file on this machine, or an already-processed
+//! project becomes a session with one stereo track per instrument, at the
+//! session's sample rate, with the tempo and meter the pipeline detected. You
+//! can then arm a track and play along.
 //!
 //! The separation itself is not done here and cannot be: it is Demucs on the
 //! GPU, driven by the DSPRO Studio worker that is already installed on this
@@ -33,6 +34,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub enum ImportSource {
     /// Run the full pipeline on a link.
     Url(String),
+    /// Run the full pipeline on an audio file already on this machine. Same
+    /// pipeline as [`Self::Url`] with the download replaced by a copy, so any
+    /// format ffmpeg decodes works.
+    LocalFile(PathBuf),
     /// Reuse a project the pipeline has already finished.
     ExistingProject(String),
 }
@@ -102,7 +107,20 @@ pub fn run_import(
 
     let project_id = match source {
         ImportSource::ExistingProject(id) => id.clone(),
-        ImportSource::Url(url) => run_pipeline(&client, url, cancel, &mut on_progress)?,
+        ImportSource::Url(url) => {
+            let job = client.submit_url(url)?;
+            run_pipeline(&client, &job.id, cancel, &mut on_progress)?
+        }
+        ImportSource::LocalFile(path) => {
+            if !path.is_file() {
+                bail!("{} is not a file", path.display());
+            }
+            on_progress(ImportProgress::Status(
+                "Sending the file to the song pipeline…".to_owned(),
+            ));
+            let job = client.submit_file(path)?;
+            run_pipeline(&client, &job.id, cancel, &mut on_progress)?
+        }
     };
 
     let project_dir = supervisor::project_dir(&project_id)?;
@@ -161,14 +179,13 @@ fn ensure_worker(
     supervisor::start_worker(WORKER_START_TIMEOUT, || client.is_healthy())
 }
 
+/// Waits for an already-submitted pipeline job and returns its project id.
 fn run_pipeline(
     client: &WorkerClient,
-    url: &str,
+    job_id: &str,
     cancel: &CancelFlag,
     on_progress: &mut impl FnMut(ImportProgress),
 ) -> Result<String> {
-    let job = client.submit_url(url)?;
-    let job_id = job.id.clone();
     loop {
         if cancel.is_cancelled() {
             bail!(
@@ -176,7 +193,7 @@ fn run_pipeline(
                  existing projects when it finishes"
             );
         }
-        let job = client.job(&job_id)?;
+        let job = client.job(job_id)?;
         on_progress(ImportProgress::Pipeline {
             stage: job.stage.clone(),
             percent: job.percent,

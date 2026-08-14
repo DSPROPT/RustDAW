@@ -5,7 +5,13 @@
 # downloads the source; librosa detects the tempo. These install cleanly on
 # macOS (Apple Silicon) and Ubuntu on Python 3.10-3.12.
 demucs>=4.0
-yt-dlp>=2024.1
+# yt-dlp needs the EJS solver scripts (the [default] extra) and a JavaScript
+# runtime to run them in, or YouTube's player challenges go unsolved and every
+# download 403s. The deno wheel puts that runtime in the venv's own bin
+# directory, where yt-dlp looks first — no system install and no PATH setup,
+# which matters because the worker is launched by RustDAW, not from a shell.
+yt-dlp[default]>=2026.7
+deno>=2.6.6
 librosa>=0.10
 pretty_midi>=0.2.10
 soundfile>=0.12

@@ -7,6 +7,7 @@
 //! land in the same place would be pure waste.
 
 use anyhow::{Context, Result, bail};
+use std::path::Path;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -17,6 +18,10 @@ use crate::supervisor;
 /// Generous enough for a cold worker that is importing torch, short enough
 /// that a wedged service surfaces as an error instead of a frozen import.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// An upload is one request carrying a whole song, so it gets its own, longer
+/// budget than the job-control calls [`REQUEST_TIMEOUT`] covers.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Health {
@@ -93,6 +98,25 @@ impl ProjectSummary {
             None => title.to_owned(),
         }
     }
+}
+
+/// One `multipart/form-data` part named `file`, which is what the worker's
+/// upload endpoint reads. Written by hand because this is the only multipart
+/// request `RustDAW` makes, and it is not worth a dependency.
+fn multipart_file_body(boundary: &str, name: &str, bytes: &[u8]) -> Vec<u8> {
+    // A quote or a newline in a filename would close the header early and split
+    // the request into something the worker reads as a different upload.
+    let name = name.replace(['"', '\r', '\n'], "_");
+    let header = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\n"
+    );
+    let trailer = format!("\r\n--{boundary}--\r\n");
+    let mut body = Vec::with_capacity(header.len() + bytes.len() + trailer.len());
+    body.extend_from_slice(header.as_bytes());
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(trailer.as_bytes());
+    body
 }
 
 pub struct WorkerClient {
@@ -184,6 +208,50 @@ impl WorkerClient {
             .context("unexpected response from /api/jobs")
     }
 
+    /// Starts a pipeline run for an audio file on this machine.
+    ///
+    /// The worker copies the bytes into its own uploads folder before the job
+    /// starts, so the original is read exactly once: moving, renaming or
+    /// deleting it afterwards cannot disturb a run in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or the worker rejects it.
+    pub fn submit_file(&self, path: &Path) -> Result<Job> {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("could not read {}", path.display()))?;
+        if bytes.is_empty() {
+            bail!("{} is empty", path.display());
+        }
+        // The worker takes the extension from the name, and ffmpeg picks the
+        // decoder from it, so a name is always sent even for an unnamed path.
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("upload.bin");
+        // A boundary must not occur anywhere in the payload. Random beats any
+        // fixed string here because the payload is arbitrary audio bytes.
+        let boundary = format!("----RustDAW{}", uuid::Uuid::new_v4().simple());
+        let body = multipart_file_body(&boundary, name, &bytes);
+
+        let agent: Agent = Agent::config_builder()
+            .timeout_global(Some(UPLOAD_TIMEOUT))
+            .build()
+            .into();
+        let mut response = agent
+            .post(self.url("/api/jobs/upload"))
+            .header(
+                "Content-Type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )
+            .send(&body[..])
+            .context("failed to upload the file to the import worker")?;
+        response
+            .body_mut()
+            .read_json::<Job>()
+            .context("unexpected response from /api/jobs/upload")
+    }
+
     /// Polls a job.
     ///
     /// # Errors
@@ -245,6 +313,29 @@ mod tests {
         let projects: Vec<ProjectSummary> = serde_json::from_slice(json).unwrap();
         assert_eq!(projects[0].label(), "Armed & Dangerous — King Von");
         assert!(projects[0].has_stems);
+    }
+
+    #[test]
+    fn multipart_body_frames_the_bytes_untouched() {
+        // 0x0d 0x0a is a boundary in text and ordinary data in audio; the part
+        // has to survive it byte for byte.
+        let audio = [0xff_u8, 0xfb, 0x00, 0x0d, 0x0a, 0x2d, 0x2d];
+        let body = multipart_file_body("BOUND", "song.mp3", &audio);
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.starts_with("--BOUND\r\nContent-Disposition: form-data; name=\"file\";"));
+        assert!(text.contains("filename=\"song.mp3\""));
+        assert!(body.ends_with(b"\r\n--BOUND--\r\n"));
+        let start = body.len() - audio.len() - b"\r\n--BOUND--\r\n".len();
+        assert_eq!(&body[start..start + audio.len()], &audio);
+    }
+
+    #[test]
+    fn a_filename_cannot_break_out_of_its_header() {
+        let body = multipart_file_body("BOUND", "ev\"il\r\nX: y.mp3", b"a");
+        let header = String::from_utf8_lossy(&body[..body.len() - 1]);
+        assert!(header.contains("filename=\"ev_il__X: y.mp3\""));
+        // One header block only: the part's blank line is the sole \r\n\r\n.
+        assert_eq!(header.matches("\r\n\r\n").count(), 1);
     }
 
     #[test]

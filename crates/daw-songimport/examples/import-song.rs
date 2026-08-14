@@ -6,10 +6,12 @@
 //! cargo run -p daw-songimport --example import-song              # list ready projects
 //! cargo run -p daw-songimport --example import-song -- <id>      # import one
 //! cargo run -p daw-songimport --example import-song -- <url>     # run the pipeline first
+//! cargo run -p daw-songimport --example import-song -- <file>    # …on a local audio file
 //! ```
 
 use anyhow::Result;
 use daw_songimport::{CancelFlag, ImportProgress, ImportSource, IngestOptions};
+use std::path::PathBuf;
 
 fn main() -> Result<()> {
     let argument = std::env::args().nth(1);
@@ -17,8 +19,11 @@ fn main() -> Result<()> {
         return list();
     };
 
+    let path = PathBuf::from(&argument);
     let source = if argument.starts_with("http://") || argument.starts_with("https://") {
         ImportSource::Url(argument)
+    } else if path.is_file() {
+        ImportSource::LocalFile(path)
     } else {
         ImportSource::ExistingProject(argument)
     };

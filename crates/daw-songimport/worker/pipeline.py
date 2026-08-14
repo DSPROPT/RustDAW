@@ -70,6 +70,20 @@ STEM_PROGRAMS = {
 
 ProgressFn = Callable[[str, float, str], None]
 
+# YouTube only serves media to a player client whose session has cleared its bot
+# check, and the clients yt-dlp picks by default no longer clear it: extraction
+# succeeds and the media URL then answers 403. Each entry is a ``player_client``
+# extractor argument, tried in order until one yields a file. ``web_embedded`` is
+# the client that currently works without an account; the empty entry falls back
+# to yt-dlp's own defaults for when that stops being true, and the last one is a
+# wider net. On non-YouTube sites the argument is ignored, so the first attempt
+# is the only one that runs.
+#
+# Clearing the check means solving the client's JS challenges, which needs a
+# JavaScript runtime and the EJS solver scripts — the ``deno`` and
+# ``yt-dlp[default]`` requirements. Without them every client 403s.
+PLAYER_CLIENTS = ("web_embedded", "", "tv,web_safari,mweb")
+
 
 def _noop(stage: str, percent: float, message: str) -> None:  # pragma: no cover
     pass
@@ -114,11 +128,29 @@ def download(url: str, into: Path, on_progress: ProgressFn) -> tuple[Path, dict]
         "no_warnings": True,
         "progress_hooks": [hook],
     }
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
-    files = list(into.glob("source.*"))
-    if not files:
-        raise RuntimeError("yt-dlp produced no audio file")
+    failures = []
+    for attempt, clients in enumerate(PLAYER_CLIENTS):
+        # A failed attempt can leave a partial source.*.part behind, which would
+        # otherwise be picked up as the download of the next attempt.
+        for leftover in into.glob("source.*"):
+            leftover.unlink()
+        if attempt:
+            on_progress("download", 0.0, "retrying with another player client")
+        attempt_options = dict(options)
+        if clients:
+            attempt_options["extractor_args"] = {"youtube": {"player_client": clients.split(",")}}
+        try:
+            with yt_dlp.YoutubeDL(attempt_options) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except Exception as error:  # noqa: BLE001 — every attempt's reason is reported together
+            failures.append(f"[{clients or 'default'}] {error}")
+            continue
+        files = list(into.glob("source.*"))
+        if files:
+            break
+        failures.append(f"[{clients or 'default'}] no audio file was produced")
+    else:
+        raise RuntimeError("yt-dlp failed:\n" + "\n".join(failures))
     metadata = {
         "title": info.get("track") or info.get("title"),
         "artist": info.get("artist") or info.get("uploader"),
