@@ -390,6 +390,8 @@ pub struct RustDawApp {
     dragged_clip: Option<(usize, usize, u64, Vec2)>,
     dirty: bool,
     confirm_new_session: bool,
+    /// The last export's outcome, until the person exporting dismisses it.
+    export_report: Option<ExportReport>,
     status_message: String,
     pixels_per_second: f32,
     /// When set, the timeline scrolls to keep the playhead in view during
@@ -485,6 +487,7 @@ impl RustDawApp {
             dragged_clip: None,
             dirty: false,
             confirm_new_session: false,
+            export_report: None,
             status_message: "Ready".to_owned(),
             pixels_per_second: 84.0,
             follow_playhead: true,
@@ -2337,28 +2340,72 @@ impl RustDawApp {
             RuntimeTransportState::Recording | RuntimeTransportState::CountIn
         ) {
             self.status_message = "Stop recording before exporting".to_owned();
+            self.export_report = Some(ExportReport::failed(
+                "Still recording",
+                "Stop the transport, then export.".to_owned(),
+            ));
             return;
         }
-        let destination = daw_core::media_dir("Exports").join("Current Mix.wav");
-        if self.master_reference.is_some() {
-            // Mastering analyses the whole mix twice over and convolves it, so
-            // on a long song this is seconds rather than instant.
-            self.status_message = "Exporting and mastering…".to_owned();
+        if self.tracks.iter().all(|track| track.clips.is_empty()) {
+            self.status_message = "Nothing to export yet".to_owned();
+            self.export_report = Some(ExportReport::failed(
+                "Nothing to export",
+                "This session has no audio clips yet.".to_owned(),
+            ));
+            return;
         }
+
+        // The export used to go straight to Exports/Current Mix.wav under the
+        // media root, which is the working directory — for an app started from
+        // the desktop that is the home folder, so the mix landed somewhere the
+        // person exporting it never saw. Now they say where it goes.
+        let directory = daw_core::media_dir("Exports");
+        let _ = std::fs::create_dir_all(&directory);
+        let suggested = format!("{}.wav", sanitize_file_name(&self.session_name));
+        let Some(chosen) = rfd::FileDialog::new()
+            .set_title("Export the mix as")
+            .add_filter("WAV audio", &["wav"])
+            .set_directory(&directory)
+            .set_file_name(&suggested)
+            .save_file()
+        else {
+            self.status_message = "Export cancelled".to_owned();
+            return;
+        };
+        let destination = ensure_extension(chosen, "wav");
+
+        let mastered = if self.master_reference.is_some() {
+            " (mastered)"
+        } else {
+            ""
+        };
         match daw_render::export_stereo(&self.project_document(), &destination) {
             Ok(frames) => {
-                let mastered = if self.master_reference.is_some() {
-                    " (mastered)"
-                } else {
-                    ""
-                };
+                let rate = self
+                    .runtime
+                    .as_ref()
+                    .map_or(48_000, |runtime| runtime.sample_rate().get());
+                let seconds = frames as f64 / f64::from(rate);
                 self.status_message = format!(
-                    "Exported {:.2} s{mastered} to {}",
-                    frames as f64 / 48_000.0,
+                    "Exported {seconds:.2} s{mastered} to {}",
                     destination.display()
                 );
+                self.export_report = Some(ExportReport::exported(
+                    format!(
+                        "{}, {seconds:.1} s{mastered}.",
+                        destination
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("The mix")
+                    ),
+                    destination,
+                ));
             }
-            Err(error) => self.status_message = format!("{error:#}"),
+            Err(error) => {
+                self.status_message = format!("{error:#}");
+                self.export_report =
+                    Some(ExportReport::failed("Export failed", format!("{error:#}")));
+            }
         }
     }
 
@@ -4709,6 +4756,42 @@ impl eframe::App for RustDawApp {
             });
         }
 
+        if let Some(report) = &self.export_report {
+            let mut dismissed = false;
+            let mut reveal = None;
+            egui::Window::new(&report.heading)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .collapsible(false)
+                .resizable(false)
+                .show(context, |ui| {
+                    ui.label(&report.detail);
+                    if let Some(path) = &report.path {
+                        ui.label(
+                            RichText::new(path.display().to_string())
+                                .small()
+                                .color(theme::MUTED),
+                        );
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() {
+                            dismissed = true;
+                        }
+                        if let Some(directory) = report.path.as_deref().and_then(|p| p.parent())
+                            && ui.button("Show in folder").clicked()
+                        {
+                            reveal = Some(directory.to_owned());
+                            dismissed = true;
+                        }
+                    });
+                });
+            if let Some(directory) = reveal {
+                reveal_in_file_manager(&directory);
+            }
+            if dismissed {
+                self.export_report = None;
+            }
+        }
         if self.confirm_new_session {
             egui::Window::new("Start a new session?")
                 .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
@@ -5402,6 +5485,49 @@ fn draw_midi_clip(
 /// Reads a WAV's layout and length, if it is one this session can play as it
 /// stands: the engine does not resample, so anything else has to be converted
 /// by [`convert_import_audio`] first.
+/// What the last export did, shown in a dialog until it is dismissed.
+///
+/// The status bar alone was not enough: it is one line at the bottom of a wide
+/// window, and an export that took a second to render looked like a button that
+/// did nothing at all.
+struct ExportReport {
+    heading: String,
+    detail: String,
+    /// The written file, when there is one to reveal.
+    path: Option<PathBuf>,
+}
+
+impl ExportReport {
+    fn exported(detail: String, path: PathBuf) -> Self {
+        Self {
+            heading: "Mix exported".to_owned(),
+            detail,
+            path: Some(path),
+        }
+    }
+
+    fn failed(heading: &str, detail: String) -> Self {
+        Self {
+            heading: heading.to_owned(),
+            detail,
+            path: None,
+        }
+    }
+}
+
+/// Opens a folder in the desktop's file manager.
+///
+/// Failure is ignored for the same reason [`open_in_browser`] ignores it: a
+/// machine with no handler makes this a button that does nothing, which is a
+/// disappointment rather than an error worth interrupting the session for.
+fn reveal_in_file_manager(directory: &std::path::Path) {
+    let _ = Command::new("xdg-open")
+        .arg(directory)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 fn inspect_import_audio(
     path: &std::path::Path,
     expected_rate: u32,

@@ -561,6 +561,12 @@ the harmonics settle.
 
 ## Reference mastering
 
+**EXPORT MIX** in the bottom bar renders the session to a stereo 24-bit WAV. It
+asks where to save it, starting in `Exports/` with the session's name, and says
+what it wrote when it is done — with a **Show in folder** button. A long session
+with mastering on takes a second or two to render, during which the window does
+not repaint.
+
 **MASTER…** in the bottom bar, next to **EXPORT MIX**, matches your bounce to a
 record you want yours to sound like. Pick a WAV at the session rate and the
 export is measured against it and brought to meet it — loudness, tone, stereo
