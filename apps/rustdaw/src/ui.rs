@@ -1259,7 +1259,13 @@ impl RustDawApp {
 
     fn choose_audio_to_import(&mut self) {
         if let Some(paths) = rfd::FileDialog::new()
-            .add_filter("WAV Audio", &["wav", "wave"])
+            .add_filter(
+                "Audio",
+                &[
+                    "wav", "wave", "mp3", "flac", "m4a", "aac", "ogg", "opus", "aiff", "aif",
+                    "wma",
+                ],
+            )
             .pick_files()
         {
             self.import_audio_files(paths);
@@ -1273,13 +1279,21 @@ impl RustDawApp {
             .as_ref()
             .map_or(48_000, |runtime| runtime.sample_rate().get());
         let mut imported = 0_usize;
+        let mut converted = 0_usize;
         let mut errors = Vec::new();
         for path in paths {
             if !path.is_file() {
                 continue;
             }
-            match inspect_import_audio(&path, expected_rate) {
-                Ok((layout, frames)) => {
+            // A session-rate mono/stereo WAV plays as it lies and is left where
+            // the user keeps it. Everything else — an MP3, a 44.1 kHz WAV, a
+            // FLAC — is converted into the session's own Imports folder.
+            let prepared = match inspect_import_audio(&path, expected_rate) {
+                Ok((layout, frames)) => Ok((path.clone(), layout, frames)),
+                Err(_) => convert_import_audio(&path, expected_rate).inspect(|_| converted += 1),
+            };
+            match prepared {
+                Ok((path, layout, frames)) => {
                     let name = path
                         .file_stem()
                         .and_then(|name| name.to_str())
@@ -1310,11 +1324,15 @@ impl RustDawApp {
             self.selected_track = self.tracks.len().saturating_sub(1);
             self.dirty = true;
         }
+        let note = match converted {
+            0 => String::new(),
+            count => format!(" ({count} converted to {expected_rate} Hz)"),
+        };
         self.status_message = if errors.is_empty() {
-            format!("Imported {imported} audio file(s) at the playhead")
+            format!("Imported {imported} audio file(s) at the playhead{note}")
         } else {
             format!(
-                "Imported {imported}; {} failed: {}",
+                "Imported {imported}{note}; {} failed: {}",
                 errors.len(),
                 errors.join(" · ")
             )
@@ -4789,7 +4807,10 @@ impl eframe::App for RustDawApp {
                         .inner_margin(24.0)
                         .show(ui, |ui| {
                             ui.heading(RichText::new("DROP AUDIO TO IMPORT").color(Color32::WHITE));
-                            ui.label("Each mono/stereo WAV becomes a new track at the playhead.");
+                            ui.label(
+                                "Each file becomes a new track at the playhead — MP3, WAV, FLAC \
+                                 and anything else ffmpeg reads.",
+                            );
                         });
                 });
         }
@@ -5378,6 +5399,9 @@ fn draw_midi_clip(
     rect
 }
 
+/// Reads a WAV's layout and length, if it is one this session can play as it
+/// stands: the engine does not resample, so anything else has to be converted
+/// by [`convert_import_audio`] first.
 fn inspect_import_audio(
     path: &std::path::Path,
     expected_rate: u32,
@@ -5405,6 +5429,134 @@ fn inspect_import_audio(
         ),
     };
     Ok((layout, u64::from(reader.duration())))
+}
+
+/// Where converted imports are kept, beside `Recordings` and `Songs`.
+///
+/// They have to outlive the import: a clip refers to its file by path, so a
+/// session saved today reopens next week by reading the same converted WAV.
+fn import_dir() -> PathBuf {
+    daw_core::media_dir("Imports")
+}
+
+/// A name in `directory` that is not taken yet, so importing the same song
+/// twice does not overwrite the copy the first clip is still playing.
+fn unique_import_path(directory: &std::path::Path, stem: &str) -> PathBuf {
+    let candidate = directory.join(format!("{stem}.wav"));
+    if !candidate.exists() {
+        return candidate;
+    }
+    for index in 2..1000 {
+        let candidate = directory.join(format!("{stem}-{index}.wav"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    directory.join(format!("{stem}-{}.wav", Uuid::new_v4().simple()))
+}
+
+/// Converts any audio file ffmpeg can read into a session-rate WAV under
+/// [`import_dir`], and returns it with its layout and length.
+///
+/// Stereo is the output for everything except a mono source, which stays mono:
+/// an MP3 dropped on the timeline should arrive as the stereo track it is,
+/// while a mono take should not be doubled into two identical channels. Sources
+/// with more channels than two are downmixed by ffmpeg rather than refused.
+fn convert_import_audio(
+    source: &std::path::Path,
+    expected_rate: u32,
+) -> anyhow::Result<(PathBuf, ChannelLayout, u64)> {
+    convert_import_audio_into(&import_dir(), source, expected_rate)
+}
+
+/// [`convert_import_audio`] with the destination folder named, so a test can
+/// convert into a temporary directory instead of the session's own.
+fn convert_import_audio_into(
+    directory: &std::path::Path,
+    source: &std::path::Path,
+    expected_rate: u32,
+) -> anyhow::Result<(PathBuf, ChannelLayout, u64)> {
+    std::fs::create_dir_all(directory)
+        .map_err(|error| anyhow::anyhow!("could not create {}: {error}", directory.display()))?;
+    let stem = source
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Imported Audio");
+    let destination = unique_import_path(directory, stem);
+
+    // Only a WAV can be inspected without decoding, and only its channel count
+    // is needed here; everything else becomes stereo.
+    let layout = match hound::WavReader::open(source).map(|reader| reader.spec().channels) {
+        Ok(1) => ChannelLayout::Mono,
+        _ => ChannelLayout::Stereo,
+    };
+    let output = Command::new(ffmpeg_program())
+        .arg("-nostdin")
+        .arg("-y")
+        .args(["-v", "error"])
+        .arg("-i")
+        .arg(source)
+        .arg("-vn")
+        .args(["-ar", &expected_rate.to_string()])
+        .args([
+            "-ac",
+            if layout == ChannelLayout::Mono { "1" } else { "2" },
+        ])
+        .args(["-c:a", "pcm_s24le"])
+        .arg(&destination)
+        .output()
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "could not run ffmpeg to convert {}: {error}; install it with `{}`",
+                source.display(),
+                ffmpeg_install_hint()
+            )
+        })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let reason = detail.lines().last().unwrap_or("ffmpeg failed");
+        let _ = std::fs::remove_file(&destination);
+        anyhow::bail!(
+            "{}: {reason}",
+            source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("audio")
+        );
+    }
+    let (layout, frames) = inspect_import_audio(&destination, expected_rate)?;
+    Ok((destination, layout, frames))
+}
+
+/// The platform's usual way to install ffmpeg, for the error hint.
+fn ffmpeg_install_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "brew install ffmpeg"
+    } else {
+        "sudo apt install ffmpeg"
+    }
+}
+
+/// Resolves the ffmpeg binary to run.
+///
+/// A GUI app launched from the desktop inherits a minimal `PATH` that excludes
+/// Homebrew, so a bare `ffmpeg` is not found even when it is installed.
+/// `FFMPEG` overrides; otherwise the common install locations are checked
+/// before falling back to the name on `PATH`.
+fn ffmpeg_program() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("FFMPEG").filter(|value| !value.is_empty()) {
+        return PathBuf::from(explicit);
+    }
+    for candidate in [
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+    ] {
+        if std::path::Path::new(candidate).is_file() {
+            return PathBuf::from(candidate);
+        }
+    }
+    PathBuf::from("ffmpeg")
 }
 
 fn ensure_extension(mut path: PathBuf, extension: &str) -> PathBuf {
@@ -5850,6 +6002,70 @@ mod tests {
 
         std::fs::remove_file(mono).unwrap();
         std::fs::remove_file(stereo_wrong_rate).unwrap();
+    }
+
+    /// The conversion tests drive the real ffmpeg, the same one an import
+    /// uses. Where it is absent the import itself cannot work either, so they
+    /// pass rather than fail on a machine that is missing it.
+    fn ffmpeg_missing() -> bool {
+        Command::new(ffmpeg_program()).arg("-version").output().is_err()
+    }
+
+    #[test]
+    fn a_file_at_the_wrong_rate_is_converted_to_the_session_rate() {
+        if ffmpeg_missing() {
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("rustdaw-convert-{}", std::process::id()));
+        let source = std::env::temp_dir().join(format!("rustdaw-convert-{}.wav", std::process::id()));
+        write_test_wav(&source, 2, 44_100);
+
+        let (converted, layout, frames) =
+            convert_import_audio_into(&directory, &source, 48_000).unwrap();
+        assert_eq!(layout, ChannelLayout::Stereo);
+        // 64 frames of 44.1 kHz is 1.45 ms, which is ~70 frames at 48 kHz.
+        assert!((60..=80).contains(&frames), "{frames} frames");
+        // Playable as it stands now: that is what the engine will demand.
+        assert_eq!(
+            inspect_import_audio(&converted, 48_000).unwrap(),
+            (ChannelLayout::Stereo, frames)
+        );
+
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_mono_source_is_not_widened_into_two_identical_channels() {
+        if ffmpeg_missing() {
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("rustdaw-convert-mono-{}", std::process::id()));
+        let source =
+            std::env::temp_dir().join(format!("rustdaw-convert-mono-{}.wav", std::process::id()));
+        write_test_wav(&source, 1, 44_100);
+
+        let (_, layout, _) = convert_import_audio_into(&directory, &source, 48_000).unwrap();
+        assert_eq!(layout, ChannelLayout::Mono);
+
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn importing_the_same_name_twice_does_not_overwrite_the_first_copy() {
+        let directory = std::env::temp_dir().join(format!("rustdaw-unique-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let first = unique_import_path(&directory, "Song");
+        assert_eq!(first, directory.join("Song.wav"));
+        std::fs::write(&first, b"taken").unwrap();
+        let second = unique_import_path(&directory, "Song");
+        assert_eq!(second, directory.join("Song-2.wav"));
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

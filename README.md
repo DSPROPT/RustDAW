@@ -9,7 +9,7 @@
 [![CI](https://github.com/DSPROPT/RustDAW/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DSPROPT/RustDAW/actions/workflows/ci.yml)
 [![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-[![Download](https://img.shields.io/badge/download-.deb%20v0.10.4-4ac470.svg)](#install-on-ubuntu)
+[![Download](https://img.shields.io/badge/download-.deb%20v0.10.5-4ac470.svg)](#install-on-ubuntu)
 
 </div>
 
@@ -60,8 +60,8 @@ and [The timeline](#the-timeline). Everything above it is the manual.
 No Rust toolchain needed. Download the package and install it:
 
 ```bash
-wget https://github.com/DSPROPT/RustDAW/raw/main/dist/rustdaw_0.10.4_amd64.deb
-sudo apt install ./rustdaw_0.10.4_amd64.deb
+wget https://github.com/DSPROPT/RustDAW/raw/main/dist/rustdaw_0.10.5_amd64.deb
+sudo apt install ./rustdaw_0.10.5_amd64.deb
 ```
 
 Then launch **RustDAW** from the applications menu, or run `rustdaw` from a
@@ -138,11 +138,17 @@ change the buffer size, test outputs 1–2, and identify the Scarlett's backend
 capture channels with live meters. Device choices and custom channel labels are
 saved in `~/.config/rustdaw/audio.json`.
 
-Drag one or more 48 kHz mono/stereo WAV files onto the edit window, or use
-**IMPORT AUDIO** to choose them in Ubuntu's file explorer. Each imported file
-creates a track at the current playhead. **SAVE AS** writes a named `.rustdaw`
-session, while **OPEN SESSION** switches projects with unsaved-change protection.
-Shortcuts: `Ctrl+O` opens a session and `Ctrl+Shift+S` saves as.
+Drag one or more audio files onto the edit window, or use **IMPORT AUDIO** to
+choose them in Ubuntu's file explorer. Each imported file creates a track at the
+current playhead. MP3, FLAC, M4A and anything else ffmpeg decodes are accepted
+alongside WAV: a file that is already a mono/stereo WAV at the session rate is
+played where it lies, and everything else is converted once into a session-rate
+24-bit WAV under `Imports/` beside `Recordings/`, which is what the clip then
+refers to. The original is never modified. Conversions come out stereo unless the
+source is mono, so an MP3 arrives as the stereo track it is. Without ffmpeg
+installed, only session-rate WAV files import. **SAVE AS** writes a named
+`.rustdaw` session, while **OPEN SESSION** switches projects with unsaved-change
+protection. Shortcuts: `Ctrl+O` opens a session and `Ctrl+Shift+S` saves as.
 
 Track **M** and **S** buttons update mute/solo audibility immediately during
 playback without reloading imported stems. Multiple tracks may be soloed, mute
@@ -690,12 +696,12 @@ Build the optimized `.deb` from a source checkout with:
 ./packaging/build-deb.sh
 ```
 
-The package is written to `dist/rustdaw_0.10.4_amd64.deb` and installs the `rustdaw`
+The package is written to `dist/rustdaw_0.10.5_amd64.deb` and installs the `rustdaw`
 executable, desktop launcher, and application icon. Installation is explicit and
 remains under the user's control:
 
 ```bash
-sudo apt install ./dist/rustdaw_0.10.4_amd64.deb
+sudo apt install ./dist/rustdaw_0.10.5_amd64.deb
 ```
 
 The native window embeds the RustDAW icon and the desktop launcher declares
