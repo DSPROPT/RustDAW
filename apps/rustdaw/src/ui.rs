@@ -44,8 +44,66 @@ struct Clip {
     path: PathBuf,
     start_frame: u64,
     end_frame: u64,
+    /// Where in the source file this clip begins reading. Editing only moves
+    /// this window; the file itself is never rewritten.
+    source_start_frame: u64,
     color: Color32,
     waveform: Vec<f32>,
+}
+
+impl Clip {
+    /// How many frames the clip occupies on the timeline.
+    fn length(&self) -> u64 {
+        self.end_frame.saturating_sub(self.start_frame)
+    }
+}
+
+/// What a drag on a clip will do, decided by where the pointer is on it.
+///
+/// Pro Tools calls this the Smart Tool: one pointer that becomes the tool the
+/// place under it implies, instead of a palette to go and choose from. Near
+/// either edge it trims that edge; anywhere else it moves the clip. The two
+/// things people do most, without a mode to be in.
+#[derive(Clone, Copy, PartialEq)]
+enum ClipZone {
+    TrimStart,
+    Body,
+    TrimEnd,
+}
+
+/// How wide the trim zones are, in pixels.
+const TRIM_ZONE_WIDTH: f32 = 9.0;
+
+impl ClipZone {
+    /// Which zone a pointer is in. Narrow clips give up their trim zones
+    /// rather than leave no way to grab the middle.
+    fn at(clip_rect: Rect, pointer_x: f32) -> Self {
+        let edge = TRIM_ZONE_WIDTH.min(clip_rect.width() / 3.0);
+        if pointer_x <= clip_rect.left() + edge {
+            Self::TrimStart
+        } else if pointer_x >= clip_rect.right() - edge {
+            Self::TrimEnd
+        } else {
+            Self::Body
+        }
+    }
+
+    fn cursor(self) -> egui::CursorIcon {
+        match self {
+            Self::Body => egui::CursorIcon::Grab,
+            _ => egui::CursorIcon::ResizeHorizontal,
+        }
+    }
+}
+
+/// A trim in progress: which edge is moving, and the clip as it was before, so
+/// the whole drag becomes one undo entry rather than one per frame.
+#[derive(Clone)]
+struct TrimDrag {
+    track: usize,
+    clip: usize,
+    edge: ClipZone,
+    before: Clip,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -76,12 +134,33 @@ struct ClipLocation {
     start_frame: u64,
 }
 
-#[derive(Clone, Copy)]
+/// A clip and the track it belongs to, kept whole so an edit can be undone by
+/// putting it back exactly as it was.
+#[derive(Clone)]
+struct ClipSnapshot {
+    track_id: Uuid,
+    clip: Clip,
+}
+
+#[derive(Clone)]
 enum EditCommand {
     MoveClip {
         clip_id: Uuid,
         before: ClipLocation,
         after: ClipLocation,
+    },
+    /// Any edit that changes which clips exist, described as what it took away
+    /// and what it put in place.
+    ///
+    /// Split, trim, paste, duplicate and delete are all this shape — a split
+    /// removes one clip and adds two, a trim removes one and adds one, a paste
+    /// removes nothing. Undo puts `removed` back and takes `added` away; redo
+    /// does the reverse. One mechanism instead of five, and no edit can be
+    /// half-undone because the two lists are applied together.
+    ReplaceClips {
+        removed: Vec<ClipSnapshot>,
+        added: Vec<ClipSnapshot>,
+        label: &'static str,
     },
 }
 
@@ -249,6 +328,10 @@ pub struct RustDawApp {
     /// A chord-lane size the wheel has changed but that is not on disk yet.
     /// Written once the wheel stops rather than on every notch.
     chord_scale_unsaved: bool,
+    /// The copied clip, kept whole so pasting reproduces its trimmed window.
+    clipboard: Option<Clip>,
+    /// An edge being dragged, if one is.
+    trimming: Option<TrimDrag>,
     selected_clip: Option<(usize, usize)>,
     dragged_clip: Option<(usize, usize, u64, Vec2)>,
     dirty: bool,
@@ -339,6 +422,8 @@ impl RustDawApp {
             detected_key: document.key.clone(),
             chords_open: true,
             chord_scale_unsaved: false,
+            clipboard: None,
+            trimming: None,
             selected_clip: None,
             dragged_clip: None,
             dirty: false,
@@ -773,6 +858,7 @@ impl RustDawApp {
                 path,
                 start_frame,
                 end_frame,
+                source_start_frame: 0,
                 color: theme::BLUE_DARK,
                 waveform,
             });
@@ -808,9 +894,11 @@ impl RustDawApp {
                 channel_strip_params(track.effects),
             )?;
             for clip in &track.clips {
-                runtime.add_identified_track_playback_file(
+                runtime.add_clip_playback_file(
                     &clip.path,
                     clip.start_frame,
+                    clip.source_start_frame,
+                    clip.length(),
                     gain,
                     channel_strip_params(track.effects),
                     track.pan,
@@ -901,21 +989,59 @@ impl RustDawApp {
         self.sync_moved_clip(target_track, target_clip)
     }
 
+    /// Applies a structural edit: takes `remove` away and puts `insert` back.
+    ///
+    /// Both halves happen together, so an edit is never left half-applied even
+    /// if one of its clips has since gone.
+    fn apply_replacement(&mut self, remove: &[ClipSnapshot], insert: &[ClipSnapshot]) {
+        for snapshot in remove {
+            for track in &mut self.tracks {
+                track.clips.retain(|clip| clip.id != snapshot.clip.id);
+            }
+        }
+        for snapshot in insert {
+            if let Some(track) = self
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == snapshot.track_id)
+            {
+                track.clips.push(snapshot.clip.clone());
+            }
+        }
+        self.selected_clip = None;
+        self.dirty = true;
+        self.playback_synced = false;
+        if let Err(error) = self.sync_playback() {
+            self.status_message = format!("Edit applied; playback preload failed: {error}");
+        }
+    }
+
     fn undo(&mut self) {
         let Some(command) = self.undo_stack.pop() else {
             self.status_message = "Nothing to undo".to_owned();
             return;
         };
-        let EditCommand::MoveClip {
-            clip_id, before, ..
-        } = command;
-        match self.apply_clip_location(clip_id, before) {
-            Ok(()) => {
-                self.redo_stack.push(command);
+        match &command {
+            EditCommand::MoveClip {
+                clip_id, before, ..
+            } => match self.apply_clip_location(*clip_id, *before) {
+                Ok(()) => {
+                    self.status_message = "Undid clip move".to_owned();
+                    self.redo_stack.push(command);
+                    self.save_session();
+                }
+                Err(error) => self.status_message = format!("Could not undo: {error}"),
+            },
+            EditCommand::ReplaceClips {
+                removed,
+                added,
+                label,
+            } => {
+                self.apply_replacement(added, removed);
+                self.status_message = format!("Undid {label}");
                 self.save_session();
-                self.status_message = "Undid clip move".to_owned();
+                self.redo_stack.push(command);
             }
-            Err(error) => self.status_message = format!("Could not undo: {error}"),
         }
     }
 
@@ -924,14 +1050,27 @@ impl RustDawApp {
             self.status_message = "Nothing to redo".to_owned();
             return;
         };
-        let EditCommand::MoveClip { clip_id, after, .. } = command;
-        match self.apply_clip_location(clip_id, after) {
-            Ok(()) => {
-                self.undo_stack.push(command);
-                self.save_session();
-                self.status_message = "Redid clip move".to_owned();
+        match &command {
+            EditCommand::MoveClip { clip_id, after, .. } => {
+                match self.apply_clip_location(*clip_id, *after) {
+                    Ok(()) => {
+                        self.status_message = "Redid clip move".to_owned();
+                        self.undo_stack.push(command);
+                        self.save_session();
+                    }
+                    Err(error) => self.status_message = format!("Could not redo: {error}"),
+                }
             }
-            Err(error) => self.status_message = format!("Could not redo: {error}"),
+            EditCommand::ReplaceClips {
+                removed,
+                added,
+                label,
+            } => {
+                self.apply_replacement(removed, added);
+                self.status_message = format!("Redid {label}");
+                self.save_session();
+                self.undo_stack.push(command);
+            }
         }
     }
 
@@ -1098,6 +1237,7 @@ impl RustDawApp {
                         path,
                         start_frame,
                         end_frame: start_frame.saturating_add(frames),
+                        source_start_frame: 0,
                         color: theme::BLUE_DARK,
                     });
                     self.tracks.push(track);
@@ -1950,22 +2090,334 @@ impl RustDawApp {
         self.status_message = "New session — press Ctrl+S to save".to_owned();
     }
 
+    /// The playhead, snapped to the nearest beat unless Alt is held.
+    ///
+    /// Snapping is the default because most sessions here start life as an
+    /// imported song, where everything already sits on the grid and an edit a
+    /// few milliseconds off the beat is never what was meant. Alt gives the
+    /// sample-accurate position back for material that was not played to a
+    /// click.
+    fn edit_frame(&self, context: &egui::Context) -> u64 {
+        let frame = self.snapshot().position_frames;
+        if context.input(|input| input.modifiers.alt) {
+            return frame;
+        }
+        self.snap_to_beat(frame)
+    }
+
+    /// The nearest beat to a timeline frame.
+    fn snap_to_beat(&self, frame: u64) -> u64 {
+        let rate = self
+            .runtime
+            .as_ref()
+            .map_or(48_000, |runtime| runtime.sample_rate().get());
+        if rate == 0 {
+            return frame;
+        }
+        let seconds = frame as f64 / f64::from(rate);
+        let tick = self.tempo_map.seconds_to_tick(seconds);
+        let per_beat = u64::from(daw_midi::TICKS_PER_QUARTER);
+        let nearest = ((tick + per_beat / 2) / per_beat) * per_beat;
+        let snapped = self.tempo_map.tick_to_seconds(nearest) * f64::from(rate);
+        if snapped < 0.0 {
+            0
+        } else {
+            snapped.round() as u64
+        }
+    }
+
+    /// Splits every clip under the playhead, on the selected track or on all
+    /// tracks when nothing is selected.
+    fn split_at_playhead(&mut self, context: &egui::Context) {
+        let frame = self.edit_frame(context);
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+
+        for track in &mut self.tracks {
+            let track_id = track.id;
+            let mut produced = Vec::new();
+            for clip in &mut track.clips {
+                if frame <= clip.start_frame || frame >= clip.end_frame {
+                    continue;
+                }
+                removed.push(ClipSnapshot {
+                    track_id,
+                    clip: clip.clone(),
+                });
+                // Both halves read one decoded source through the cache, so a
+                // split costs no memory and no reload.
+                let consumed = frame - clip.start_frame;
+                let mut right = clip.clone();
+                right.id = Uuid::new_v4();
+                right.start_frame = frame;
+                right.source_start_frame = clip.source_start_frame.saturating_add(consumed);
+                clip.end_frame = frame;
+                produced.push(right);
+            }
+            for clip in produced {
+                added.push(ClipSnapshot {
+                    track_id,
+                    clip: clip.clone(),
+                });
+                track.clips.push(clip);
+            }
+        }
+
+        if removed.is_empty() {
+            self.status_message = "Nothing under the playhead to split".to_owned();
+            return;
+        }
+
+        // The left halves changed too, so they are recorded as replacements of
+        // themselves.
+        for snapshot in &removed {
+            if let Some(clip) = self
+                .tracks
+                .iter()
+                .flat_map(|track| &track.clips)
+                .find(|clip| clip.id == snapshot.clip.id)
+            {
+                added.push(ClipSnapshot {
+                    track_id: snapshot.track_id,
+                    clip: clip.clone(),
+                });
+            }
+        }
+
+        let count = removed.len();
+        self.remember_edit(EditCommand::ReplaceClips {
+            removed,
+            added,
+            label: "split",
+        });
+        self.selected_clip = None;
+        self.dirty = true;
+        self.playback_synced = false;
+        if let Err(error) = self.sync_playback() {
+            self.status_message = format!("Split; playback preload failed: {error}");
+        } else {
+            self.status_message = format!("Split {count} clip(s) at the playhead");
+        }
+        self.save_session();
+    }
+
+    /// Moves the edge being dragged to `frame`, live.
+    ///
+    /// Applied straight to the clip so the waveform follows the pointer; the
+    /// undo entry is not written until the drag ends, so a whole trim is one
+    /// step rather than one per frame.
+    fn apply_trim(&mut self, frame: u64) {
+        let Some(drag) = self.trimming.clone() else {
+            return;
+        };
+        let Some(clip) = self
+            .tracks
+            .get_mut(drag.track)
+            .and_then(|track| track.clips.get_mut(drag.clip))
+        else {
+            return;
+        };
+
+        match drag.edge {
+            ClipZone::TrimStart => {
+                if frame >= clip.end_frame {
+                    return;
+                }
+                if frame < clip.start_frame {
+                    // Pulling the edge back out again, but only as far as the
+                    // source still has audio behind it.
+                    let wanted = clip.start_frame - frame;
+                    if wanted > clip.source_start_frame {
+                        return;
+                    }
+                    clip.source_start_frame -= wanted;
+                } else {
+                    // The window walks forward with the edge, so the take does
+                    // not slide under the pointer.
+                    clip.source_start_frame += frame - clip.start_frame;
+                }
+                clip.start_frame = frame;
+            }
+            ClipZone::TrimEnd => {
+                if frame <= clip.start_frame {
+                    return;
+                }
+                clip.end_frame = frame;
+            }
+            ClipZone::Body => {}
+        }
+        self.dirty = true;
+    }
+
+    /// Ends a trim: records one undo entry for the whole drag and reloads the
+    /// engine with the new window.
+    fn commit_trim(&mut self) {
+        let Some(drag) = self.trimming.take() else {
+            return;
+        };
+        let Some(after) = self
+            .tracks
+            .get(drag.track)
+            .and_then(|track| track.clips.get(drag.clip))
+            .cloned()
+        else {
+            return;
+        };
+        if after.start_frame == drag.before.start_frame && after.end_frame == drag.before.end_frame
+        {
+            return;
+        }
+        let Some(track_id) = self.tracks.get(drag.track).map(|track| track.id) else {
+            return;
+        };
+
+        self.remember_edit(EditCommand::ReplaceClips {
+            removed: vec![ClipSnapshot {
+                track_id,
+                clip: drag.before,
+            }],
+            added: vec![ClipSnapshot {
+                track_id,
+                clip: after,
+            }],
+            label: "trim",
+        });
+        self.playback_synced = false;
+        if let Err(error) = self.sync_playback() {
+            self.status_message = format!("Trimmed; playback preload failed: {error}");
+        } else {
+            self.status_message = "Trimmed clip (audio file preserved)".to_owned();
+        }
+        self.save_session();
+    }
+
+    /// Copies the selected clip to the clipboard.
+    fn copy_selected_clip(&mut self) {
+        let Some((track_index, clip_index)) = self.selected_clip else {
+            self.status_message = "Select a clip to copy".to_owned();
+            return;
+        };
+        let Some(clip) = self
+            .tracks
+            .get(track_index)
+            .and_then(|track| track.clips.get(clip_index))
+        else {
+            return;
+        };
+        self.clipboard = Some(clip.clone());
+        self.status_message = format!("Copied {}", clip.name);
+    }
+
+    /// Pastes the clipboard onto the selected track at the playhead.
+    fn paste_clip(&mut self, context: &egui::Context) {
+        let Some(source) = self.clipboard.clone() else {
+            self.status_message = "Nothing to paste".to_owned();
+            return;
+        };
+        let frame = self.edit_frame(context);
+        let Some(track) = self.tracks.get_mut(self.selected_track) else {
+            return;
+        };
+
+        // A pasted clip keeps its source window, so pasting a trimmed region
+        // gives back exactly that region.
+        let mut clip = source;
+        clip.id = Uuid::new_v4();
+        let length = clip.length();
+        clip.start_frame = frame;
+        clip.end_frame = frame.saturating_add(length);
+
+        let snapshot = ClipSnapshot {
+            track_id: track.id,
+            clip: clip.clone(),
+        };
+        let name = clip.name.clone();
+        track.clips.push(clip);
+
+        self.remember_edit(EditCommand::ReplaceClips {
+            removed: Vec::new(),
+            added: vec![snapshot],
+            label: "paste",
+        });
+        self.dirty = true;
+        self.playback_synced = false;
+        if let Err(error) = self.sync_playback() {
+            self.status_message = format!("Pasted; playback preload failed: {error}");
+        } else {
+            self.status_message = format!("Pasted {name}");
+        }
+        self.save_session();
+    }
+
+    /// Duplicates the selected clip immediately after itself.
+    fn duplicate_selected_clip(&mut self) {
+        let Some((track_index, clip_index)) = self.selected_clip else {
+            self.status_message = "Select a clip to duplicate".to_owned();
+            return;
+        };
+        let Some(track) = self.tracks.get_mut(track_index) else {
+            return;
+        };
+        let Some(source) = track.clips.get(clip_index) else {
+            return;
+        };
+
+        let mut clip = source.clone();
+        let length = clip.length();
+        clip.id = Uuid::new_v4();
+        clip.start_frame = source.end_frame;
+        clip.end_frame = source.end_frame.saturating_add(length);
+
+        let snapshot = ClipSnapshot {
+            track_id: track.id,
+            clip: clip.clone(),
+        };
+        let name = clip.name.clone();
+        track.clips.push(clip);
+
+        self.remember_edit(EditCommand::ReplaceClips {
+            removed: Vec::new(),
+            added: vec![snapshot],
+            label: "duplicate",
+        });
+        self.dirty = true;
+        self.playback_synced = false;
+        if let Err(error) = self.sync_playback() {
+            self.status_message = format!("Duplicated; playback preload failed: {error}");
+        } else {
+            self.status_message = format!("Duplicated {name}");
+        }
+        self.save_session();
+    }
+
     fn delete_selected_clip(&mut self) {
         let Some((track_index, clip_index)) = self.selected_clip.take() else {
             return;
         };
-        if let Some(track) = self.tracks.get_mut(track_index) {
-            if clip_index < track.clips.len() {
-                track.clips.remove(clip_index);
-                self.dirty = true;
-                self.status_message = "Clip removed (audio file preserved)".to_owned();
-                self.save_session();
-                self.playback_synced = false;
-                if let Err(error) = self.sync_playback() {
-                    self.status_message = format!("Clip removed; playback preload failed: {error}");
-                }
-            }
+        let Some(track) = self.tracks.get_mut(track_index) else {
+            return;
+        };
+        if clip_index >= track.clips.len() {
+            return;
         }
+        let clip = track.clips.remove(clip_index);
+        let snapshot = ClipSnapshot {
+            track_id: track.id,
+            clip,
+        };
+
+        self.remember_edit(EditCommand::ReplaceClips {
+            removed: vec![snapshot],
+            added: Vec::new(),
+            label: "delete",
+        });
+        self.dirty = true;
+        self.status_message = "Clip removed (audio file preserved)".to_owned();
+        self.playback_synced = false;
+        if let Err(error) = self.sync_playback() {
+            self.status_message = format!("Clip removed; playback preload failed: {error}");
+        }
+        self.save_session();
     }
 
     fn delete_track(&mut self, index: usize) {
@@ -2062,8 +2514,26 @@ impl RustDawApp {
                 track.armed = !track.armed;
             }
         }
-        if context.input(|input| input.key_pressed(egui::Key::C)) {
+        // Plain C toggles the click, so the edit shortcuts take the modifier
+        // forms and B — which is where Pro Tools puts separate-at-selection.
+        if context.input(|input| input.key_pressed(egui::Key::C) && !input.modifiers.ctrl) {
             self.click_enabled = !self.click_enabled;
+        }
+        if context.input(|input| input.key_pressed(egui::Key::B) && !input.modifiers.ctrl) {
+            self.split_at_playhead(context);
+        }
+        if context.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::C)) {
+            self.copy_selected_clip();
+        }
+        if context.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::X)) {
+            self.copy_selected_clip();
+            self.delete_selected_clip();
+        }
+        if context.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::V)) {
+            self.paste_clip(context);
+        }
+        if context.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::D)) {
+            self.duplicate_selected_clip();
         }
         if context.input(|input| input.key_pressed(egui::Key::Home)) {
             if let Some(runtime) = &self.runtime {
@@ -3302,6 +3772,9 @@ impl RustDawApp {
         let mut drag_start_request = None;
         let mut drag_progress_request = None;
         let mut drag_destination = None;
+        let mut trim_start_request: Option<TrimDrag> = None;
+        let mut trim_to_frame: Option<u64> = None;
+        let mut trim_commit = false;
         let mut clip_interacted = false;
         let mut open_piano_roll = None;
         for (clip_index, clip) in self.tracks[index].midi_clips.iter().enumerate() {
@@ -3344,16 +3817,62 @@ impl RustDawApp {
                 ui.id().with(("clip", index, clip_index)),
                 Sense::click_and_drag(),
             );
+
+            // The Smart Tool: the pointer becomes the tool the place under it
+            // implies, so hovering an edge already shows the trim cursor.
+            let pointer_x = response
+                .hover_pos()
+                .or_else(|| response.interact_pointer_pos())
+                .map(|position| position.x);
+            let zone = pointer_x.map_or(ClipZone::Body, |x| ClipZone::at(clip_rect, x));
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(zone.cursor());
+            }
+
+            let trimming_this = self
+                .trimming
+                .as_ref()
+                .is_some_and(|drag| drag.track == index && drag.clip == clip_index);
+
             if response.clicked() {
                 selected_request = Some((index, clip_index));
                 clip_interacted = true;
             }
             if response.drag_started() {
-                drag_start_request = Some((index, clip_index, clip.start_frame, Vec2::ZERO));
                 selected_request = Some((index, clip_index));
                 clip_interacted = true;
+                if zone == ClipZone::Body {
+                    drag_start_request = Some((index, clip_index, clip.start_frame, Vec2::ZERO));
+                } else {
+                    trim_start_request = Some(TrimDrag {
+                        track: index,
+                        clip: clip_index,
+                        edge: zone,
+                        before: clip.clone(),
+                    });
+                }
             }
-            if response.dragged() {
+            if trimming_this && response.dragged() {
+                clip_interacted = true;
+                // The edge follows the pointer rather than a delta, so a trim
+                // cannot drift away from the cursor over a long drag.
+                if let Some(pointer) = response.interact_pointer_pos() {
+                    let seconds =
+                        (pointer.x - rect.left() + self.timeline_scroll_x) / self.pixels_per_second;
+                    let raw = (seconds.max(0.0) * sample_rate as f32) as u64;
+                    let snapped = if ui.ctx().input(|input| input.modifiers.alt) {
+                        raw
+                    } else {
+                        self.snap_to_beat(raw)
+                    };
+                    trim_to_frame = Some(snapped);
+                }
+            }
+            if trimming_this && response.drag_stopped() {
+                trim_commit = true;
+                clip_interacted = true;
+            }
+            if !trimming_this && zone == ClipZone::Body && response.dragged() {
                 clip_interacted = true;
                 let total_delta = ui
                     .ctx()
@@ -3404,6 +3923,15 @@ impl RustDawApp {
         if let Some(selection) = selected_request {
             self.selected_track = index;
             self.selected_clip = Some(selection);
+        }
+        if let Some(drag) = trim_start_request {
+            self.trimming = Some(drag);
+        }
+        if let Some(frame) = trim_to_frame {
+            self.apply_trim(frame);
+        }
+        if trim_commit {
+            self.commit_trim();
         }
         if let Some(drag) = drag_start_request {
             self.dragged_clip = Some(drag);
@@ -3475,6 +4003,7 @@ impl RustDawApp {
                     path: PathBuf::new(),
                     start_frame: start,
                     end_frame: snapshot.position_frames.max(start + 1),
+                    source_start_frame: 0,
                     color: Color32::from_rgb(92, 42, 45),
                     waveform: Vec::new(),
                 };
@@ -4719,6 +5248,7 @@ fn track_from_project(track: ProjectTrack) -> Track {
                 path: clip.path,
                 start_frame: clip.start_frame,
                 end_frame: clip.end_frame,
+                source_start_frame: clip.source_start_frame,
                 color: theme::BLUE_DARK,
             })
             .collect(),
@@ -4751,6 +5281,7 @@ fn track_to_project(track: &Track) -> ProjectTrack {
                 path: clip.path.clone(),
                 start_frame: clip.start_frame,
                 end_frame: clip.end_frame,
+                source_start_frame: clip.source_start_frame,
             })
             .collect(),
         kind: track.kind,
@@ -4805,6 +5336,60 @@ fn moved_start_frame(origin: u64, frame_delta: i64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    fn test_clip(start: u64, end: u64) -> Clip {
+        Clip {
+            id: Uuid::new_v4(),
+            name: "Take".to_owned(),
+            path: PathBuf::from("take.wav"),
+            start_frame: start,
+            end_frame: end,
+            source_start_frame: 0,
+            color: theme::BLUE_DARK,
+            waveform: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_pointer_becomes_a_trimmer_near_either_edge() {
+        let rect = Rect::from_min_max(Pos2::new(100.0, 0.0), Pos2::new(300.0, 40.0));
+        assert!(matches!(ClipZone::at(rect, 102.0), ClipZone::TrimStart));
+        assert!(matches!(ClipZone::at(rect, 298.0), ClipZone::TrimEnd));
+        assert!(matches!(ClipZone::at(rect, 200.0), ClipZone::Body));
+    }
+
+    #[test]
+    fn a_narrow_clip_keeps_a_body_to_grab() {
+        // With a clip only a few pixels wide, edge zones covering all of it
+        // would leave no way to move it at all.
+        let rect = Rect::from_min_max(Pos2::new(100.0, 0.0), Pos2::new(112.0, 40.0));
+        assert!(
+            matches!(ClipZone::at(rect, 106.0), ClipZone::Body),
+            "the middle of a narrow clip still moves it"
+        );
+    }
+
+    #[test]
+    fn the_trim_cursor_differs_from_the_move_cursor() {
+        assert_eq!(ClipZone::Body.cursor(), egui::CursorIcon::Grab);
+        assert_eq!(
+            ClipZone::TrimStart.cursor(),
+            egui::CursorIcon::ResizeHorizontal
+        );
+        assert_eq!(
+            ClipZone::TrimEnd.cursor(),
+            egui::CursorIcon::ResizeHorizontal
+        );
+    }
+
+    #[test]
+    fn a_clip_reports_the_length_it_occupies() {
+        assert_eq!(test_clip(1_000, 2_500).length(), 1_500);
+        // A degenerate clip must not underflow into an enormous length.
+        let mut backwards = test_clip(2_000, 2_000);
+        backwards.end_frame = 1_000;
+        assert_eq!(backwards.length(), 0);
+    }
+
     #[test]
     fn a_settings_file_written_before_the_chord_lane_still_loads() {
         // `#[serde(default)]` on the struct is what makes this true; without

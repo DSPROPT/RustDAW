@@ -220,9 +220,31 @@ struct PlaybackClip {
     track_id: usize,
     audible: bool,
     start_frame: u64,
+    /// Where in `samples` this clip starts reading, and how many frames it
+    /// takes. Editing is non-destructive: several clips share one decoded
+    /// source through the cache and differ only in this window.
+    source_start_frame: u64,
+    length: u64,
     samples: Arc<Vec<[f32; 2]>>,
     gain: f32,
     pan: f32,
+}
+
+impl PlaybackClip {
+    /// One past the last timeline frame this clip sounds on.
+    fn end_frame(&self) -> u64 {
+        self.start_frame.saturating_add(self.length)
+    }
+
+    /// The source frame for a timeline position, if this clip covers it.
+    fn sample_at(&self, timeline_frame: u64) -> Option<[f32; 2]> {
+        let offset = timeline_frame.checked_sub(self.start_frame)?;
+        if offset >= self.length {
+            return None;
+        }
+        let index = usize::try_from(self.source_start_frame.saturating_add(offset)).ok()?;
+        self.samples.get(index).copied()
+    }
 }
 
 /// One track's amplifier: a gate ahead of the model, the model, its tone
@@ -735,6 +757,44 @@ impl AudioRuntime {
         path: &std::path::Path,
         start_frame: u64,
         gain: f32,
+        effects: ChannelStripParams,
+        pan: f32,
+        track_id: usize,
+        clip_id: u128,
+        audible: bool,
+    ) -> Result<()> {
+        // The whole file, which is what an untrimmed clip plays.
+        self.add_clip_playback_file(
+            path,
+            start_frame,
+            0,
+            u64::MAX,
+            gain,
+            effects,
+            pan,
+            track_id,
+            clip_id,
+            audible,
+        )
+    }
+
+    /// Schedules a window of a WAV rather than the whole of it.
+    ///
+    /// `source_start_frame` and `length` are the trimmed region. Clips split
+    /// from one take share a single decoded source through the cache and
+    /// differ only in this window, so splitting costs no memory and no decode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when media loading or command scheduling fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_clip_playback_file(
+        &self,
+        path: &std::path::Path,
+        start_frame: u64,
+        source_start_frame: u64,
+        length: u64,
+        gain: f32,
         _effects: ChannelStripParams,
         pan: f32,
         track_id: usize,
@@ -761,12 +821,16 @@ impl AudioRuntime {
             }
         };
         let samples = source;
+        // A window can never reach past the end of what was decoded.
+        let available = (samples.len() as u64).saturating_sub(source_start_frame);
         self.playback_commands
             .push(PlaybackCommand::Add(PlaybackClip {
                 clip_id,
                 track_id,
                 audible,
                 start_frame,
+                source_start_frame,
+                length: length.min(available),
                 samples,
                 gain: gain.clamp(0.0, 4.0),
                 pan: pan.clamp(-1.0, 1.0),
@@ -1871,7 +1935,7 @@ fn mix_playback(
             continue;
         }
         let block_end = block_start.saturating_add(output_left.len() as u64);
-        let clip_end = clip.start_frame.saturating_add(clip.samples.len() as u64);
+        let clip_end = clip.end_frame();
         if clip.start_frame >= block_end || clip_end <= block_start {
             continue;
         }
@@ -1879,8 +1943,9 @@ fn mix_playback(
         let overlap_end = block_end.min(clip_end);
         for timeline_frame in overlap_start..overlap_end {
             let output_index = usize::try_from(timeline_frame - block_start).unwrap_or(0);
-            let clip_index = usize::try_from(timeline_frame - clip.start_frame).unwrap_or(0);
-            let frame = clip.samples[clip_index];
+            let Some(frame) = clip.sample_at(timeline_frame) else {
+                continue;
+            };
             let left_pan_gain = if clip.pan > 0.0 { 1.0 - clip.pan } else { 1.0 };
             let right_pan_gain = if clip.pan < 0.0 { 1.0 + clip.pan } else { 1.0 };
             let left = frame[0] * clip.gain * left_pan_gain;
@@ -2174,7 +2239,7 @@ fn mix_clips(
         let Some(scratch) = track_scratch.get_mut(clip.track_id) else {
             continue;
         };
-        let clip_end = clip.start_frame.saturating_add(clip.samples.len() as u64);
+        let clip_end = clip.end_frame();
         if clip.start_frame >= block_end || clip_end <= block_start {
             continue;
         }
@@ -2185,8 +2250,9 @@ fn mix_clips(
         let right_pan_gain = if clip.pan < 0.0 { 1.0 + clip.pan } else { 1.0 };
         for timeline_frame in overlap_start..overlap_end {
             let output_index = usize::try_from(timeline_frame - block_start).unwrap_or(0);
-            let clip_index = usize::try_from(timeline_frame - clip.start_frame).unwrap_or(0);
-            let frame = clip.samples[clip_index];
+            let Some(frame) = clip.sample_at(timeline_frame) else {
+                continue;
+            };
             scratch[output_index][0] += frame[0] * clip.gain * left_pan_gain;
             scratch[output_index][1] += frame[1] * clip.gain * right_pan_gain;
         }
@@ -2392,12 +2458,105 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_trimmed_clip_plays_only_its_window_of_the_source() {
+        // The take counts 0,1,2,3,4,5 so the window is unmistakable. This clip
+        // is the second half, dropped on the timeline at frame 10.
+        let source: Vec<[f32; 2]> = (0..6).map(|n| [n as f32, n as f32]).collect();
+        let clip = PlaybackClip {
+            clip_id: 1,
+            track_id: 0,
+            audible: true,
+            start_frame: 10,
+            source_start_frame: 3,
+            length: 3,
+            samples: Arc::new(source),
+            gain: 1.0,
+            pan: 0.0,
+        };
+        let mut clips: [Option<PlaybackClip>; PLAYBACK_SLOT_CAPACITY] =
+            std::array::from_fn(|_| None);
+        clips[0] = Some(clip);
+
+        let mut left = vec![0.0_f32; 16];
+        let mut right = vec![0.0_f32; 16];
+        let mut peaks = [0.0_f32; MIXER_TRACK_CAPACITY];
+        mix_playback(&clips, 0, &mut left, &mut right, &mut peaks);
+
+        assert_eq!(&left[10..13], &[3.0, 4.0, 5.0], "the second half, in order");
+        assert!(left[9].abs() < f32::EPSILON, "silence before it");
+        assert!(left[13].abs() < f32::EPSILON, "and after it");
+    }
+
+    #[test]
+    fn two_clips_split_from_one_take_reassemble_it() {
+        // Splitting must be seamless: the halves played back to back have to
+        // reproduce the original exactly, or an edit would be audible.
+        let source = Arc::new(
+            (0..8)
+                .map(|n| [n as f32, n as f32])
+                .collect::<Vec<[f32; 2]>>(),
+        );
+        let half = |slot: u128, start: u64, source_start: u64| PlaybackClip {
+            clip_id: slot,
+            track_id: 0,
+            audible: true,
+            start_frame: start,
+            source_start_frame: source_start,
+            length: 4,
+            samples: Arc::clone(&source),
+            gain: 1.0,
+            pan: 0.0,
+        };
+        let mut clips: [Option<PlaybackClip>; PLAYBACK_SLOT_CAPACITY] =
+            std::array::from_fn(|_| None);
+        clips[0] = Some(half(0, 0, 0));
+        clips[1] = Some(half(1, 4, 4));
+
+        let mut left = vec![0.0_f32; 8];
+        let mut right = vec![0.0_f32; 8];
+        let mut peaks = [0.0_f32; MIXER_TRACK_CAPACITY];
+        mix_playback(&clips, 0, &mut left, &mut right, &mut peaks);
+        assert_eq!(left, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+    }
+
+    #[test]
+    fn a_window_reaching_past_the_source_stops_at_its_end() {
+        let clip = PlaybackClip {
+            clip_id: 1,
+            track_id: 0,
+            audible: true,
+            start_frame: 0,
+            source_start_frame: 2,
+            // Longer than what is left, which a shortened file would produce.
+            length: 100,
+            samples: Arc::new(vec![[1.0, 1.0]; 4]),
+            gain: 1.0,
+            pan: 0.0,
+        };
+        let mut clips: [Option<PlaybackClip>; PLAYBACK_SLOT_CAPACITY] =
+            std::array::from_fn(|_| None);
+        clips[0] = Some(clip);
+
+        let mut left = vec![0.0_f32; 8];
+        let mut right = vec![0.0_f32; 8];
+        let mut peaks = [0.0_f32; MIXER_TRACK_CAPACITY];
+        mix_playback(&clips, 0, &mut left, &mut right, &mut peaks);
+        assert_eq!(&left[0..2], &[1.0, 1.0], "the two frames that exist");
+        assert!(
+            left[2..].iter().all(|v| v.abs() < f32::EPSILON),
+            "no reading past the end"
+        );
+    }
+
+    #[test]
     fn playback_is_mixed_at_its_absolute_position_in_stereo() {
         let clip = PlaybackClip {
             clip_id: 1,
             track_id: 0,
             audible: true,
             start_frame: 102,
+            source_start_frame: 0,
+            length: u64::MAX,
             samples: Arc::new(vec![[0.25, -0.5], [0.5, -0.25]]),
             gain: 2.0,
             pan: 0.0,
@@ -2429,6 +2588,8 @@ mod tests {
             track_id: 4,
             audible: true,
             start_frame: 0,
+            source_start_frame: 0,
+            length: u64::MAX,
             samples: Arc::new(vec![[0.5, 0.5]]),
             gain: 1.0,
             pan: -1.0,
@@ -2452,6 +2613,8 @@ mod tests {
             track_id: 0,
             audible: true,
             start_frame: 0,
+            source_start_frame: 0,
+            length: u64::MAX,
             samples: Arc::new(vec![[0.2, 0.3]]),
             gain: 1.0,
             pan: 0.0,
@@ -2461,6 +2624,8 @@ mod tests {
             track_id: 1,
             audible: true,
             start_frame: 0,
+            source_start_frame: 0,
+            length: u64::MAX,
             samples: Arc::new(vec![[0.4, 0.1]]),
             gain: 1.0,
             pan: 0.0,
@@ -2484,6 +2649,8 @@ mod tests {
             track_id: 3,
             audible: false,
             start_frame: 0,
+            source_start_frame: 0,
+            length: u64::MAX,
             samples: Arc::new(vec![[0.8, -0.8]]),
             gain: 1.0,
             pan: 0.0,
@@ -2506,6 +2673,8 @@ mod tests {
                 track_id,
                 audible: true,
                 start_frame: 0,
+                source_start_frame: 0,
+                length: u64::MAX,
                 samples: Arc::new(vec![[0.2, 0.2]]),
                 gain: 1.0,
                 pan: 0.0,
@@ -2526,6 +2695,8 @@ mod tests {
             track_id: 0,
             audible: true,
             start_frame: 0,
+            source_start_frame: 0,
+            length: u64::MAX,
             samples: Arc::clone(&samples),
             gain: 1.0,
             pan: 0.0,
@@ -2552,6 +2723,8 @@ mod tests {
             track_id: 2,
             audible: true,
             start_frame: 0,
+            source_start_frame: 0,
+            length: u64::MAX,
             samples: Arc::clone(&source),
             gain: 1.0,
             pan: 0.0,
@@ -3000,6 +3173,8 @@ mod tests {
             clip_id: 1,
             track_id: 0,
             start_frame: 0,
+            source_start_frame: 0,
+            length: u64::MAX,
             samples: Arc::new(vec![[0.5_f32; 2]; 4_096]),
             gain: 1.0,
             pan: 0.0,

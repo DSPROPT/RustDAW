@@ -150,6 +150,7 @@ pub fn ingest_project(
 
         let mut track = ProjectTrack::new(title_case(stem_name), ChannelLayout::Stereo);
         track.clips.push(ProjectClip {
+            source_start_frame: 0,
             id: Uuid::new_v4(),
             name: title_case(stem_name),
             path: destination,

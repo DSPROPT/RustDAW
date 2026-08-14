@@ -125,10 +125,13 @@ pub fn export_stereo(project: &ProjectDocument, destination: &Path) -> Result<u6
                 }
             }
             processor.process_stereo(&mut samples);
-            let available = clip.end_frame.saturating_sub(clip.start_frame);
-            let wanted = usize::try_from(available).unwrap_or(usize::MAX);
+            let wanted = usize::try_from(clip.length()).unwrap_or(usize::MAX);
             let start = usize::try_from(clip.start_frame).context("clip starts too late")?;
-            for (offset, frame) in samples.iter().take(wanted).enumerate() {
+            // The clip reads a window of its source rather than the whole file:
+            // trimming and splitting move this offset, and the file is never
+            // rewritten.
+            let source_start = usize::try_from(clip.source_start_frame).unwrap_or(usize::MAX);
+            for (offset, frame) in samples.iter().skip(source_start).take(wanted).enumerate() {
                 let Some(output) = mix.get_mut(start.saturating_add(offset)) else {
                     break;
                 };
@@ -311,6 +314,7 @@ mod tests {
 
         let mut track = ProjectTrack::new("Mix", ChannelLayout::Stereo);
         track.clips.push(ProjectClip {
+            source_start_frame: 0,
             id: uuid::Uuid::new_v4(),
             name: "Take".to_owned(),
             path: source.clone(),
@@ -361,6 +365,7 @@ mod tests {
 
         let mut track = ProjectTrack::new("Mix", ChannelLayout::Stereo);
         track.clips.push(ProjectClip {
+            source_start_frame: 0,
             id: uuid::Uuid::new_v4(),
             name: "Take".to_owned(),
             path: source.clone(),
@@ -402,6 +407,7 @@ mod tests {
 
         let mut track = ProjectTrack::new("Guitar", ChannelLayout::Mono);
         track.clips.push(ProjectClip {
+            source_start_frame: 0,
             id: uuid::Uuid::new_v4(),
             name: "Take".to_owned(),
             path: PathBuf::from(&input),

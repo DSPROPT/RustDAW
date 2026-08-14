@@ -336,6 +336,82 @@ pub struct ProjectClip {
     pub path: PathBuf,
     pub start_frame: u64,
     pub end_frame: u64,
+    /// Where in the source file this clip begins reading.
+    ///
+    /// Editing is non-destructive: trimming, splitting and copying only move
+    /// this window over a file that is never rewritten. Absent in sessions
+    /// written before editing existed, where every clip started at the top of
+    /// its file — which is exactly what a default of zero means.
+    #[serde(default)]
+    pub source_start_frame: u64,
+}
+
+impl ProjectClip {
+    /// How many frames the clip occupies on the timeline.
+    #[must_use]
+    pub fn length(&self) -> u64 {
+        self.end_frame.saturating_sub(self.start_frame)
+    }
+
+    /// The half-open range of the source file this clip reads.
+    #[must_use]
+    pub fn source_range(&self) -> std::ops::Range<u64> {
+        self.source_start_frame..self.source_start_frame.saturating_add(self.length())
+    }
+
+    /// Splits at a timeline frame, returning the part after it.
+    ///
+    /// `None` when the frame is not strictly inside the clip: splitting at an
+    /// edge would make an empty clip, which is not an edit anyone means.
+    #[must_use]
+    pub fn split_at(&mut self, frame: u64) -> Option<Self> {
+        if frame <= self.start_frame || frame >= self.end_frame {
+            return None;
+        }
+        let consumed = frame - self.start_frame;
+        let right = Self {
+            id: Uuid::new_v4(),
+            name: self.name.clone(),
+            path: self.path.clone(),
+            start_frame: frame,
+            end_frame: self.end_frame,
+            source_start_frame: self.source_start_frame.saturating_add(consumed),
+        };
+        self.end_frame = frame;
+        Some(right)
+    }
+
+    /// Moves the start edge to `frame`, keeping the audio under it still.
+    ///
+    /// Trimming the front has to walk the source window forward by the same
+    /// amount, or the take would slide against the timeline as the edge moved.
+    /// Refuses to leave nothing, or to trim back past the head of the file.
+    pub fn trim_start(&mut self, frame: u64) -> bool {
+        if frame >= self.end_frame {
+            return false;
+        }
+        if frame < self.start_frame {
+            // Extending backwards: only as far as the source still has audio.
+            let wanted = self.start_frame - frame;
+            if wanted > self.source_start_frame {
+                return false;
+            }
+            self.source_start_frame -= wanted;
+        } else {
+            self.source_start_frame += frame - self.start_frame;
+        }
+        self.start_frame = frame;
+        true
+    }
+
+    /// Moves the end edge to `frame`. The source window follows the length.
+    pub fn trim_end(&mut self, frame: u64) -> bool {
+        if frame <= self.start_frame {
+            return false;
+        }
+        self.end_frame = frame;
+        true
+    }
 }
 
 /// Writes a project via a sibling temporary file and atomic rename.
@@ -435,6 +511,106 @@ const fn default_reverb_mix() -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// A clip covering frames 1000..2000 of the timeline, reading its source
+    /// from the top.
+    fn clip() -> ProjectClip {
+        ProjectClip {
+            id: Uuid::new_v4(),
+            name: "Take".to_owned(),
+            path: PathBuf::from("take.wav"),
+            start_frame: 1_000,
+            end_frame: 2_000,
+            source_start_frame: 0,
+        }
+    }
+
+    #[test]
+    fn a_clip_written_before_editing_reads_from_the_top_of_its_file() {
+        let older = r#"{"id":"00000000-0000-4000-8000-000000000000","name":"Take",
+                        "path":"take.wav","start_frame":10,"end_frame":20}"#;
+        let restored: ProjectClip = serde_json::from_str(older).expect("older clip");
+        assert_eq!(restored.source_start_frame, 0);
+        assert_eq!(restored.source_range(), 0..10);
+    }
+
+    #[test]
+    fn splitting_hands_the_second_half_the_audio_that_follows() {
+        let mut left = clip();
+        let right = left.split_at(1_400).expect("splits inside");
+
+        assert_eq!((left.start_frame, left.end_frame), (1_000, 1_400));
+        assert_eq!((right.start_frame, right.end_frame), (1_400, 2_000));
+        // The halves read consecutive windows of one untouched file: nothing
+        // is duplicated and nothing is lost.
+        assert_eq!(left.source_range(), 0..400);
+        assert_eq!(right.source_range(), 400..1_000);
+        assert_eq!(left.path, right.path);
+        assert_ne!(left.id, right.id, "the halves are separate clips");
+    }
+
+    #[test]
+    fn splitting_at_an_edge_is_refused() {
+        assert!(clip().split_at(1_000).is_none(), "would leave nothing left");
+        assert!(
+            clip().split_at(2_000).is_none(),
+            "would leave nothing right"
+        );
+        assert!(clip().split_at(500).is_none(), "outside the clip");
+    }
+
+    #[test]
+    fn trimming_the_front_keeps_the_audio_where_it_was() {
+        // The whole point: the take must not slide under the edge.
+        let mut clip = clip();
+        assert!(clip.trim_start(1_250));
+        assert_eq!(clip.start_frame, 1_250);
+        assert_eq!(
+            clip.source_range(),
+            250..1_000,
+            "the window walked forward with the edge"
+        );
+    }
+
+    #[test]
+    fn a_trimmed_front_can_be_pulled_back_out_again() {
+        let mut clip = clip();
+        clip.trim_start(1_250);
+        assert!(clip.trim_start(1_100), "there is still source behind it");
+        assert_eq!(clip.source_range(), 100..1_000);
+    }
+
+    #[test]
+    fn the_front_cannot_be_pulled_back_past_the_start_of_the_file() {
+        let mut clip = clip();
+        assert!(!clip.trim_start(900), "there is no audio before frame zero");
+        assert_eq!(clip.start_frame, 1_000, "and nothing moved");
+    }
+
+    #[test]
+    fn trimming_the_end_shortens_without_moving_the_window() {
+        let mut clip = clip();
+        assert!(clip.trim_end(1_600));
+        assert_eq!(clip.end_frame, 1_600);
+        assert_eq!(clip.source_range(), 0..600);
+    }
+
+    #[test]
+    fn an_edge_cannot_be_dragged_through_the_other_one() {
+        let mut clip = clip();
+        assert!(!clip.trim_start(2_000));
+        assert!(!clip.trim_end(1_000));
+        assert_eq!((clip.start_frame, clip.end_frame), (1_000, 2_000));
+    }
+
+    #[test]
+    fn splitting_a_clip_that_was_already_trimmed_stays_lined_up() {
+        // The case that catches off-by-one offsets: edit, then edit again.
+        let mut left = clip();
+        left.trim_start(1_200);
+        let right = left.split_at(1_500).expect("splits");
+        assert_eq!(left.source_range(), 200..500);
+        assert_eq!(right.source_range(), 500..1_000);
+    }
 
     #[test]
     fn a_session_written_before_the_time_effects_existed_still_opens() {
@@ -491,6 +667,7 @@ mod tests {
     fn json_round_trip_preserves_session() {
         let mut project = ProjectDocument::default();
         project.tracks[0].clips.push(ProjectClip {
+            source_start_frame: 0,
             id: Uuid::new_v4(),
             name: "Take 1".to_owned(),
             path: PathBuf::from("Audio/Take_1.wav"),
