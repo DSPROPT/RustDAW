@@ -47,6 +47,9 @@ struct Clip {
     /// Where in the source file this clip begins reading. Editing only moves
     /// this window; the file itself is never rewritten.
     source_start_frame: u64,
+    /// Total frames in the source file. The waveform peaks span the whole
+    /// file, so this is what says which part of them this clip is showing.
+    source_frames: u64,
     color: Color32,
     waveform: Vec<f32>,
 }
@@ -58,12 +61,17 @@ impl Clip {
     }
 }
 
-/// What a drag on a clip will do, decided by where the pointer is on it.
+/// What a drag on a clip will do, decided by where the gesture began on it.
 ///
 /// Pro Tools calls this the Smart Tool: one pointer that becomes the tool the
 /// place under it implies, instead of a palette to go and choose from. Near
-/// either edge it trims that edge; anywhere else it moves the clip. The two
-/// things people do most, without a mode to be in.
+/// either edge it trims that edge; anywhere else it moves the clip.
+///
+/// The zone is read from where the pointer was **pressed**, never from where it
+/// is now. egui reports no drag until the pointer has travelled `max_click_dist`
+/// — six pixels — from the press, so by the time there is a drag to act on the
+/// pointer has already left a nine-pixel edge zone. Sampling it then sees the
+/// body of the clip and turns every trim into a move.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ClipZone {
     TrimStart,
@@ -71,11 +79,17 @@ enum ClipZone {
     TrimEnd,
 }
 
-/// How wide the trim zones are, in pixels.
-const TRIM_ZONE_WIDTH: f32 = 9.0;
+/// The height of the unit toggle sitting in the ruler.
+fn ruler_height_inner() -> f32 {
+    22.0
+}
+
+/// How wide the trim zones are, in pixels. Comfortably wider than egui's
+/// six-pixel click threshold, so a press inside one is unambiguous.
+const TRIM_ZONE_WIDTH: f32 = 10.0;
 
 impl ClipZone {
-    /// Which zone a pointer is in. Narrow clips give up their trim zones
+    /// Which zone a position is in. Narrow clips give up their trim zones
     /// rather than leave no way to grab the middle.
     fn at(clip_rect: Rect, pointer_x: f32) -> Self {
         let edge = TRIM_ZONE_WIDTH.min(clip_rect.width() / 3.0);
@@ -92,6 +106,14 @@ impl ClipZone {
         match self {
             Self::Body => egui::CursorIcon::Grab,
             _ => egui::CursorIcon::ResizeHorizontal,
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Self::TrimStart => "start",
+            Self::TrimEnd => "end",
+            Self::Body => "clip",
         }
     }
 }
@@ -341,6 +363,12 @@ pub struct RustDawApp {
     chord_scale_unsaved: bool,
     /// The copied clip, kept whole so pasting reproduces its trimmed window.
     clipboard: Option<Clip>,
+    /// The loop range in seconds, if one is marked.
+    loop_range: Option<(f64, f64)>,
+    /// Where a loop drag on the ruler began.
+    loop_drag_anchor: Option<f64>,
+    /// Whether the ruler counts bars rather than minutes and seconds.
+    ruler_shows_bars: bool,
     /// An edge being dragged, if one is.
     trimming: Option<TrimDrag>,
     selected_clip: Option<(usize, usize)>,
@@ -434,6 +462,9 @@ impl RustDawApp {
             chords_open: true,
             chord_scale_unsaved: false,
             clipboard: None,
+            loop_range: None,
+            loop_drag_anchor: None,
+            ruler_shows_bars: false,
             trimming: None,
             selected_clip: None,
             dragged_clip: None,
@@ -860,7 +891,7 @@ impl RustDawApp {
             .unwrap_or("Take")
             .to_owned();
         let mut added = false;
-        let waveform = analyze_waveform(&path);
+        let (waveform, source_frames) = analyze_waveform(&path);
         let clip_id = Uuid::new_v4();
         if let Some(track) = self.tracks.get_mut(self.selected_track) {
             track.clips.push(Clip {
@@ -870,6 +901,7 @@ impl RustDawApp {
                 start_frame,
                 end_frame,
                 source_start_frame: 0,
+                source_frames,
                 color: theme::BLUE_DARK,
                 waveform,
             });
@@ -1241,14 +1273,16 @@ impl RustDawApp {
                     let mut track = Track::new(self.tracks.len(), layout);
                     track.name.clone_from(&name);
                     let clip_id = Uuid::new_v4();
+                    let (waveform, source_frames) = analyze_waveform(&path);
                     track.clips.push(Clip {
                         id: clip_id,
                         name,
-                        waveform: analyze_waveform(&path),
+                        waveform,
                         path,
                         start_frame,
                         end_frame: start_frame.saturating_add(frames),
                         source_start_frame: 0,
+                        source_frames,
                         color: theme::BLUE_DARK,
                     });
                     self.tracks.push(track);
@@ -1879,6 +1913,214 @@ impl RustDawApp {
     /// its base size. The bottom is where the text stops being legible; the top
     /// is where the lane starts eating the timeline.
     const CHORD_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.7..=3.0;
+
+    /// Seconds under a timeline x position.
+    fn seconds_at_x(&self, left: f32, x: f32) -> f64 {
+        f64::from(((x - left + self.timeline_scroll_x) / self.pixels_per_second).max(0.0))
+    }
+
+    /// The timeline ruler: where you are, where you are going, and what is
+    /// looping.
+    ///
+    /// Clicking moves the playhead, because waiting for playback to reach the
+    /// chorus to hear the chorus is not a workflow. Dragging marks a loop, so
+    /// a passage can be played round until it is right.
+    fn timeline_ruler(
+        &mut self,
+        ui: &mut egui::Ui,
+        ruler: Rect,
+        response: &egui::Response,
+        sample_rate: u32,
+    ) {
+        let painter = ui.painter_at(ruler);
+        painter.rect_filled(ruler, 0.0, theme::PANEL_2);
+
+        let to_frame = |seconds: f64| (seconds * f64::from(sample_rate)) as u64;
+        let x_of = |seconds: f64| {
+            ruler.left() + (seconds as f32) * self.pixels_per_second - self.timeline_scroll_x
+        };
+
+        // Dragging marks a loop; a plain click drops the playhead.
+        if response.drag_started() {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                self.loop_drag_anchor = Some(self.seconds_at_x(ruler.left(), pointer.x));
+            }
+        }
+        if response.dragged() {
+            if let (Some(anchor), Some(pointer)) =
+                (self.loop_drag_anchor, response.interact_pointer_pos())
+            {
+                let here = self.seconds_at_x(ruler.left(), pointer.x);
+                let (from, to) = if here < anchor {
+                    (here, anchor)
+                } else {
+                    (anchor, here)
+                };
+                // A flick of a drag is a click that wobbled, not a loop.
+                if to - from > 0.05 {
+                    self.loop_range = Some((from, to));
+                }
+            }
+        }
+        if response.drag_stopped() {
+            self.loop_drag_anchor = None;
+            if let (Some(runtime), Some((from, to))) = (&self.runtime, self.loop_range) {
+                runtime.set_loop(to_frame(from), to_frame(to));
+                runtime.seek(daw_core::SamplePosition::new(to_frame(from)));
+                self.status_message =
+                    format!("Looping {from:.2}s – {to:.2}s. Click the ruler to clear.");
+            }
+        }
+        if response.clicked() {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let seconds = self.seconds_at_x(ruler.left(), pointer.x);
+                if let Some(runtime) = &self.runtime {
+                    runtime.seek(daw_core::SamplePosition::new(to_frame(seconds)));
+                    // A click outside the loop means the loop is no longer what
+                    // is wanted; one inside it is just moving within it.
+                    let inside = self
+                        .loop_range
+                        .is_some_and(|(from, to)| seconds >= from && seconds <= to);
+                    if !inside && self.loop_range.take().is_some() {
+                        runtime.clear_loop();
+                        self.status_message = "Loop cleared".to_owned();
+                    }
+                }
+            }
+        }
+
+        // The loop, behind the marks.
+        if let Some((from, to)) = self.loop_range {
+            let band = Rect::from_min_max(
+                Pos2::new(x_of(from).max(ruler.left()), ruler.top()),
+                Pos2::new(x_of(to).min(ruler.right()), ruler.bottom()),
+            );
+            if band.width() > 0.0 {
+                painter.rect_filled(band, 0.0, theme::BLUE_DARK);
+                for edge in [band.left(), band.right()] {
+                    painter.line_segment(
+                        [
+                            Pos2::new(edge, ruler.top()),
+                            Pos2::new(edge, ruler.bottom()),
+                        ],
+                        Stroke::new(1.5_f32, theme::BLUE),
+                    );
+                }
+            }
+        }
+
+        if self.ruler_shows_bars {
+            self.draw_bar_marks(&painter, ruler);
+        } else {
+            self.draw_second_marks(&painter, ruler);
+        }
+
+        // The unit switch, parked at the left where it cannot be scrolled away.
+        let toggle = Rect::from_min_size(
+            Pos2::new(ruler.left() + 4.0, ruler.top() + 4.0),
+            Vec2::new(46.0, ruler_height_inner()),
+        );
+        let toggle_response = ui.interact(toggle, ui.id().with("ruler-units"), Sense::click());
+        painter.rect_filled(toggle, 3.0, theme::PANEL);
+        painter.text(
+            toggle.center(),
+            Align2::CENTER_CENTER,
+            if self.ruler_shows_bars {
+                "BARS"
+            } else {
+                "TIME"
+            },
+            FontId::monospace(10.0),
+            theme::BLUE,
+        );
+        if toggle_response.clicked() {
+            self.ruler_shows_bars = !self.ruler_shows_bars;
+        }
+        toggle_response
+            .on_hover_text("Show the ruler in bars and beats, or in minutes and seconds");
+
+        response.clone().on_hover_text(
+            "Click to move the playhead.\nDrag to mark a loop; click outside it to clear.",
+        );
+    }
+
+    /// Minutes and seconds, labelled every five.
+    fn draw_second_marks(&self, painter: &egui::Painter, ruler: Rect) {
+        for second in 0..=3_600 {
+            let x = ruler.left() + second as f32 * self.pixels_per_second - self.timeline_scroll_x;
+            if x > ruler.right() {
+                break;
+            }
+            if x < ruler.left() - 4.0 {
+                continue;
+            }
+            if second % 5 == 0 {
+                painter.line_segment(
+                    [
+                        Pos2::new(x, ruler.bottom() - 5.0),
+                        Pos2::new(x, ruler.bottom()),
+                    ],
+                    Stroke::new(1.0_f32, theme::BORDER),
+                );
+                painter.text(
+                    Pos2::new(x + 4.0, ruler.center().y),
+                    Align2::LEFT_CENTER,
+                    format!("{:02}:{:02}", second / 60, second % 60),
+                    FontId::monospace(11.0),
+                    theme::MUTED,
+                );
+            }
+        }
+    }
+
+    /// Bars and beats, from the session's tempo map, so the ruler agrees with
+    /// the click and with the chord chart above the tracks.
+    fn draw_bar_marks(&self, painter: &egui::Painter, ruler: Rect) {
+        let per_beat = u64::from(daw_midi::TICKS_PER_QUARTER);
+        let beats_per_bar = u64::from(self.meter_numerator.max(1));
+        // Label every bar while they are far enough apart to read, then every
+        // fourth, then every sixteenth.
+        let seconds_per_beat = 60.0 / f64::from(self.tempo.max(1));
+        let pixels_per_bar =
+            (seconds_per_beat * beats_per_bar as f64) as f32 * self.pixels_per_second;
+        let label_every = if pixels_per_bar > 48.0 {
+            1
+        } else if pixels_per_bar > 14.0 {
+            4
+        } else {
+            16
+        };
+
+        for bar in 0..10_000_u64 {
+            let tick = bar * beats_per_bar * per_beat;
+            let seconds = self.tempo_map.tick_to_seconds(tick);
+            let x =
+                ruler.left() + (seconds as f32) * self.pixels_per_second - self.timeline_scroll_x;
+            if x > ruler.right() {
+                break;
+            }
+            if x < ruler.left() - 4.0 {
+                continue;
+            }
+            let labelled = bar % label_every == 0;
+            painter.line_segment(
+                [
+                    Pos2::new(x, ruler.bottom() - if labelled { 7.0 } else { 4.0 }),
+                    Pos2::new(x, ruler.bottom()),
+                ],
+                Stroke::new(1.0_f32, theme::BORDER),
+            );
+            if labelled {
+                painter.text(
+                    Pos2::new(x + 4.0, ruler.center().y),
+                    Align2::LEFT_CENTER,
+                    format!("{}", bar + 1),
+                    FontId::monospace(11.0),
+                    theme::MUTED,
+                );
+            }
+        }
+    }
 
     /// The chord chart, drawn as a lane of marks under the ruler.
     ///
@@ -3829,13 +4071,11 @@ impl RustDawApp {
                 Sense::click_and_drag(),
             );
 
-            // The Smart Tool: the pointer becomes the tool the place under it
-            // implies, so hovering an edge already shows the trim cursor.
             let pointer_x = response
                 .hover_pos()
                 .or_else(|| response.interact_pointer_pos())
                 .map(|position| position.x);
-            let zone = pointer_x.map_or(ClipZone::Body, |x| ClipZone::at(clip_rect, x));
+            let hover_zone = pointer_x.map_or(ClipZone::Body, |x| ClipZone::at(clip_rect, x));
 
             if response.clicked() {
                 selected_request = Some((index, clip_index));
@@ -3844,25 +4084,23 @@ impl RustDawApp {
             if response.drag_started() {
                 selected_request = Some((index, clip_index));
                 clip_interacted = true;
-                if zone == ClipZone::Body {
+                // Where the gesture began, not where the pointer has run on to.
+                let press_zone = ui
+                    .ctx()
+                    .input(|input| input.pointer.press_origin())
+                    .map_or(hover_zone, |origin| ClipZone::at(clip_rect, origin.x));
+                if press_zone == ClipZone::Body {
                     drag_start_request = Some((index, clip_index, clip.start_frame, Vec2::ZERO));
                 } else {
                     trim_start_request = Some(TrimDrag {
                         track: index,
                         clip: clip_index,
-                        edge: zone,
+                        edge: press_zone,
                         before: clip.clone(),
                     });
                 }
             }
 
-            // Which tool this gesture is using was decided when it started, and
-            // is held until it ends. The pointer leaves the edge zone as soon
-            // as it moves, so asking where it is now would turn every trim into
-            // a move a few pixels in. `trim_start_request` is included because
-            // egui reports the first drag on the same frame it reports the
-            // press, and the field it lands in is not written until after this
-            // loop has released its borrow.
             let trimming_this = self
                 .trimming
                 .as_ref()
@@ -3873,9 +4111,9 @@ impl RustDawApp {
             // it does not flip to the grab hand as the pointer leaves the edge.
             if response.hovered() || trimming_this {
                 let showing = if trimming_this {
-                    self.trimming.as_ref().map_or(zone, |drag| drag.edge)
+                    self.trimming.as_ref().map_or(hover_zone, |drag| drag.edge)
                 } else {
-                    zone
+                    hover_zone
                 };
                 ui.ctx().set_cursor_icon(showing.cursor());
             }
@@ -3899,6 +4137,12 @@ impl RustDawApp {
             if trimming_this && response.drag_stopped() {
                 trim_commit = true;
                 clip_interacted = true;
+            }
+            if response.hovered() && !trimming_this {
+                response.clone().on_hover_text(
+                    "Drag the middle to move, or between tracks.\nDrag either edge to trim \
+                     it.\nEdits snap to the beat; hold Alt for sample-accurate placement.",
+                );
             }
             if !trimming_this && response.dragged() {
                 clip_interacted = true;
@@ -3953,6 +4197,7 @@ impl RustDawApp {
             self.selected_clip = Some(selection);
         }
         if let Some(drag) = trim_start_request {
+            self.status_message = format!("Trimming the {} edge…", drag.edge.describe());
             self.trimming = Some(drag);
         }
         if let Some(frame) = trim_to_frame {
@@ -4032,6 +4277,7 @@ impl RustDawApp {
                     start_frame: start,
                     end_frame: snapshot.position_frames.max(start + 1),
                     source_start_frame: 0,
+                    source_frames: 0,
                     color: Color32::from_rgb(92, 42, 45),
                     waveform: Vec::new(),
                 };
@@ -4291,33 +4537,15 @@ impl eframe::App for RustDawApp {
             .frame(egui::Frame::new().fill(theme::BG))
             .show(context, |ui| {
                 let ruler_height = 30.0;
-                let (ruler, _) = ui.allocate_exact_size(
+                let (ruler, ruler_response) = ui.allocate_exact_size(
                     Vec2::new(ui.available_width(), ruler_height),
-                    Sense::hover(),
+                    Sense::click_and_drag(),
                 );
-                let painter = ui.painter_at(ruler);
-                painter.rect_filled(ruler, 0.0, theme::PANEL_2);
-                // The ruler is drawn scrolled by the same offset as the tracks
-                // below it, so its time labels always sit over the right frames.
-                for second in 0..=600 {
-                    let x = ruler.left() + second as f32 * self.pixels_per_second
-                        - self.timeline_scroll_x;
-                    if x > ruler.right() {
-                        break;
-                    }
-                    if x < ruler.left() - 4.0 {
-                        continue;
-                    }
-                    if second % 5 == 0 {
-                        painter.text(
-                            Pos2::new(x + 4.0, ruler.center().y),
-                            Align2::LEFT_CENTER,
-                            format!("{:02}:{:02}", second / 60, second % 60),
-                            FontId::monospace(11.0),
-                            theme::MUTED,
-                        );
-                    }
-                }
+                let ruler_rate = self
+                    .runtime
+                    .as_ref()
+                    .map_or(48_000, |runtime| runtime.sample_rate().get());
+                self.timeline_ruler(ui, ruler, &ruler_response, ruler_rate);
                 self.chord_lane(ui, ruler.left(), ruler.width());
 
                 // While the transport runs, keep the playhead in view by
@@ -4962,8 +5190,21 @@ fn draw_clip(
     );
     let center = rect.center().y + 6.0;
     let mut x = rect.left() + 5.0;
+    // Which slice of the file this clip is showing. The peaks span the whole
+    // source, so a trimmed clip has to read the matching part of them —
+    // drawing them across the clip's width regardless is what made a trim look
+    // like the audio had moved rather than been trimmed.
+    let (window_start, window_span) = if clip.source_frames > 0 {
+        let total = clip.source_frames as f32;
+        let start = clip.source_start_frame as f32 / total;
+        let span = (clip.length() as f32 / total).max(f32::EPSILON);
+        (start, span)
+    } else {
+        (0.0, 1.0)
+    };
     while x < rect.right() - 3.0 {
-        let fraction = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        let across = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        let fraction = (window_start + across * window_span).clamp(0.0, 1.0);
         let peak_index = ((clip.waveform.len().saturating_sub(1)) as f32 * fraction) as usize;
         let peak = clip.waveform.get(peak_index).copied().unwrap_or(0.0);
         let normalized = peak.sqrt() * (rect.height() * 0.34);
@@ -5213,10 +5454,15 @@ fn default_session_path() -> PathBuf {
     daw_core::media_dir("Sessions").join("Current.rustdaw.json")
 }
 
-fn analyze_waveform(path: &std::path::Path) -> Vec<f32> {
+/// Peak buckets for a whole file, and how many frames it holds.
+///
+/// The peaks cover the entire file rather than any one clip's window, so
+/// several clips split from one take share the same measurement and a trim
+/// redraws without touching the disk.
+fn analyze_waveform(path: &std::path::Path) -> (Vec<f32>, u64) {
     const PEAK_BUCKETS: usize = 512;
     let Ok(mut reader) = hound::WavReader::open(path) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let spec = reader.spec();
     let values = match spec.sample_format {
@@ -5242,13 +5488,14 @@ fn analyze_waveform(path: &std::path::Path) -> Vec<f32> {
     let channels = usize::from(spec.channels).max(1);
     let frames = values.len() / channels;
     if frames == 0 {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
     let frames_per_bucket = frames.div_ceil(PEAK_BUCKETS).max(1);
-    values
+    let peaks = values
         .chunks(frames_per_bucket.saturating_mul(channels))
         .map(|bucket| bucket.iter().copied().fold(0.0_f32, f32::max))
-        .collect()
+        .collect();
+    (peaks, frames as u64)
 }
 
 fn track_from_project(track: ProjectTrack) -> Track {
@@ -5269,15 +5516,19 @@ fn track_from_project(track: ProjectTrack) -> Track {
         clips: track
             .clips
             .into_iter()
-            .map(|clip| Clip {
-                id: clip.id,
-                waveform: analyze_waveform(&clip.path),
-                name: clip.name,
-                path: clip.path,
-                start_frame: clip.start_frame,
-                end_frame: clip.end_frame,
-                source_start_frame: clip.source_start_frame,
-                color: theme::BLUE_DARK,
+            .map(|clip| {
+                let (waveform, source_frames) = analyze_waveform(&clip.path);
+                Clip {
+                    id: clip.id,
+                    waveform,
+                    source_frames,
+                    name: clip.name,
+                    path: clip.path,
+                    start_frame: clip.start_frame,
+                    end_frame: clip.end_frame,
+                    source_start_frame: clip.source_start_frame,
+                    color: theme::BLUE_DARK,
+                }
             })
             .collect(),
         kind: track.kind,
@@ -5372,45 +5623,47 @@ mod tests {
             start_frame: start,
             end_frame: end,
             source_start_frame: 0,
+            source_frames: 0,
             color: theme::BLUE_DARK,
             waveform: Vec::new(),
         }
     }
 
     #[test]
-    fn a_gesture_keeps_the_tool_it_started_with() {
-        // The bug this locks down: the zone was recomputed from the live
-        // pointer every frame, so pressing on an edge and dragging inward
-        // turned the trim into a move a few pixels in. The drag targets the
-        // clip it began on, whatever the pointer is over now.
-        let drag = TrimDrag {
-            track: 2,
-            clip: 5,
-            edge: ClipZone::TrimStart,
-            before: test_clip(0, 1_000),
-        };
-        assert!(drag.targets(2, 5));
-        assert!(!drag.targets(2, 6), "a different clip is not this gesture");
-        assert!(!drag.targets(3, 5), "nor a different track");
-        assert_eq!(drag.edge, ClipZone::TrimStart, "the edge is latched too");
-    }
-
-    #[test]
     fn the_pointer_becomes_a_trimmer_near_either_edge() {
-        let rect = Rect::from_min_max(Pos2::new(100.0, 0.0), Pos2::new(300.0, 40.0));
-        assert!(matches!(ClipZone::at(rect, 102.0), ClipZone::TrimStart));
-        assert!(matches!(ClipZone::at(rect, 298.0), ClipZone::TrimEnd));
-        assert!(matches!(ClipZone::at(rect, 200.0), ClipZone::Body));
+        let rect = Rect::from_min_max(Pos2::new(100.0, 0.0), Pos2::new(400.0, 40.0));
+        assert_eq!(ClipZone::at(rect, 102.0), ClipZone::TrimStart);
+        assert_eq!(ClipZone::at(rect, 398.0), ClipZone::TrimEnd);
+        assert_eq!(ClipZone::at(rect, 250.0), ClipZone::Body);
     }
 
     #[test]
     fn a_narrow_clip_keeps_a_body_to_grab() {
-        // With a clip only a few pixels wide, edge zones covering all of it
-        // would leave no way to move it at all.
-        let rect = Rect::from_min_max(Pos2::new(100.0, 0.0), Pos2::new(112.0, 40.0));
-        assert!(
-            matches!(ClipZone::at(rect, 106.0), ClipZone::Body),
-            "the middle of a narrow clip still moves it"
+        // Edge zones covering a whole clip would leave no way to move it.
+        let rect = Rect::from_min_max(Pos2::new(100.0, 0.0), Pos2::new(115.0, 40.0));
+        assert_eq!(ClipZone::at(rect, 107.0), ClipZone::Body);
+    }
+
+    #[test]
+    fn a_press_anywhere_in_the_zone_is_a_trim() {
+        // egui reports no drag until the pointer has moved six pixels from the
+        // press, so the zone is read from the press origin. This walks the
+        // whole zone to show every part of it decides a trim — the live
+        // position, six pixels further in, would not.
+        let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(600.0, 40.0));
+        let mut offset = 0.0_f32;
+        while offset <= TRIM_ZONE_WIDTH {
+            assert_eq!(
+                ClipZone::at(rect, rect.left() + offset),
+                ClipZone::TrimStart,
+                "a press {offset} px in must trim"
+            );
+            offset += 1.0;
+        }
+        assert_eq!(
+            ClipZone::at(rect, rect.left() + TRIM_ZONE_WIDTH + 1.0),
+            ClipZone::Body,
+            "and past the zone it moves"
         );
     }
 

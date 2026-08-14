@@ -140,6 +140,11 @@ struct Shared {
     recording: AtomicBool,
     record_pending: AtomicBool,
     record_start_frame: AtomicU64,
+    /// The loop range, in frames. An end of zero means no loop, which is why
+    /// the pair is two plain atomics rather than a lock around an `Option`:
+    /// the audio callback reads them every block and must never wait.
+    loop_start: AtomicU64,
+    loop_end: AtomicU64,
     position: AtomicU64,
     tempo: AtomicU16,
     meter_numerator: AtomicU16,
@@ -182,6 +187,8 @@ impl Shared {
             recording: AtomicBool::new(false),
             record_pending: AtomicBool::new(false),
             record_start_frame: AtomicU64::new(0),
+            loop_start: AtomicU64::new(0),
+            loop_end: AtomicU64::new(0),
             position: AtomicU64::new(0),
             tempo: AtomicU16::new(120),
             meter_numerator: AtomicU16::new(4),
@@ -667,6 +674,27 @@ impl AudioRuntime {
 
     pub fn seek_to_start(&self) {
         self.shared.position.store(0, Ordering::Release);
+    }
+
+    /// Sets the loop range, in frames. Playback wraps from `end` back to
+    /// `start` while it is set.
+    pub fn set_loop(&self, start: u64, end: u64) {
+        // Order matters: writing the end last means the callback never sees an
+        // end without a start it belongs to.
+        self.shared.loop_start.store(start, Ordering::Relaxed);
+        self.shared.loop_end.store(end, Ordering::Relaxed);
+    }
+
+    /// Clears the loop, so playback runs to the end of the session.
+    pub fn clear_loop(&self) {
+        self.shared.loop_end.store(0, Ordering::Relaxed);
+    }
+
+    /// The loop range, if one is set.
+    #[must_use]
+    pub fn loop_range(&self) -> Option<(u64, u64)> {
+        let end = self.shared.loop_end.load(Ordering::Relaxed);
+        (end > 0).then(|| (self.shared.loop_start.load(Ordering::Relaxed), end))
     }
 
     pub fn seek(&self, position: SamplePosition) {
@@ -1713,6 +1741,16 @@ fn output_stream<T: cpal::SizedSample + Copy + Send + 'static>(
                                     &mut monitor_nam,
                                 );
                                 position = position.saturating_add(count as u64);
+                                // Wrap the transport at the end of the loop.
+                                // Checked per render chunk, so the wrap lands
+                                // within one chunk of the mark rather than on
+                                // the exact sample; making it sample-accurate
+                                // means splitting the block, which is not worth
+                                // the complexity until someone can hear it.
+                                let end = shared.loop_end.load(Ordering::Relaxed);
+                                if end > 0 && position >= end {
+                                    position = shared.loop_start.load(Ordering::Relaxed);
+                                }
                             },
                         );
                         for ((frame, left), right) in output_chunk
