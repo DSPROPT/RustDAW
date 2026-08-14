@@ -64,7 +64,7 @@ impl Clip {
 /// place under it implies, instead of a palette to go and choose from. Near
 /// either edge it trims that edge; anywhere else it moves the clip. The two
 /// things people do most, without a mode to be in.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum ClipZone {
     TrimStart,
     Body,
@@ -104,6 +104,17 @@ struct TrimDrag {
     clip: usize,
     edge: ClipZone,
     before: Clip,
+}
+
+impl TrimDrag {
+    /// Whether this drag belongs to a given clip.
+    ///
+    /// A gesture keeps the tool it started with: the pointer leaves the edge
+    /// zone within a few pixels of moving, and a trim that became a move
+    /// part-way through would be unusable.
+    fn targets(&self, track: usize, clip: usize) -> bool {
+        self.track == track && self.clip == clip
+    }
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -3825,14 +3836,6 @@ impl RustDawApp {
                 .or_else(|| response.interact_pointer_pos())
                 .map(|position| position.x);
             let zone = pointer_x.map_or(ClipZone::Body, |x| ClipZone::at(clip_rect, x));
-            if response.hovered() {
-                ui.ctx().set_cursor_icon(zone.cursor());
-            }
-
-            let trimming_this = self
-                .trimming
-                .as_ref()
-                .is_some_and(|drag| drag.track == index && drag.clip == clip_index);
 
             if response.clicked() {
                 selected_request = Some((index, clip_index));
@@ -3852,6 +3855,31 @@ impl RustDawApp {
                     });
                 }
             }
+
+            // Which tool this gesture is using was decided when it started, and
+            // is held until it ends. The pointer leaves the edge zone as soon
+            // as it moves, so asking where it is now would turn every trim into
+            // a move a few pixels in. `trim_start_request` is included because
+            // egui reports the first drag on the same frame it reports the
+            // press, and the field it lands in is not written until after this
+            // loop has released its borrow.
+            let trimming_this = self
+                .trimming
+                .as_ref()
+                .or(trim_start_request.as_ref())
+                .is_some_and(|drag| drag.targets(index, clip_index));
+
+            // The cursor shows the latched tool while a gesture is running, so
+            // it does not flip to the grab hand as the pointer leaves the edge.
+            if response.hovered() || trimming_this {
+                let showing = if trimming_this {
+                    self.trimming.as_ref().map_or(zone, |drag| drag.edge)
+                } else {
+                    zone
+                };
+                ui.ctx().set_cursor_icon(showing.cursor());
+            }
+
             if trimming_this && response.dragged() {
                 clip_interacted = true;
                 // The edge follows the pointer rather than a delta, so a trim
@@ -3872,7 +3900,7 @@ impl RustDawApp {
                 trim_commit = true;
                 clip_interacted = true;
             }
-            if !trimming_this && zone == ClipZone::Body && response.dragged() {
+            if !trimming_this && response.dragged() {
                 clip_interacted = true;
                 let total_delta = ui
                     .ctx()
@@ -3893,7 +3921,7 @@ impl RustDawApp {
                     StrokeKind::Inside,
                 );
             }
-            if response.drag_stopped() {
+            if !trimming_this && response.drag_stopped() {
                 let origin = self
                     .dragged_clip
                     .filter(|(track, item, _, _)| *track == index && *item == clip_index)
@@ -5347,6 +5375,24 @@ mod tests {
             color: theme::BLUE_DARK,
             waveform: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_gesture_keeps_the_tool_it_started_with() {
+        // The bug this locks down: the zone was recomputed from the live
+        // pointer every frame, so pressing on an edge and dragging inward
+        // turned the trim into a move a few pixels in. The drag targets the
+        // clip it began on, whatever the pointer is over now.
+        let drag = TrimDrag {
+            track: 2,
+            clip: 5,
+            edge: ClipZone::TrimStart,
+            before: test_clip(0, 1_000),
+        };
+        assert!(drag.targets(2, 5));
+        assert!(!drag.targets(2, 6), "a different clip is not this gesture");
+        assert!(!drag.targets(3, 5), "nor a different track");
+        assert_eq!(drag.edge, ClipZone::TrimStart, "the edge is latched too");
     }
 
     #[test]
