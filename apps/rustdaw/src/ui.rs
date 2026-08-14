@@ -79,6 +79,21 @@ enum ClipZone {
     TrimEnd,
 }
 
+/// The furthest the end edge of a clip can be dragged.
+///
+/// A clip is a window onto a file, and the window cannot show audio the file
+/// does not have — dragging the end outwards past the last sample would leave
+/// a clip longer than anything it can play, which reads as the take having
+/// grown. A source of unknown length is left unbounded, which is the case for
+/// the take still being recorded.
+fn max_end_frame(start_frame: u64, source_start_frame: u64, source_frames: u64) -> u64 {
+    if source_frames == 0 {
+        return u64::MAX;
+    }
+    let available = source_frames.saturating_sub(source_start_frame);
+    start_frame.saturating_add(available.max(1))
+}
+
 /// The height of the unit toggle sitting in the ruler.
 fn ruler_height_inner() -> f32 {
     22.0
@@ -1914,9 +1929,23 @@ impl RustDawApp {
     /// is where the lane starts eating the timeline.
     const CHORD_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.7..=3.0;
 
-    /// Seconds under a timeline x position.
-    fn seconds_at_x(&self, left: f32, x: f32) -> f64 {
-        f64::from(((x - left + self.timeline_scroll_x) / self.pixels_per_second).max(0.0))
+    /// Seconds under an x position **on the ruler**.
+    ///
+    /// The ruler is drawn outside the timeline's scroll area and offsets itself
+    /// by hand, so reading a position off it has to add that offset back.
+    fn ruler_seconds_at(&self, ruler_left: f32, x: f32) -> f64 {
+        f64::from(((x - ruler_left + self.timeline_scroll_x) / self.pixels_per_second).max(0.0))
+    }
+
+    /// Seconds under an x position **inside a track row**.
+    ///
+    /// Track rows live inside the scroll area, which has already translated
+    /// them — [`draw_clip`] places a clip at `track_rect.left() + start` with no
+    /// offset of its own. Adding the scroll here as well would count it twice,
+    /// which is what made a trim at the end of a scrolled timeline stretch the
+    /// clip by however far the view had been scrolled.
+    fn track_seconds_at(&self, track_left: f32, x: f32) -> f64 {
+        f64::from(((x - track_left) / self.pixels_per_second).max(0.0))
     }
 
     /// The timeline ruler: where you are, where you are going, and what is
@@ -1943,14 +1972,14 @@ impl RustDawApp {
         // Dragging marks a loop; a plain click drops the playhead.
         if response.drag_started() {
             if let Some(pointer) = response.interact_pointer_pos() {
-                self.loop_drag_anchor = Some(self.seconds_at_x(ruler.left(), pointer.x));
+                self.loop_drag_anchor = Some(self.ruler_seconds_at(ruler.left(), pointer.x));
             }
         }
         if response.dragged() {
             if let (Some(anchor), Some(pointer)) =
                 (self.loop_drag_anchor, response.interact_pointer_pos())
             {
-                let here = self.seconds_at_x(ruler.left(), pointer.x);
+                let here = self.ruler_seconds_at(ruler.left(), pointer.x);
                 let (from, to) = if here < anchor {
                     (here, anchor)
                 } else {
@@ -1967,13 +1996,22 @@ impl RustDawApp {
             if let (Some(runtime), Some((from, to))) = (&self.runtime, self.loop_range) {
                 runtime.set_loop(to_frame(from), to_frame(to));
                 runtime.seek(daw_core::SamplePosition::new(to_frame(from)));
-                self.status_message =
-                    format!("Looping {from:.2}s – {to:.2}s. Click the ruler to clear.");
+                let playing = matches!(
+                    self.snapshot().transport,
+                    RuntimeTransportState::Playing | RuntimeTransportState::Recording
+                );
+                self.status_message = if playing {
+                    format!("Looping {from:.2}s – {to:.2}s. Click the ruler to clear.")
+                } else {
+                    format!(
+                        "Loop set {from:.2}s – {to:.2}s — press Play. Click the ruler to clear."
+                    )
+                };
             }
         }
         if response.clicked() {
             if let Some(pointer) = response.interact_pointer_pos() {
-                let seconds = self.seconds_at_x(ruler.left(), pointer.x);
+                let seconds = self.ruler_seconds_at(ruler.left(), pointer.x);
                 if let Some(runtime) = &self.runtime {
                     runtime.seek(daw_core::SamplePosition::new(to_frame(seconds)));
                     // A click outside the loop means the loop is no longer what
@@ -2495,7 +2533,11 @@ impl RustDawApp {
                 if frame <= clip.start_frame {
                     return;
                 }
-                clip.end_frame = frame;
+                clip.end_frame = frame.min(max_end_frame(
+                    clip.start_frame,
+                    clip.source_start_frame,
+                    clip.source_frames,
+                ));
             }
             ClipZone::Body => {}
         }
@@ -3659,6 +3701,39 @@ impl RustDawApp {
                             .color(theme::MUTED),
                     );
                     ui.separator();
+                    // Read back from the engine rather than from this side, so
+                    // what is shown is what the audio callback will actually
+                    // act on.
+                    let armed = self.runtime.as_ref().and_then(AudioRuntime::loop_range);
+                    let rate = self
+                        .runtime
+                        .as_ref()
+                        .map_or(48_000, |runtime| runtime.sample_rate().get());
+                    let label = armed.map_or_else(
+                        || "LOOP —".to_owned(),
+                        |(start, end)| {
+                            format!(
+                                "LOOP {:.1}s–{:.1}s",
+                                start as f64 / f64::from(rate),
+                                end as f64 / f64::from(rate)
+                            )
+                        },
+                    );
+                    if ui
+                        .selectable_label(armed.is_some(), label)
+                        .on_hover_text(
+                            "The loop the audio engine is holding.\nDrag the ruler to set one; \
+                             click here to clear it.",
+                        )
+                        .clicked()
+                    {
+                        if let Some(runtime) = &self.runtime {
+                            runtime.clear_loop();
+                        }
+                        self.loop_range = None;
+                        self.status_message = "Loop cleared".to_owned();
+                    }
+                    ui.separator();
                     if ui.selectable_label(self.click_enabled, "CLICK").clicked() {
                         self.click_enabled = !self.click_enabled;
                         self.dirty = true;
@@ -4123,9 +4198,8 @@ impl RustDawApp {
                 // The edge follows the pointer rather than a delta, so a trim
                 // cannot drift away from the cursor over a long drag.
                 if let Some(pointer) = response.interact_pointer_pos() {
-                    let seconds =
-                        (pointer.x - rect.left() + self.timeline_scroll_x) / self.pixels_per_second;
-                    let raw = (seconds.max(0.0) * sample_rate as f32) as u64;
+                    let seconds = self.track_seconds_at(rect.left(), pointer.x);
+                    let raw = (seconds * f64::from(sample_rate)) as u64;
                     let snapped = if ui.ctx().input(|input| input.modifiers.alt) {
                         raw
                     } else {
@@ -5627,6 +5701,18 @@ mod tests {
             color: theme::BLUE_DARK,
             waveform: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_end_edge_cannot_reveal_audio_the_file_does_not_have() {
+        // A ten-second take, untrimmed, dropped at frame 1000.
+        assert_eq!(max_end_frame(1_000, 0, 480_000), 481_000);
+        // Already trimmed 2 s off the front: only 8 s remain to show.
+        assert_eq!(max_end_frame(1_000, 96_000, 480_000), 385_000);
+        // A source still being recorded has no known length yet.
+        assert_eq!(max_end_frame(1_000, 0, 0), u64::MAX);
+        // A window starting past the end still leaves a usable clip.
+        assert_eq!(max_end_frame(1_000, 999_999, 480_000), 1_001);
     }
 
     #[test]

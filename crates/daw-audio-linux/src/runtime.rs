@@ -1364,6 +1364,19 @@ fn input_stream<T: cpal::SizedSample + Copy + Send + 'static>(
         .context("failed to build input stream")
 }
 
+/// Wraps the transport back to the start of the loop once it reaches the end.
+///
+/// `loop_end` of zero means no loop. Pure arithmetic on values the caller has
+/// already loaded, so the audio callback does no work beyond a comparison, and
+/// so the behaviour can be tested without an audio device.
+fn wrap_to_loop(position: u64, loop_start: u64, loop_end: u64) -> u64 {
+    if loop_end > 0 && position >= loop_end {
+        loop_start
+    } else {
+        position
+    }
+}
+
 fn capture_input<T: Copy>(
     data: &[T],
     channels: usize,
@@ -1642,6 +1655,8 @@ fn output_stream<T: cpal::SizedSample + Copy + Send + 'static>(
                 let meter_denominator = shared.meter_denominator.load(Ordering::Relaxed);
                 let click_enabled = shared.click_enabled.load(Ordering::Relaxed);
                 let click_level = f32::from_bits(shared.click_level_bits.load(Ordering::Relaxed));
+                let loop_start = shared.loop_start.load(Ordering::Relaxed);
+                let loop_end = shared.loop_end.load(Ordering::Relaxed);
 
                 for output_chunk in data.chunks_mut(channels * CLICK_SCRATCH_FRAMES) {
                     let frames = output_chunk.len() / channels;
@@ -1706,7 +1721,11 @@ fn output_stream<T: cpal::SizedSample + Copy + Send + 'static>(
                             }
                         }
                         if playing {
-                            position = position.saturating_add(frames as u64);
+                            position = wrap_to_loop(
+                                position.saturating_add(frames as u64),
+                                loop_start,
+                                loop_end,
+                            );
                         }
                     } else {
                         // Pitch-preserving time-stretch. The stretcher pulls the
@@ -1740,17 +1759,16 @@ fn output_stream<T: cpal::SizedSample + Copy + Send + 'static>(
                                     &mut monitor_effects,
                                     &mut monitor_nam,
                                 );
-                                position = position.saturating_add(count as u64);
-                                // Wrap the transport at the end of the loop.
-                                // Checked per render chunk, so the wrap lands
-                                // within one chunk of the mark rather than on
-                                // the exact sample; making it sample-accurate
-                                // means splitting the block, which is not worth
-                                // the complexity until someone can hear it.
-                                let end = shared.loop_end.load(Ordering::Relaxed);
-                                if end > 0 && position >= end {
-                                    position = shared.loop_start.load(Ordering::Relaxed);
-                                }
+                                // Wraps within one render chunk of the mark
+                                // rather than on the exact sample; making it
+                                // sample-accurate means splitting the block,
+                                // which is not worth the complexity until
+                                // someone can hear it.
+                                position = wrap_to_loop(
+                                    position.saturating_add(count as u64),
+                                    loop_start,
+                                    loop_end,
+                                );
                             },
                         );
                         for ((frame, left), right) in output_chunk
@@ -2494,6 +2512,41 @@ mod tests {
     // is exact and the precision warning has nothing to catch.
     #![allow(clippy::cast_precision_loss)]
     use super::*;
+
+    #[test]
+    fn the_transport_wraps_at_the_end_of_the_loop() {
+        // Bar 3 to bar 5, say.
+        let (start, end) = (96_000_u64, 192_000_u64);
+        assert_eq!(
+            wrap_to_loop(100_000, start, end),
+            100_000,
+            "inside, runs on"
+        );
+        assert_eq!(wrap_to_loop(191_999, start, end), 191_999, "up to the mark");
+        assert_eq!(wrap_to_loop(192_000, start, end), start, "and wraps at it");
+        assert_eq!(
+            wrap_to_loop(500_000, start, end),
+            start,
+            "a chunk that overshoots still lands on the start"
+        );
+    }
+
+    #[test]
+    fn no_loop_leaves_the_transport_alone() {
+        // An end of zero is how "no loop" is expressed, so the common case
+        // must pass straight through.
+        for position in [0_u64, 1, 48_000, u64::MAX] {
+            assert_eq!(wrap_to_loop(position, 0, 0), position);
+            assert_eq!(wrap_to_loop(position, 96_000, 0), position);
+        }
+    }
+
+    #[test]
+    fn a_loop_before_the_playhead_pulls_it_back() {
+        // Setting a loop that ends behind where playback already is should
+        // jump back rather than run to the end of the song.
+        assert_eq!(wrap_to_loop(900_000, 10_000, 20_000), 10_000);
+    }
 
     #[test]
     fn a_trimmed_clip_plays_only_its_window_of_the_source() {
