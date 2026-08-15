@@ -567,6 +567,19 @@ what it wrote when it is done — with a **Show in folder** button. A long sessi
 with mastering on takes a second or two to render, during which the window does
 not repaint.
 
+**EXPORT STEMS** writes one WAV per audible track into a `<session> Stems`
+folder you choose. Each stem carries that track's insert chain, gain and pan,
+and they are all the full length of the session, so they line up at zero
+wherever you open them and adding them back together reproduces the mix. Muted
+tracks are left out and a solo is honoured, for the same reason. The mastering
+reference is deliberately not applied: it measures a finished mix as a whole,
+and running it per stem would master each one separately so they no longer sum
+to one song. Instrument tracks are skipped — their MIDI is played by the live
+synthesiser and there is nothing to render offline. A track hotter than full
+scale on its own clips in its stem even where the mix sounds clean, because in
+the mix the other tracks pull the sum back under; the export names any stem that
+happened to, so you know to pull that fader down.
+
 **MASTER…** in the bottom bar, next to **EXPORT MIX**, matches your bounce to a
 record you want yours to sound like. Pick a WAV at the session rate and the
 export is measured against it and brought to meet it — loudness, tone, stereo

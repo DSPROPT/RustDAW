@@ -16,11 +16,108 @@ use std::path::Path;
 ///
 /// Returns an error for missing/unsupported media, sample-rate mismatches, or
 /// output filesystem failures.
-// The offline mix is one pass over every clip through the full insert chain.
-// Splitting it would mean threading the whole per-track state through helpers
-// for no gain in clarity.
-#[allow(clippy::too_many_lines)]
 pub fn export_stereo(project: &ProjectDocument, destination: &Path) -> Result<u64> {
+    let frame_count = render_length(project)?;
+    let mut mix = vec![[0.0_f32; 2]; frame_count];
+
+    for track in audible_tracks(project) {
+        let rendered = render_track(track, project.sample_rate, frame_count)?;
+        for (output, frame) in mix.iter_mut().zip(rendered) {
+            output[0] += frame[0];
+            output[1] += frame[1];
+        }
+    }
+
+    // The master stage. Everything above is the mix; this is the one thing
+    // that looks at it whole, so it runs last and only on the way out.
+    if let Some(reference) = &project.master_reference {
+        master_to_reference(&mut mix, reference, project.sample_rate)?;
+    }
+
+    write_stereo_wav(destination, &mix, project.sample_rate)?;
+    u64::try_from(frame_count).context("session is too long to render")
+}
+
+/// One track written out on its own by [`export_stems`].
+#[derive(Clone, Debug)]
+pub struct StemExport {
+    /// The track's name, as it appears in the mixer.
+    pub track: String,
+    /// The file that was written.
+    pub path: std::path::PathBuf,
+    /// The peak level rendered, before the 24-bit clamp. Over 1.0 means the
+    /// track is hotter than full scale on its own, so the file it was written
+    /// to is clipped — even where the finished mix is not, because other tracks
+    /// pull the sum back under. Fix it by lowering that track's fader.
+    pub peak: f32,
+}
+
+impl StemExport {
+    /// Whether the written file lost signal to the 24-bit ceiling.
+    #[must_use]
+    pub fn clipped(&self) -> bool {
+        self.peak > 1.0
+    }
+}
+
+/// Renders every audible track to its own stereo 24-bit WAV in `directory`.
+///
+/// The stems are what the mix is made of: each one carries that track's insert
+/// chain, gain and pan, and they are all the full length of the session so they
+/// line up at zero wherever they are opened. Summing them reproduces the mix,
+/// which is why muted tracks are left out and a solo is honoured — and why the
+/// mastering reference is *not* applied here. Mastering measures a finished mix
+/// as a whole; running it on each stem separately would master six songs and
+/// they would no longer add up to one.
+///
+/// The sum is exact only while every stem fits in 24 bits. A track hotter than
+/// full scale on its own clips on the way out even where the mix does not — the
+/// other tracks pull the sum back under, but the stem has nothing to pull it.
+/// [`StemExport::clipped`] reports that per stem rather than leaving it as a
+/// difference nobody notices until the stems are used somewhere else.
+///
+/// Instrument tracks are skipped: their MIDI is played by the live synthesiser
+/// and the offline renderer has no audio for them. Only tracks with audio clips
+/// come out, and the returned list says which those were.
+///
+/// # Errors
+///
+/// Returns an error for missing/unsupported media, sample-rate mismatches, or
+/// output filesystem failures.
+pub fn export_stems(project: &ProjectDocument, directory: &Path) -> Result<Vec<StemExport>> {
+    let frame_count = render_length(project)?;
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("failed to create {}", directory.display()))?;
+
+    let mut written = Vec::new();
+    for (index, track) in audible_tracks(project)
+        .filter(|track| !track.clips.is_empty())
+        .enumerate()
+    {
+        let rendered = render_track(track, project.sample_rate, frame_count)?;
+        // Numbered so the files sort in mixer order, and so two tracks sharing
+        // a name do not write over each other.
+        let path = directory.join(format!(
+            "{:02} {}.wav",
+            index + 1,
+            sanitize_file_name(&track.name)
+        ));
+        let peak = rendered
+            .iter()
+            .flat_map(|frame| [frame[0].abs(), frame[1].abs()])
+            .fold(0.0_f32, f32::max);
+        write_stereo_wav(&path, &rendered, project.sample_rate)?;
+        written.push(StemExport {
+            track: track.name.clone(),
+            path,
+            peak,
+        });
+    }
+    Ok(written)
+}
+
+/// How long the rendered session is, in frames: the end of its last clip.
+fn render_length(project: &ProjectDocument) -> Result<usize> {
     let end_frame = project
         .tracks
         .iter()
@@ -28,18 +125,79 @@ pub fn export_stereo(project: &ProjectDocument, destination: &Path) -> Result<u6
         .map(|clip| clip.end_frame)
         .max()
         .unwrap_or(0);
-    let frame_count = usize::try_from(end_frame).context("session is too long to render")?;
-    let mut mix = vec![[0.0_f32; 2]; frame_count];
+    usize::try_from(end_frame).context("session is too long to render")
+}
 
+/// The tracks a listener would hear: unmuted, and soloed if anything is.
+fn audible_tracks(
+    project: &ProjectDocument,
+) -> impl Iterator<Item = &daw_project::ProjectTrack> + '_ {
     let any_solo = project.tracks.iter().any(|track| track.solo);
-    for track in project
+    project
         .tracks
         .iter()
-        .filter(|track| !track.muted && (!any_solo || track.solo))
+        .filter(move |track| !track.muted && (!any_solo || track.solo))
+}
+
+/// Replaces anything awkward in a track name so it can be a file name.
+fn sanitize_file_name(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, '-' | '_' | ' ') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        "Track".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Writes finished frames as a 24-bit stereo WAV, creating the folder if needed.
+fn write_stereo_wav(destination: &Path, frames: &[[f32; 2]], sample_rate: u32) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate,
+        bits_per_sample: 24,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(destination, spec)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+    for frame in frames {
+        writer.write_sample(float_to_i24(frame[0]))?;
+        writer.write_sample(float_to_i24(frame[1]))?;
+    }
+    writer
+        .finalize()
+        .with_context(|| format!("failed to finalize {}", destination.display()))
+}
+
+/// Renders one track's clips into a buffer of `frame_count` frames, through its
+/// insert chain, gain and pan — everything the mix does except the master stage.
+// One pass over the track's clips through the full insert chain. Splitting it
+// would mean threading the whole per-track state through helpers for no gain in
+// clarity.
+#[allow(clippy::too_many_lines)]
+fn render_track(
+    track: &daw_project::ProjectTrack,
+    sample_rate_hz: u32,
+    frame_count: usize,
+) -> Result<Vec<[f32; 2]>> {
+    let mut rendered = vec![[0.0_f32; 2]; frame_count];
     {
         let gain = db_to_gain(track.gain_db);
         let mut processor = ChannelStrip::new(
-            daw_core::SampleRate::new(project.sample_rate)
+            daw_core::SampleRate::new(sample_rate_hz)
                 .context("project sample rate cannot be zero")?,
             ChannelStripParams {
                 nam_enabled: track.effects.nam_enabled,
@@ -74,7 +232,7 @@ pub fn export_stereo(project: &ProjectDocument, destination: &Path) -> Result<u6
                 gate_release_ms: track.effects.gate_release_ms,
             },
         );
-        let sample_rate = daw_core::SampleRate::new(project.sample_rate)
+        let sample_rate = daw_core::SampleRate::new(sample_rate_hz)
             .context("project sample rate cannot be zero")?;
         let mut gate = NoiseGate::new(sample_rate);
         let mut tone = ToneStack::new(sample_rate);
@@ -82,14 +240,14 @@ pub fn export_stereo(project: &ProjectDocument, destination: &Path) -> Result<u6
             track
                 .nam_model
                 .as_deref()
-                .map(|path| NamProcessor::load(path, project.sample_rate, 2_048))
+                .map(|path| NamProcessor::load(path, sample_rate_hz, 2_048))
                 .transpose()
                 .map_err(anyhow::Error::msg)?
         } else {
             None
         };
         for clip in &track.clips {
-            let mut samples = read_wav(&clip.path, project.sample_rate)?;
+            let mut samples = read_wav(&clip.path, sample_rate_hz)?;
             if let Some(nam) = &mut nam {
                 let input_gain = db_to_gain(track.effects.nam_input_db);
                 let normalize = if track.effects.nam_normalize {
@@ -131,50 +289,26 @@ pub fn export_stereo(project: &ProjectDocument, destination: &Path) -> Result<u6
             // trimming and splitting move this offset, and the file is never
             // rewritten.
             let source_start = usize::try_from(clip.source_start_frame).unwrap_or(usize::MAX);
+            let left_pan_gain = if track.pan > 0.0 {
+                1.0 - track.pan
+            } else {
+                1.0
+            };
+            let right_pan_gain = if track.pan < 0.0 {
+                1.0 + track.pan
+            } else {
+                1.0
+            };
             for (offset, frame) in samples.iter().skip(source_start).take(wanted).enumerate() {
-                let Some(output) = mix.get_mut(start.saturating_add(offset)) else {
+                let Some(output) = rendered.get_mut(start.saturating_add(offset)) else {
                     break;
-                };
-                let left_pan_gain = if track.pan > 0.0 {
-                    1.0 - track.pan
-                } else {
-                    1.0
-                };
-                let right_pan_gain = if track.pan < 0.0 {
-                    1.0 + track.pan
-                } else {
-                    1.0
                 };
                 output[0] += frame[0] * gain * left_pan_gain;
                 output[1] += frame[1] * gain * right_pan_gain;
             }
         }
     }
-
-    // The master stage. Everything above is the mix; this is the one thing
-    // that looks at it whole, so it runs last and only on the way out.
-    if let Some(reference) = &project.master_reference {
-        master_to_reference(&mut mix, reference, project.sample_rate)?;
-    }
-
-    if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let spec = hound::WavSpec {
-        channels: 2,
-        sample_rate: project.sample_rate,
-        bits_per_sample: 24,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut writer = hound::WavWriter::create(destination, spec)
-        .with_context(|| format!("failed to create {}", destination.display()))?;
-    for frame in mix {
-        writer.write_sample(float_to_i24(frame[0]))?;
-        writer.write_sample(float_to_i24(frame[1]))?;
-    }
-    writer.finalize().context("failed to finalize mix WAV")?;
-    Ok(end_frame)
+    Ok(rendered)
 }
 
 /// Matches the finished mix to a reference record.
@@ -297,6 +431,118 @@ mod tests {
             writer.write_sample(float_to_i24(sample * 0.9)).unwrap();
         }
         writer.finalize().unwrap();
+    }
+
+    /// Reads a stereo WAV back as interleaved floats.
+    fn read_frames(path: &Path) -> Vec<[f32; 2]> {
+        let mut reader = hound::WavReader::open(path).unwrap();
+        let samples: Vec<f32> = reader
+            .samples::<i32>()
+            .map(|sample| {
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    sample.unwrap() as f32 / 8_388_608.0
+                }
+            })
+            .collect();
+        samples.chunks_exact(2).map(|pair| [pair[0], pair[1]]).collect()
+    }
+
+    fn noise_track(name: &str, source: &Path, seconds: u64) -> ProjectTrack {
+        let mut track = ProjectTrack::new(name, ChannelLayout::Stereo);
+        track.clips.push(ProjectClip {
+            source_start_frame: 0,
+            id: uuid::Uuid::new_v4(),
+            name: "Take".to_owned(),
+            path: source.to_path_buf(),
+            start_frame: 0,
+            end_frame: 48_000 * seconds,
+        });
+        track
+    }
+
+    #[test]
+    fn stems_are_one_file_per_track_that_add_back_up_to_the_mix() {
+        let stem = format!("rustdaw-stems-test-{}", std::process::id());
+        let temp = std::env::temp_dir();
+        let drums = temp.join(format!("{stem}-drums.wav"));
+        let bass = temp.join(format!("{stem}-bass.wav"));
+        let mixed = temp.join(format!("{stem}-mix.wav"));
+        let directory = temp.join(format!("{stem}-stems"));
+        write_noise(&drums, 1, 0.2);
+        write_noise(&bass, 1, 0.1);
+
+        // Gain and pan differ so the sum is only right if each stem carries its
+        // own; the muted track must not appear in either the mix or the stems.
+        let mut drum_track = noise_track("Drums", &drums, 1);
+        drum_track.gain_db = -3.0;
+        drum_track.pan = -0.4;
+        let bass_track = noise_track("Bass / DI", &bass, 1);
+        let mut muted = noise_track("Scratch", &drums, 1);
+        muted.muted = true;
+        let project = ProjectDocument {
+            tracks: vec![drum_track, bass_track, muted],
+            ..ProjectDocument::default()
+        };
+
+        export_stereo(&project, &mixed).unwrap();
+        let written = export_stems(&project, &directory).unwrap();
+
+        assert_eq!(written.len(), 2, "the muted track must not be written");
+        assert_eq!(written[0].path.file_name().unwrap(), "01 Drums.wav");
+        // A slash would have made a directory of it.
+        assert_eq!(written[1].path.file_name().unwrap(), "02 Bass _ DI.wav");
+
+        let mix = read_frames(&mixed);
+        let stems: Vec<Vec<[f32; 2]>> = written.iter().map(|s| read_frames(&s.path)).collect();
+        for stem in &stems {
+            assert_eq!(stem.len(), mix.len(), "stems must be the session's length");
+        }
+        // Nothing here is hot enough to clip, which is the condition under
+        // which the sum is exact.
+        assert!(written.iter().all(|stem| !stem.clipped()));
+        let mut worst = 0.0_f32;
+        for (index, frame) in mix.iter().enumerate() {
+            for channel in 0..2 {
+                let summed: f32 = stems.iter().map(|stem| stem[index][channel]).sum();
+                worst = worst.max((summed - frame[channel]).abs());
+            }
+        }
+        assert!(worst < 1e-5, "stems differ from the mix by {worst}");
+
+        for path in [drums, bass, mixed] {
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_track_hotter_than_full_scale_is_reported_as_a_clipped_stem() {
+        let stem = format!("rustdaw-clip-test-{}", std::process::id());
+        let temp = std::env::temp_dir();
+        let loud = temp.join(format!("{stem}-loud.wav"));
+        let quiet = temp.join(format!("{stem}-quiet.wav"));
+        let directory = temp.join(format!("{stem}-stems"));
+        write_noise(&loud, 1, 0.9);
+        write_noise(&quiet, 1, 0.1);
+
+        // +6 dB on already-loud noise puts this track over the ceiling on its
+        // own, which is exactly the case the mix can hide.
+        let mut hot = noise_track("Hot", &loud, 1);
+        hot.gain_db = 6.0;
+        let project = ProjectDocument {
+            tracks: vec![hot, noise_track("Quiet", &quiet, 1)],
+            ..ProjectDocument::default()
+        };
+
+        let written = export_stems(&project, &directory).unwrap();
+        assert!(written[0].clipped(), "peak was {}", written[0].peak);
+        assert!(!written[1].clipped(), "peak was {}", written[1].peak);
+
+        for path in [loud, quiet] {
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

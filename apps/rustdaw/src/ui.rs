@@ -2409,6 +2409,113 @@ impl RustDawApp {
         }
     }
 
+    /// Exports every audible track as its own WAV, into a folder of stems.
+    fn export_stems(&mut self) {
+        if matches!(
+            self.snapshot().transport,
+            RuntimeTransportState::Recording | RuntimeTransportState::CountIn
+        ) {
+            self.status_message = "Stop recording before exporting".to_owned();
+            self.export_report = Some(ExportReport::failed(
+                "Still recording",
+                "Stop the transport, then export.".to_owned(),
+            ));
+            return;
+        }
+        let any_solo = self.tracks.iter().any(|track| track.solo);
+        let exportable = self
+            .tracks
+            .iter()
+            .filter(|track| !track.clips.is_empty() && !track.muted && (!any_solo || track.solo))
+            .count();
+        if exportable == 0 {
+            self.status_message = "Nothing to export yet".to_owned();
+            self.export_report = Some(ExportReport::failed(
+                "Nothing to export",
+                "No audible track in this session has audio clips.".to_owned(),
+            ));
+            return;
+        }
+
+        let directory = daw_core::media_dir("Exports");
+        let _ = std::fs::create_dir_all(&directory);
+        let Some(chosen) = rfd::FileDialog::new()
+            .set_title("Choose where to put the stems")
+            .set_directory(&directory)
+            .pick_folder()
+        else {
+            self.status_message = "Export cancelled".to_owned();
+            return;
+        };
+        // Its own folder inside the chosen one: a stem export is a dozen files,
+        // and dropping them loose into Music or Desktop would be rude.
+        let target = unique_directory(
+            &chosen,
+            &format!("{} Stems", sanitize_file_name(&self.session_name)),
+        );
+
+        match daw_render::export_stems(&self.project_document(), &target) {
+            Ok(stems) => {
+                // Everything the session has that a stem could not be made of,
+                // said plainly rather than left as a silent difference in count.
+                let mut notes = Vec::new();
+                let instruments = self
+                    .tracks
+                    .iter()
+                    .filter(|track| track.kind.is_instrument())
+                    .count();
+                if instruments > 0 {
+                    notes.push(format!(
+                        "{instruments} instrument track(s) skipped — MIDI is not rendered offline"
+                    ));
+                }
+                let silenced = self
+                    .tracks
+                    .iter()
+                    .filter(|track| {
+                        !track.clips.is_empty() && (track.muted || (any_solo && !track.solo))
+                    })
+                    .count();
+                if silenced > 0 {
+                    notes.push(format!("{silenced} muted track(s) left out"));
+                }
+                if self.master_reference.is_some() {
+                    notes.push("mastering applies to the mix, not to stems".to_owned());
+                }
+                // A track over full scale on its own clips in its stem even
+                // when the mix sounds clean, so it has to be said out loud.
+                let clipped: Vec<&str> = stems
+                    .iter()
+                    .filter(|stem| stem.clipped())
+                    .map(|stem| stem.track.as_str())
+                    .collect();
+                if !clipped.is_empty() {
+                    notes.push(format!(
+                        "clipped on its own, lower the fader: {}",
+                        clipped.join(", ")
+                    ));
+                }
+                self.status_message =
+                    format!("Exported {} stem(s) to {}", stems.len(), target.display());
+                self.export_report = Some(ExportReport::exported(
+                    if notes.is_empty() {
+                        format!("{} stem(s) written.", stems.len())
+                    } else {
+                        format!("{} stem(s) written. {}.", stems.len(), notes.join("; "))
+                    },
+                    target,
+                ));
+            }
+            Err(error) => {
+                self.status_message = format!("{error:#}");
+                self.export_report = Some(ExportReport::failed(
+                    "Stem export failed",
+                    format!("{error:#}"),
+                ));
+            }
+        }
+    }
+
     /// Chooses the record the exported mix is matched to.
     ///
     /// The reference has to be at the session rate for the same reason every
@@ -4612,8 +4719,22 @@ impl eframe::App for RustDawApp {
                     {
                         self.tuner.open = !self.tuner.open;
                     }
-                    if ui.button("EXPORT MIX").clicked() {
+                    if ui
+                        .button("EXPORT MIX")
+                        .on_hover_text("Render the session to one stereo WAV")
+                        .clicked()
+                    {
                         self.export_mix();
+                    }
+                    if ui
+                        .button("EXPORT STEMS")
+                        .on_hover_text(
+                            "Render every audible track to its own WAV, all the same length so \
+                             they line up. They add back up to the mix.",
+                        )
+                        .clicked()
+                    {
+                        self.export_stems();
                     }
                     // The mastering reference sits next to EXPORT MIX because
                     // that is the only thing it affects: it is a property of
@@ -5563,6 +5684,22 @@ fn inspect_import_audio(
 /// session saved today reopens next week by reading the same converted WAV.
 fn import_dir() -> PathBuf {
     daw_core::media_dir("Imports")
+}
+
+/// A folder in `parent` that does not exist yet, so exporting stems twice keeps
+/// both sets rather than writing the second over the first.
+fn unique_directory(parent: &std::path::Path, name: &str) -> PathBuf {
+    let candidate = parent.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    for index in 2..1000 {
+        let candidate = parent.join(format!("{name} {index}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    parent.join(format!("{name} {}", Uuid::new_v4().simple()))
 }
 
 /// A name in `directory` that is not taken yet, so importing the same song
