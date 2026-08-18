@@ -140,18 +140,6 @@ pub fn ingest_project(
         .with_context(|| format!("failed to create {}", audio_dir.display()))?;
 
     let mut notes = Vec::new();
-    if options.transpose_semitones != 0 {
-        notes.push(format!(
-            "Transposed {:+} semitone(s); the drums keep their own pitch.{}",
-            options.transpose_semitones,
-            if has_rubberband() {
-                ""
-            } else {
-                " This ffmpeg has no rubberband filter, so the rougher \
-                 resampling fallback was used."
-            }
-        ));
-    }
     let beats_per_bar = manifest
         .detected_tempo()
         .map_or(4, |detected| detected.beats_per_bar);
@@ -170,15 +158,11 @@ pub fn ingest_project(
             continue;
         }
         let destination = audio_dir.join(format!("{stem_name}.wav"));
-        // Drums are unpitched: moving a kit down four semitones does not put it
-        // in another key, it just makes it sound like a bigger, duller kit. The
-        // rest of the band moves and the drums stay as played.
-        let stem_semitones = if is_percussion(stem_name) {
-            0
-        } else {
-            options.transpose_semitones
-        };
-        let converted = convert_audio(&source, &destination, target_rate, stem_semitones)
+        // Always converted in the key it was recorded in. A transposition is
+        // applied afterwards by the same code that re-keys a session later, so
+        // the session keeps its original audio and changing key again shifts
+        // that rather than shifting a shift.
+        let converted = convert_audio(&source, &destination, target_rate, 0)
             .with_context(|| format!("failed to convert the {stem_name} stem"))?;
 
         if converted.frames == 0 || (options.skip_silent && converted.is_silent()) {
@@ -195,6 +179,7 @@ pub fn ingest_project(
             path: destination,
             start_frame: 0,
             end_frame: converted.frames,
+            source_path: None,
         });
         tracks.push(track);
     }
@@ -273,20 +258,10 @@ pub fn ingest_project(
     }
 
     if options.import_midi {
-        match import_midi_tracks(
-            project_dir,
-            &document.tempo_map(),
-            offset_seconds,
-            options.transpose_semitones,
-        ) {
-            Ok((instrument_tracks, skipped_midi, dropped_notes)) => {
+        match import_midi_tracks(project_dir, &document.tempo_map(), offset_seconds) {
+            Ok((instrument_tracks, skipped_midi)) => {
                 if !skipped_midi.is_empty() {
                     notes.push(format!("MIDI tracks left out: {}", skipped_midi.join(", ")));
-                }
-                if dropped_notes > 0 {
-                    notes.push(format!(
-                        "{dropped_notes} transcribed note(s) fell off the keyboard when transposed."
-                    ));
                 }
                 if instrument_tracks.is_empty() {
                     notes.push("No transcription in this project.".to_owned());
@@ -299,6 +274,37 @@ pub fn ingest_project(
                 }
             }
             Err(error) => notes.push(format!("MIDI could not be imported: {error}")),
+        }
+    }
+
+    // The song is in the key it was recorded in up to here. Moving it is the
+    // same operation as changing key later, so it runs through the same code:
+    // the session keeps its original stems and gains a shifted set beside them.
+    if options.transpose_semitones != 0 {
+        progress(1.0, "key");
+        match crate::rekey::rekey_session(
+            &mut document,
+            &session_dir,
+            options.transpose_semitones,
+            // The import reports its own stages; the re-key's per-stem
+            // progress would need a callback shared across its threads and
+            // buys nothing over the "key" step already shown.
+            &|_, _| {},
+        ) {
+            Ok(rekeyed) => {
+                notes.push(format!(
+                    "Transposed {:+} semitone(s); the drums keep their own pitch.{}",
+                    rekeyed.semitones,
+                    if has_rubberband() {
+                        ""
+                    } else {
+                        " This ffmpeg has no rubberband filter, so the rougher resampling \
+                         fallback was used."
+                    }
+                ));
+                notes.extend(rekeyed.notes);
+            }
+            Err(error) => notes.push(format!("The song could not be transposed: {error:#}")),
         }
     }
 
@@ -496,17 +502,14 @@ fn bar_alignment_offset(bpm: f64, first_downbeat: f64, beats_per_bar: u16) -> f6
 /// Reads `midi/song.mid` and turns each pitched track into an instrument track.
 ///
 /// Returns the tracks and the names of any drum tracks that were left out.
-/// `semitones` moves the transcription with the audio. Returns the tracks, any
-/// track names left out, and how many notes the shift pushed off the keyboard.
 fn import_midi_tracks(
     project_dir: &Path,
     tempo: &TempoMap,
     offset_seconds: f64,
-    semitones: i32,
-) -> Result<(Vec<ProjectTrack>, Vec<String>, usize)> {
+) -> Result<(Vec<ProjectTrack>, Vec<String>)> {
     let path = project_dir.join("midi/song.mid");
     if !path.is_file() {
-        return Ok((Vec::new(), Vec::new(), 0));
+        return Ok((Vec::new(), Vec::new()));
     }
     let bytes =
         std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -524,7 +527,6 @@ fn import_midi_tracks(
 
     let mut tracks = Vec::new();
     let skipped = Vec::new();
-    let mut dropped = 0_usize;
     for source in file.sounding_tracks() {
         let name = if source.name.is_empty() {
             "MIDI".to_owned()
@@ -532,27 +534,13 @@ fn import_midi_tracks(
             title_case(&source.name)
         };
         let mut clip = MidiClip::new(name.clone(), 0, 0);
-        // Channel 10 is a kit map rather than a scale — note 38 is a snare in
-        // every key — so a drum track keeps its numbers while the band moves.
-        let track_semitones = if source.is_drums() { 0 } else { semitones };
         clip.notes = source
             .notes
             .iter()
-            .filter_map(|note| {
-                // A shift can push the lowest or highest notes off the 0-127
-                // keyboard. Those are dropped rather than folded into another
-                // octave, which would put a wrong note in the transcription.
-                let Ok(pitch) = u8::try_from(i32::from(note.pitch) + track_semitones) else {
-                    dropped += 1;
-                    return None;
-                };
-                if pitch > 127 {
-                    dropped += 1;
-                    return None;
-                }
+            .map(|note| {
                 let start = rebase(note.start_tick);
                 let end = rebase(note.end_tick()).max(start + 1);
-                Some(daw_midi::Note::new(pitch, note.velocity, start, end - start))
+                daw_midi::Note::new(note.pitch, note.velocity, start, end - start)
             })
             .collect();
         clip.resort();
@@ -569,7 +557,7 @@ fn import_midi_tracks(
         track.midi_clips.push(clip);
         tracks.push(track);
     }
-    Ok((tracks, skipped, dropped))
+    Ok((tracks, skipped))
 }
 
 /// Resamples one file into the session, reporting its length and peak.
@@ -608,8 +596,11 @@ fn ffmpeg_program() -> std::path::PathBuf {
     std::path::PathBuf::from("ffmpeg")
 }
 
-/// Whether a stem is a drum or a piece of a kit, and so has no key to move.
-fn is_percussion(stem_name: &str) -> bool {
+/// Whether a stem or track is a drum or a piece of a kit, and so has no key to
+/// move. Matched on the name, which is the only thing a stem and the track made
+/// from it have in common once the session is written.
+#[must_use]
+pub fn is_percussion(stem_name: &str) -> bool {
     let name = stem_name.to_ascii_lowercase();
     name == "drums"
         || crate::manifest::DRUMKIT_ORDER
@@ -662,6 +653,47 @@ fn pitch_filter(semitones: i32, rate: u32) -> Option<String> {
         "asetrate={shifted_rate},aresample={rate},atempo={:.9}",
         1.0 / ratio
     ))
+}
+
+/// Shifts one already-converted stem into `destination`, leaving its sample
+/// rate and its length exactly as they are.
+///
+/// Used when a session changes key: unlike [`convert_audio`] there is no
+/// resampling or level measurement to do, because the stem is already at the
+/// session's rate and was measured when it was imported.
+pub(crate) fn convert_pitch(source: &Path, destination: &Path, semitones: i32) -> Result<()> {
+    let rate = hound::WavReader::open(source)
+        .with_context(|| format!("failed to open {}", source.display()))?
+        .spec()
+        .sample_rate;
+    let Some(filter) = pitch_filter(semitones, rate) else {
+        std::fs::copy(source, destination)
+            .with_context(|| format!("failed to copy {}", source.display()))?;
+        return Ok(());
+    };
+    let output = Command::new(ffmpeg_program())
+        .arg("-nostdin")
+        .arg("-y")
+        .args(["-v", "error"])
+        .arg("-i")
+        .arg(source)
+        .args(["-af", &filter])
+        .args(["-c:a", "pcm_s24le"])
+        .arg(destination)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run ffmpeg; install it with `{}`",
+                ffmpeg_install_hint()
+            )
+        })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let reason = detail.lines().last().unwrap_or("ffmpeg failed");
+        let _ = std::fs::remove_file(destination);
+        bail!("ffmpeg could not shift {}: {reason}", source.display());
+    }
+    Ok(())
 }
 
 fn convert_audio(

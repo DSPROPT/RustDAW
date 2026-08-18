@@ -452,6 +452,7 @@ mod tests {
         let mut track = ProjectTrack::new(name, ChannelLayout::Stereo);
         track.clips.push(ProjectClip {
             source_start_frame: 0,
+            source_path: None,
             id: uuid::Uuid::new_v4(),
             name: "Take".to_owned(),
             path: source.to_path_buf(),
@@ -561,6 +562,7 @@ mod tests {
         let mut track = ProjectTrack::new("Mix", ChannelLayout::Stereo);
         track.clips.push(ProjectClip {
             source_start_frame: 0,
+            source_path: None,
             id: uuid::Uuid::new_v4(),
             name: "Take".to_owned(),
             path: source.clone(),
@@ -612,6 +614,7 @@ mod tests {
         let mut track = ProjectTrack::new("Mix", ChannelLayout::Stereo);
         track.clips.push(ProjectClip {
             source_start_frame: 0,
+            source_path: None,
             id: uuid::Uuid::new_v4(),
             name: "Take".to_owned(),
             path: source.clone(),
@@ -654,6 +657,7 @@ mod tests {
         let mut track = ProjectTrack::new("Guitar", ChannelLayout::Mono);
         track.clips.push(ProjectClip {
             source_start_frame: 0,
+            source_path: None,
             id: uuid::Uuid::new_v4(),
             name: "Take".to_owned(),
             path: PathBuf::from(&input),

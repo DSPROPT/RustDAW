@@ -13,6 +13,7 @@
 pub mod client;
 pub mod ingest;
 pub mod manifest;
+pub mod rekey;
 pub mod supervisor;
 
 use anyhow::{Context, Result, bail};
@@ -24,6 +25,7 @@ use std::time::Duration;
 pub use client::{Job, ProjectSummary, WorkerClient};
 pub use ingest::{IngestOptions, Ingested, MAX_TRANSPOSE_SEMITONES};
 pub use manifest::SongManifest;
+pub use rekey::{Rekeyed, forget_other_keys, other_keys_size, rekey_session};
 
 /// How long to wait for a worker we started to come up. Importing torch and
 /// opening CUDA on a cold start is slow; this is deliberately patient.

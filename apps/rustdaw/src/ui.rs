@@ -20,7 +20,7 @@ use daw_project::{
 };
 use daw_songimport::{
     CancelFlag, ImportProgress, ImportSource, IngestOptions, Ingested, MAX_TRANSPOSE_SEMITONES,
-    ProjectSummary,
+    ProjectSummary, Rekeyed,
 };
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
@@ -51,6 +51,9 @@ struct Clip {
     /// Total frames in the source file. The waveform peaks span the whole
     /// file, so this is what says which part of them this clip is showing.
     source_frames: u64,
+    /// The unshifted file this clip was rendered from, when `path` is a
+    /// re-keyed render. Carried so changing key again starts from the original.
+    source_path: Option<PathBuf>,
     color: Color32,
     waveform: Vec<f32>,
 }
@@ -376,6 +379,9 @@ pub struct RustDawApp {
     /// to produce and were previously discarded on the first save.
     chords: Vec<daw_project::ChordEvent>,
     detected_key: Option<String>,
+    /// How far the loaded session has been moved from the key it was imported
+    /// in. Kept beside the document so saving does not lose it.
+    session_transpose: i32,
     /// Whether the chord lane is shown above the tracks.
     chords_open: bool,
     /// A chord-lane size the wheel has changed but that is not on disk yet.
@@ -395,6 +401,12 @@ pub struct RustDawApp {
     dragged_clip: Option<(usize, usize, u64, Vec2)>,
     dirty: bool,
     confirm_new_session: bool,
+    /// The re-key window, open while a key is being chosen.
+    transpose_open: bool,
+    /// The key being auditioned in that window, in semitones from the original.
+    transpose_wanted: i32,
+    /// Receives the re-keyed document from the worker thread.
+    transpose_receiver: Option<Receiver<Result<(ProjectDocument, Rekeyed), String>>>,
     /// The last export's outcome, until the person exporting dismisses it.
     export_report: Option<ExportReport>,
     status_message: String,
@@ -481,6 +493,7 @@ impl RustDawApp {
             master_reference: document.master_reference.clone(),
             chords: document.chords.clone(),
             detected_key: document.key.clone(),
+            session_transpose: document.transpose_semitones,
             chords_open: true,
             chord_scale_unsaved: false,
             clipboard: None,
@@ -492,6 +505,9 @@ impl RustDawApp {
             dragged_clip: None,
             dirty: false,
             confirm_new_session: false,
+            transpose_open: false,
+            transpose_wanted: 0,
+            transpose_receiver: None,
             export_report: None,
             status_message: "Ready".to_owned(),
             pixels_per_second: 84.0,
@@ -924,6 +940,7 @@ impl RustDawApp {
                 start_frame,
                 end_frame,
                 source_start_frame: 0,
+                source_path: None,
                 source_frames,
                 color: theme::BLUE_DARK,
                 waveform,
@@ -1169,6 +1186,7 @@ impl RustDawApp {
             master_reference: self.master_reference.clone(),
             chords: self.chords.clone(),
             key: self.detected_key.clone(),
+            transpose_semitones: self.session_transpose,
             tracks: self.tracks.iter().map(track_to_project).collect(),
             ..ProjectDocument::default()
         }
@@ -1238,6 +1256,7 @@ impl RustDawApp {
                 self.master_reference = document.master_reference.clone();
                 self.chords = document.chords.clone();
                 self.detected_key = document.key.clone();
+                self.session_transpose = document.transpose_semitones;
                 self.tracks = document
                     .tracks
                     .into_iter()
@@ -1319,6 +1338,7 @@ impl RustDawApp {
                         start_frame,
                         end_frame: start_frame.saturating_add(frames),
                         source_start_frame: 0,
+                        source_path: None,
                         source_frames,
                         color: theme::BLUE_DARK,
                     });
@@ -2454,6 +2474,259 @@ impl RustDawApp {
                 self.export_report =
                     Some(ExportReport::failed("Export failed", format!("{error:#}")));
             }
+        }
+    }
+
+    /// Starts moving the loaded session into another key on a worker thread.
+    ///
+    /// The stems are re-rendered from the originals the session already holds,
+    /// so this is a few seconds rather than another import — and a key that has
+    /// been heard before is already on disk and comes back at once.
+    fn start_rekey(&mut self, context: &egui::Context, semitones: i32) {
+        if self.transpose_receiver.is_some() {
+            return;
+        }
+        let Some(session_dir) = self.session_path.parent().map(std::path::Path::to_path_buf) else {
+            self.status_message = "This session has no folder to write the new key into".to_owned();
+            return;
+        };
+        let mut document = self.project_document();
+        let (sender, receiver) = channel();
+        let repaint = context.clone();
+        let spawned = std::thread::Builder::new()
+            .name("rekey".to_owned())
+            .spawn(move || {
+                let outcome =
+                    daw_songimport::rekey_session(&mut document, &session_dir, semitones, &|_, _| {})
+                        .map(|rekeyed| (document, rekeyed))
+                        .map_err(|error| format!("{error:#}"));
+                let _ = sender.send(outcome);
+                repaint.request_repaint();
+            });
+        match spawned {
+            Ok(_) => {
+                self.transpose_receiver = Some(receiver);
+                self.status_message = format!("Moving the song to {semitones:+} semitones…");
+            }
+            Err(error) => self.status_message = format!("Could not start the re-key: {error}"),
+        }
+    }
+
+    /// Moves the re-keyed document into the loaded session.
+    ///
+    /// Only what a key change touches is copied across — the files the clips
+    /// read, the transcription and the chart — so the waveforms already drawn,
+    /// the selection and the undo history all survive it. A shifted stem has
+    /// the same length and envelope as the one it came from, so its peaks are
+    /// still the right picture.
+    fn apply_rekeyed(&mut self, document: &ProjectDocument) {
+        for project_track in &document.tracks {
+            let Some(track) = self
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == project_track.id)
+            else {
+                continue;
+            };
+            for project_clip in &project_track.clips {
+                if let Some(clip) = track
+                    .clips
+                    .iter_mut()
+                    .find(|clip| clip.id == project_clip.id)
+                {
+                    clip.path.clone_from(&project_clip.path);
+                    clip.source_path.clone_from(&project_clip.source_path);
+                }
+            }
+            track.midi_clips.clone_from(&project_track.midi_clips);
+        }
+        self.chords.clone_from(&document.chords);
+        self.detected_key.clone_from(&document.key);
+        self.session_transpose = document.transpose_semitones;
+    }
+
+    /// Takes the re-keyed session from the worker thread once it is ready.
+    fn poll_rekey(&mut self) {
+        let Some(receiver) = self.transpose_receiver.take() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok((document, rekeyed))) => {
+                // The playhead is left where it was: the whole point is to hear
+                // the same passage again in the new key.
+                self.apply_rekeyed(&document);
+                self.dirty = true;
+                self.save_session();
+                let source = if rekeyed.rendered == 0 {
+                    "already rendered".to_owned()
+                } else {
+                    format!("{} stem(s) shifted", rekeyed.rendered)
+                };
+                let key = self
+                    .detected_key
+                    .as_deref()
+                    .map_or_else(String::new, |key| format!(" — now in {key}"));
+                self.status_message = format!(
+                    "Song moved to {:+} semitones ({source}){key}. {}",
+                    rekeyed.semitones,
+                    rekeyed.notes.join(" ")
+                );
+                if let Err(error) = self.sync_playback() {
+                    self.status_message = format!("Key changed; playback preload failed: {error}");
+                }
+            }
+            Ok(Err(error)) => self.status_message = format!("The key could not be changed: {error}"),
+            Err(TryRecvError::Empty) => self.transpose_receiver = Some(receiver),
+            Err(TryRecvError::Disconnected) => {
+                self.status_message = "The re-key stopped before it finished".to_owned();
+            }
+        }
+    }
+
+    /// The window that chooses the key the loaded session plays in.
+    fn transpose_window(&mut self, context: &egui::Context) {
+        if !self.transpose_open {
+            return;
+        }
+        let mut open = self.transpose_open;
+        let mut wanted = None;
+        let mut forget = false;
+        let running = self.transpose_receiver.is_some();
+        let current = self.session_transpose;
+        egui::Window::new("SONG KEY")
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Moves the whole song into another key to rehearse in: the stems, the \
+                         chord chart and the transcription together. The drums are left alone.",
+                    )
+                    .small()
+                    .color(theme::MUTED),
+                );
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Now playing in");
+                    ui.label(
+                        RichText::new(match self.detected_key.as_deref() {
+                            Some(key) => key.to_owned(),
+                            None => "an undetected key".to_owned(),
+                        })
+                        .strong()
+                        .color(theme::BLUE),
+                    );
+                    if current != 0 {
+                        ui.label(
+                            RichText::new(format!("({current:+} from the original)"))
+                                .small()
+                                .color(theme::MUTED),
+                        );
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Move to");
+                    ui.add_enabled(
+                        !running,
+                        egui::DragValue::new(&mut self.transpose_wanted)
+                            .range(-MAX_TRANSPOSE_SEMITONES..=MAX_TRANSPOSE_SEMITONES)
+                            .speed(0.1)
+                            .suffix(" st"),
+                    );
+                    for semitones in [-4, -2, -1, 0, 1, 2, 4] {
+                        let label = if semitones == 0 {
+                            "0".to_owned()
+                        } else {
+                            format!("{semitones:+}")
+                        };
+                        if ui
+                            .add_enabled(
+                                !running,
+                                egui::Button::selectable(
+                                    self.transpose_wanted == semitones,
+                                    label,
+                                ),
+                            )
+                            .clicked()
+                        {
+                            self.transpose_wanted = semitones;
+                        }
+                    }
+                    ui.label(
+                        RichText::new(transpose_description(self.transpose_wanted))
+                            .small()
+                            .color(theme::MUTED),
+                    );
+                });
+                ui.add_space(6.0);
+                if running {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label(RichText::new("Rendering the new key…").small());
+                    });
+                    return;
+                }
+                let changed = self.transpose_wanted != current;
+                if ui
+                    .add_enabled(changed, egui::Button::new("CHANGE KEY"))
+                    .on_hover_text(
+                        "A few seconds the first time. A key you have already heard comes back \
+                         at once, because its render is still on disk.",
+                    )
+                    .clicked()
+                {
+                    wanted = Some(self.transpose_wanted);
+                }
+                if !changed {
+                    ui.label(
+                        RichText::new("The song is already in this key.")
+                            .small()
+                            .color(theme::MUTED),
+                    );
+                }
+                // Every key heard is kept so it comes back at once, which is a
+                // quarter of a gigabyte a time on a three-minute song. Say what
+                // that is costing, and offer to hand it back.
+                if let Some(session_dir) = self.session_path.parent() {
+                    let held = daw_songimport::other_keys_size(session_dir, current);
+                    if held > 0 {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{:.1} GB of other keys kept for instant recall",
+                                    held as f64 / 1_000_000_000.0
+                                ))
+                                .small()
+                                .color(theme::MUTED),
+                            );
+                            if ui.small_button("FORGET THEM").clicked() {
+                                forget = true;
+                            }
+                        });
+                    }
+                }
+            });
+        self.transpose_open = open;
+        if forget {
+            let freed = self
+                .session_path
+                .parent()
+                .map(|directory| daw_songimport::forget_other_keys(directory, current));
+            self.status_message = match freed {
+                Some(Ok(bytes)) => format!(
+                    "Freed {:.1} GB; those keys will render again when asked for",
+                    bytes as f64 / 1_000_000_000.0
+                ),
+                Some(Err(error)) => format!("Could not remove the other keys: {error:#}"),
+                None => "This session has no folder".to_owned(),
+            };
+        }
+        if let Some(semitones) = wanted {
+            self.start_rekey(context, semitones);
         }
     }
 
@@ -4602,6 +4875,7 @@ impl RustDawApp {
                     start_frame: start,
                     end_frame: snapshot.position_frames.max(start + 1),
                     source_start_frame: 0,
+                    source_path: None,
                     source_frames: 0,
                     color: Color32::from_rgb(92, 42, 45),
                     waveform: Vec::new(),
@@ -4743,6 +5017,25 @@ impl eframe::App for RustDawApp {
                         .clicked()
                     {
                         self.open_song_import(context);
+                    }
+                    let key_label = if self.session_transpose == 0 {
+                        "SONG KEY".to_owned()
+                    } else {
+                        format!("SONG KEY ({:+})", self.session_transpose)
+                    };
+                    if ui
+                        .add_enabled(
+                            self.tracks.iter().any(|track| !track.clips.is_empty()),
+                            egui::Button::new(key_label),
+                        )
+                        .on_hover_text(
+                            "Move the loaded song into another key to rehearse in, without \
+                             importing it again",
+                        )
+                        .clicked()
+                    {
+                        self.transpose_wanted = self.session_transpose;
+                        self.transpose_open = true;
                     }
                     if ui
                         .add_enabled(
@@ -5071,8 +5364,10 @@ impl eframe::App for RustDawApp {
         self.inserts_window(context, &snapshot);
         self.run_tuner(context);
         self.poll_song_import(context);
+        self.poll_rekey();
         self.poll_amp_fetch();
         self.song_import_window(context);
+        self.transpose_window(context);
         self.piano_roll_window(context);
     }
 }
@@ -6124,6 +6419,7 @@ fn track_from_project(track: ProjectTrack) -> Track {
                     start_frame: clip.start_frame,
                     end_frame: clip.end_frame,
                     source_start_frame: clip.source_start_frame,
+                    source_path: clip.source_path,
                     color: theme::BLUE_DARK,
                 }
             })
@@ -6158,6 +6454,7 @@ fn track_to_project(track: &Track) -> ProjectTrack {
                 start_frame: clip.start_frame,
                 end_frame: clip.end_frame,
                 source_start_frame: clip.source_start_frame,
+                source_path: clip.source_path.clone(),
             })
             .collect(),
         kind: track.kind,
@@ -6220,6 +6517,7 @@ mod tests {
             start_frame: start,
             end_frame: end,
             source_start_frame: 0,
+            source_path: None,
             source_frames: 0,
             color: theme::BLUE_DARK,
             waveform: Vec::new(),

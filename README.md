@@ -678,13 +678,25 @@ stem, because a kit has no key and moving it down four semitones only makes it
 sound like a duller kit, and the channel-10 drum transcription, where note 38 is
 a snare rather than a pitch.
 
-The setting applies to already-processed songs too, and re-importing one is
-seconds of conversion rather than a separation run — so rehearsing a song at -2
-and at -4 is two imports of the same entry in the list. Each lands in its own
-session named for the shift (`Song (-4 st)`), so they do not overwrite each
-other. Where ffmpeg was built without librubberband, a resampling fallback is
-used instead and the import says so; it is rougher, and the fix is an ffmpeg
-built with rubberband.
+Better still, a song already open does not need importing again: **SONG KEY** in
+the bottom bar moves the loaded session. It shows the key it is playing in, takes
+a new one, and about six seconds later the song is in it — the stems are
+re-rendered from the originals the session keeps beside them, so nothing is
+separated or analysed twice. The playhead, the selection and the undo history
+stay where they were.
+
+Each key is kept under `Audio/Keys/`, which makes going back to one already heard
+immediate rather than another six seconds. That costs roughly a quarter of a
+gigabyte per key on a three-minute song, so the window says how much is being
+held and offers to hand it back; the renders are made again from the originals
+whenever they are next asked for. Because every render starts from the original
+recording, moving down four and then up two is one pitch shift and not two, and
+going back to `0` restores exactly the files that were imported.
+
+The **Transpose** setting in the import window does the same thing on the way in,
+and applies to already-processed songs as well. Where ffmpeg was built without
+librubberband, a resampling fallback is used instead and the import says so; it
+is rougher, and the fix is an ffmpeg built with rubberband.
 
 The separation itself is Demucs and the transcription is basic-pitch, run by a
 self-contained Python worker that ships in this repo under

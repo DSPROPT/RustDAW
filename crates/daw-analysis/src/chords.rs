@@ -129,6 +129,68 @@ pub struct Chord {
     pub bass: Option<u8>,
 }
 
+/// [`PITCH_CLASSES`] as the integer the transposition maths works in.
+const SEMITONES_PER_OCTAVE: i32 = 12;
+
+/// Rewrites a printed chord or key name a number of semitones away.
+///
+/// Works on anything shaped like a root followed by the rest of its name, so it
+/// serves chords (`A#m7/G`, with the slash bass moved too) and key names
+/// (`G minor`) alike. Text it cannot read a root from — `N.C.` for no chord —
+/// comes back unchanged, and everything is respelled with sharps because that
+/// is what [`Chord::name`] writes.
+#[must_use]
+pub fn transpose_label(label: &str, semitones: i32) -> String {
+    if semitones == 0 {
+        return label.to_owned();
+    }
+    match label.split_once('/') {
+        Some((chord, bass)) => {
+            let moved = transpose_root(chord, semitones);
+            let moved_bass = transpose_root(bass, semitones);
+            format!("{moved}/{moved_bass}")
+        }
+        None => transpose_root(label, semitones),
+    }
+}
+
+/// Moves the note name at the start of `text`, keeping whatever follows it.
+fn transpose_root(text: &str, semitones: i32) -> String {
+    let Some((pitch_class, rest)) = split_root(text) else {
+        return text.to_owned();
+    };
+    let moved = (i32::from(pitch_class) + semitones).rem_euclid(SEMITONES_PER_OCTAVE);
+    format!("{}{rest}", NOTE_NAMES[moved as usize])
+}
+
+/// Reads a leading note name, returning its pitch class and the rest.
+fn split_root(text: &str) -> Option<(u8, &str)> {
+    let mut characters = text.char_indices();
+    let (_, letter) = characters.next()?;
+    // A, B, C… are 9, 11, 0…: the scale starts at C but the alphabet at A.
+    let natural: i32 = match letter.to_ascii_uppercase() {
+        'C' => 0,
+        'D' => 2,
+        'E' => 4,
+        'F' => 5,
+        'G' => 7,
+        'A' => 9,
+        'B' => 11,
+        _ => return None,
+    };
+    let (accidental, rest_at): (i32, usize) = match characters.next() {
+        Some((index, '#')) => (1, index + 1),
+        // Flats are read even though they are never written: a chart edited by
+        // hand should still transpose.
+        Some((index, 'b')) => (-1, index + 1),
+        Some((index, _)) => (0, index),
+        None => (0, text.len()),
+    };
+    let pitch_class = (natural + accidental).rem_euclid(SEMITONES_PER_OCTAVE);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some((pitch_class as u8, &text[rest_at..]))
+}
+
 impl Chord {
     #[must_use]
     pub fn name(&self) -> String {
@@ -729,5 +791,38 @@ mod tests {
                 .0
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn labels_move_by_semitones_and_keep_their_quality() {
+        assert_eq!(transpose_label("G", -4), "D#");
+        assert_eq!(transpose_label("D#m", 4), "G m".replace(' ', ""));
+        assert_eq!(transpose_label("G#sus4", -4), "Esus4");
+        assert_eq!(transpose_label("Cmaj7", 1), "C#maj7");
+        // The slash bass moves with the chord, not against it.
+        assert_eq!(transpose_label("A#m7/G", -4), "F#m7/D#");
+        // Wrapping past B comes back round to C rather than running off.
+        assert_eq!(transpose_label("A", 4), "C#");
+        assert_eq!(transpose_label("C", -1), "B");
+    }
+
+    #[test]
+    fn keys_transpose_the_same_way_chords_do() {
+        assert_eq!(transpose_label("G minor", -4), "D# minor");
+        assert_eq!(transpose_label("G major", 4), "B major");
+    }
+
+    #[test]
+    fn what_has_no_root_is_left_alone() {
+        assert_eq!(transpose_label("N.C.", -4), "N.C.");
+        assert_eq!(transpose_label("", 3), "");
+        // A shift of nothing never rewrites anything, flats included.
+        assert_eq!(transpose_label("Bb7", 0), "Bb7");
+    }
+
+    #[test]
+    fn a_flat_is_read_even_though_sharps_are_written() {
+        assert_eq!(transpose_label("Bb", 1), "B");
+        assert_eq!(transpose_label("Eb m", 2), "F m");
     }
 }

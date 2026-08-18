@@ -35,9 +35,18 @@ pub struct ProjectDocument {
     /// The detected chord chart, in timeline order.
     #[serde(default)]
     pub chords: Vec<ChordEvent>,
-    /// The detected key, e.g. "E minor".
+    /// The detected key, e.g. "E minor". Follows [`Self::transpose_semitones`]:
+    /// it names the key the session is in now, not the one it was recorded in.
     #[serde(default)]
     pub key: Option<String>,
+    /// Semitones this session has been moved from the key it came in at.
+    ///
+    /// Set by re-keying a song to rehearse it somewhere else. The audio, the
+    /// chord chart and the transcription have all been moved by this much
+    /// already; it is kept so a further change can be worked out from the
+    /// original rather than piled on top of the last one.
+    #[serde(default)]
+    pub transpose_semitones: i32,
     /// A record the exported mix is matched to, if one has been chosen.
     ///
     /// Additive and optional, so a session written before mastering existed
@@ -80,6 +89,7 @@ impl Default for ProjectDocument {
             tempo_map: None,
             chords: Vec::new(),
             key: None,
+            transpose_semitones: 0,
             master_reference: None,
             tracks: vec![ProjectTrack::new("Audio 1", ChannelLayout::Mono)],
         }
@@ -344,6 +354,15 @@ pub struct ProjectClip {
     /// its file — which is exactly what a default of zero means.
     #[serde(default)]
     pub source_start_frame: u64,
+    /// The unshifted file this clip's audio was rendered from, when [`Self::path`]
+    /// is a re-keyed render rather than the recording itself.
+    ///
+    /// Absent means `path` *is* the original, which is what every session
+    /// written before re-keying existed holds. Keeping it means changing key
+    /// again reads the original each time, so a song moved down four and then
+    /// up two has been through one pitch shift, not two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<PathBuf>,
 }
 
 impl ProjectClip {
@@ -376,6 +395,8 @@ impl ProjectClip {
             start_frame: frame,
             end_frame: self.end_frame,
             source_start_frame: self.source_start_frame.saturating_add(consumed),
+            // Both halves keep reading the same file, re-keyed or not.
+            source_path: self.source_path.clone(),
         };
         self.end_frame = frame;
         Some(right)
@@ -521,6 +542,7 @@ mod tests {
             start_frame: 1_000,
             end_frame: 2_000,
             source_start_frame: 0,
+            source_path: None,
         }
     }
 
@@ -668,6 +690,7 @@ mod tests {
         let mut project = ProjectDocument::default();
         project.tracks[0].clips.push(ProjectClip {
             source_start_frame: 0,
+            source_path: None,
             id: Uuid::new_v4(),
             name: "Take 1".to_owned(),
             path: PathBuf::from("Audio/Take_1.wav"),
