@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub use client::{Job, ProjectSummary, WorkerClient};
-pub use ingest::{IngestOptions, Ingested};
+pub use ingest::{IngestOptions, Ingested, MAX_TRANSPOSE_SEMITONES};
 pub use manifest::SongManifest;
 
 /// How long to wait for a worker we started to come up. Importing torch and

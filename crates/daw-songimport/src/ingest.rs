@@ -45,6 +45,10 @@ pub struct IngestOptions {
     pub import_midi: bool,
     /// Detect the chord chart and the key.
     pub detect_chords: bool,
+    /// Semitones to move the song by, for practising in another key. Negative
+    /// is down. The stems are pitch-shifted without changing their length, so
+    /// the tempo, the beat grid and the bar alignment are unaffected.
+    pub transpose_semitones: i32,
 }
 
 impl Default for IngestOptions {
@@ -58,6 +62,7 @@ impl Default for IngestOptions {
             tempo_hint: daw_analysis::TempoHint::default(),
             import_midi: true,
             detect_chords: true,
+            transpose_semitones: 0,
         }
     }
 }
@@ -113,7 +118,21 @@ pub fn ingest_project(
         sources.extend(manifest.ordered_drumkit());
     }
 
-    let name = manifest.display_name();
+    // The key is part of what this session is: importing the same song at -2
+    // and at -4 to rehearse both should give two obviously different folders,
+    // not "Song" and "Song 2".
+    // Said in words rather than with a sign: "+" is not legal in a file name
+    // and sanitising turns it into an underscore, which left "(+4 st)" and
+    // "(-4 st)" as "__4 st_" and "_-4 st_" side by side in the folder list.
+    let name = match options.transpose_semitones {
+        0 => manifest.display_name(),
+        semitones => format!(
+            "{} ({} st {})",
+            manifest.display_name(),
+            semitones.abs(),
+            if semitones < 0 { "down" } else { "up" }
+        ),
+    };
     let file_stem = sanitize_file_name(&name);
     let session_dir = unique_directory(&options.destination_root, &file_stem)?;
     let audio_dir = session_dir.join("Audio");
@@ -121,6 +140,18 @@ pub fn ingest_project(
         .with_context(|| format!("failed to create {}", audio_dir.display()))?;
 
     let mut notes = Vec::new();
+    if options.transpose_semitones != 0 {
+        notes.push(format!(
+            "Transposed {:+} semitone(s); the drums keep their own pitch.{}",
+            options.transpose_semitones,
+            if has_rubberband() {
+                ""
+            } else {
+                " This ffmpeg has no rubberband filter, so the rougher \
+                 resampling fallback was used."
+            }
+        ));
+    }
     let beats_per_bar = manifest
         .detected_tempo()
         .map_or(4, |detected| detected.beats_per_bar);
@@ -139,7 +170,15 @@ pub fn ingest_project(
             continue;
         }
         let destination = audio_dir.join(format!("{stem_name}.wav"));
-        let converted = convert_audio(&source, &destination, target_rate)
+        // Drums are unpitched: moving a kit down four semitones does not put it
+        // in another key, it just makes it sound like a bigger, duller kit. The
+        // rest of the band moves and the drums stay as played.
+        let stem_semitones = if is_percussion(stem_name) {
+            0
+        } else {
+            options.transpose_semitones
+        };
+        let converted = convert_audio(&source, &destination, target_rate, stem_semitones)
             .with_context(|| format!("failed to convert the {stem_name} stem"))?;
 
         if converted.frames == 0 || (options.skip_silent && converted.is_silent()) {
@@ -234,10 +273,20 @@ pub fn ingest_project(
     }
 
     if options.import_midi {
-        match import_midi_tracks(project_dir, &document.tempo_map(), offset_seconds) {
-            Ok((instrument_tracks, skipped_midi)) => {
+        match import_midi_tracks(
+            project_dir,
+            &document.tempo_map(),
+            offset_seconds,
+            options.transpose_semitones,
+        ) {
+            Ok((instrument_tracks, skipped_midi, dropped_notes)) => {
                 if !skipped_midi.is_empty() {
                     notes.push(format!("MIDI tracks left out: {}", skipped_midi.join(", ")));
+                }
+                if dropped_notes > 0 {
+                    notes.push(format!(
+                        "{dropped_notes} transcribed note(s) fell off the keyboard when transposed."
+                    ));
                 }
                 if instrument_tracks.is_empty() {
                     notes.push("No transcription in this project.".to_owned());
@@ -447,14 +496,17 @@ fn bar_alignment_offset(bpm: f64, first_downbeat: f64, beats_per_bar: u16) -> f6
 /// Reads `midi/song.mid` and turns each pitched track into an instrument track.
 ///
 /// Returns the tracks and the names of any drum tracks that were left out.
+/// `semitones` moves the transcription with the audio. Returns the tracks, any
+/// track names left out, and how many notes the shift pushed off the keyboard.
 fn import_midi_tracks(
     project_dir: &Path,
     tempo: &TempoMap,
     offset_seconds: f64,
-) -> Result<(Vec<ProjectTrack>, Vec<String>)> {
+    semitones: i32,
+) -> Result<(Vec<ProjectTrack>, Vec<String>, usize)> {
     let path = project_dir.join("midi/song.mid");
     if !path.is_file() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), 0));
     }
     let bytes =
         std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -472,6 +524,7 @@ fn import_midi_tracks(
 
     let mut tracks = Vec::new();
     let skipped = Vec::new();
+    let mut dropped = 0_usize;
     for source in file.sounding_tracks() {
         let name = if source.name.is_empty() {
             "MIDI".to_owned()
@@ -479,13 +532,27 @@ fn import_midi_tracks(
             title_case(&source.name)
         };
         let mut clip = MidiClip::new(name.clone(), 0, 0);
+        // Channel 10 is a kit map rather than a scale — note 38 is a snare in
+        // every key — so a drum track keeps its numbers while the band moves.
+        let track_semitones = if source.is_drums() { 0 } else { semitones };
         clip.notes = source
             .notes
             .iter()
-            .map(|note| {
+            .filter_map(|note| {
+                // A shift can push the lowest or highest notes off the 0-127
+                // keyboard. Those are dropped rather than folded into another
+                // octave, which would put a wrong note in the transcription.
+                let Ok(pitch) = u8::try_from(i32::from(note.pitch) + track_semitones) else {
+                    dropped += 1;
+                    return None;
+                };
+                if pitch > 127 {
+                    dropped += 1;
+                    return None;
+                }
                 let start = rebase(note.start_tick);
                 let end = rebase(note.end_tick()).max(start + 1);
-                daw_midi::Note::new(note.pitch, note.velocity, start, end - start)
+                Some(daw_midi::Note::new(pitch, note.velocity, start, end - start))
             })
             .collect();
         clip.resort();
@@ -502,7 +569,7 @@ fn import_midi_tracks(
         track.midi_clips.push(clip);
         tracks.push(track);
     }
-    Ok((tracks, skipped))
+    Ok((tracks, skipped, dropped))
 }
 
 /// Resamples one file into the session, reporting its length and peak.
@@ -541,14 +608,81 @@ fn ffmpeg_program() -> std::path::PathBuf {
     std::path::PathBuf::from("ffmpeg")
 }
 
-fn convert_audio(source: &Path, destination: &Path, target_rate: u32) -> Result<ConvertedAudio> {
+/// Whether a stem is a drum or a piece of a kit, and so has no key to move.
+fn is_percussion(stem_name: &str) -> bool {
+    let name = stem_name.to_ascii_lowercase();
+    name == "drums"
+        || crate::manifest::DRUMKIT_ORDER
+            .iter()
+            .any(|part| name == *part)
+}
+
+/// The widest shift offered. Beyond an octave the fallback filter chain leaves
+/// atempo's supported range, and the result stops being music worth practising
+/// against anyway.
+pub const MAX_TRANSPOSE_SEMITONES: i32 = 12;
+
+/// Whether this ffmpeg was built with librubberband.
+///
+/// Checked once and remembered: it costs a process launch, and every stem of
+/// every import would otherwise ask again.
+fn has_rubberband() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        Command::new(ffmpeg_program())
+            .args(["-hide_banner", "-filters"])
+            .output()
+            .is_ok_and(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.contains(" rubberband "))
+            })
+    })
+}
+
+/// The ffmpeg filter that moves audio by `semitones` while leaving its length
+/// alone, or `None` when there is nothing to shift.
+///
+/// Rubberband is a phase vocoder written for music and is what this should use.
+/// Where ffmpeg was built without it, resampling moves the pitch and `atempo`
+/// puts the length back — cruder, audibly so on a full mix, but it means an
+/// import still transposes on a machine whose ffmpeg is a plain build.
+fn pitch_filter(semitones: i32, rate: u32) -> Option<String> {
+    if semitones == 0 {
+        return None;
+    }
+    let clamped = semitones.clamp(-MAX_TRANSPOSE_SEMITONES, MAX_TRANSPOSE_SEMITONES);
+    let ratio = (f64::from(clamped) / 12.0).exp2();
+    if has_rubberband() {
+        return Some(format!("rubberband=pitch={ratio:.9}"));
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let shifted_rate = (f64::from(rate) * ratio).round() as u32;
+    Some(format!(
+        "asetrate={shifted_rate},aresample={rate},atempo={:.9}",
+        1.0 / ratio
+    ))
+}
+
+fn convert_audio(
+    source: &Path,
+    destination: &Path,
+    target_rate: u32,
+    semitones: i32,
+) -> Result<ConvertedAudio> {
+    let filters = match pitch_filter(semitones, target_rate) {
+        // The shift runs before volumedetect so the peak reported is the one
+        // actually written, not the level before shifting.
+        Some(shift) => format!("{shift},volumedetect"),
+        None => "volumedetect".to_owned(),
+    };
     let output = Command::new(ffmpeg_program())
         .arg("-nostdin")
         .arg("-y")
         .args(["-v", "info"])
         .arg("-i")
         .arg(source)
-        .args(["-af", "volumedetect"])
+        .args(["-af", &filters])
         .args(["-ar", &target_rate.to_string()])
         .args(["-ac", "2"])
         .args(["-c:a", "pcm_s24le"])
@@ -700,6 +834,54 @@ mod tests {
             }
             .is_silent()
         );
+    }
+
+    #[test]
+    fn a_shift_of_nothing_adds_no_filter() {
+        assert!(pitch_filter(0, 48_000).is_none());
+    }
+
+    #[test]
+    fn a_shift_moves_by_equal_temperament() {
+        // Whichever filter this ffmpeg can offer, the ratio in it is the one
+        // twelve-tone equal temperament asks for: an octave down is half.
+        let down_an_octave = pitch_filter(-12, 48_000).expect("a shift");
+        assert!(
+            down_an_octave.contains("0.500000000")
+                || down_an_octave.contains("asetrate=24000"),
+            "{down_an_octave}"
+        );
+        let up_an_octave = pitch_filter(12, 48_000).expect("a shift");
+        assert!(
+            up_an_octave.contains("2.000000000") || up_an_octave.contains("asetrate=96000"),
+            "{up_an_octave}"
+        );
+        // A fifth is 1.4983, not 1.5: tempered, not just intonation.
+        let up_a_fifth = pitch_filter(7, 48_000).expect("a shift");
+        assert!(
+            up_a_fifth.contains("1.498307077") || up_a_fifth.contains("asetrate=71919"),
+            "{up_a_fifth}"
+        );
+    }
+
+    #[test]
+    fn the_fallback_stays_inside_atempos_supported_range() {
+        // atempo refuses anything outside 0.5-100, which is the reason the
+        // shift is capped at an octave.
+        for semitones in [-MAX_TRANSPOSE_SEMITONES, MAX_TRANSPOSE_SEMITONES] {
+            let ratio = (f64::from(semitones) / 12.0).exp2();
+            assert!((0.5..=100.0).contains(&(1.0 / ratio)), "{semitones}");
+        }
+    }
+
+    #[test]
+    fn a_kit_is_recognised_whatever_it_is_called() {
+        for name in ["drums", "Drums", "kick", "snare", "toms", "cymbals"] {
+            assert!(is_percussion(name), "{name}");
+        }
+        for name in ["bass", "guitar", "piano", "other", "vocals", "strings"] {
+            assert!(!is_percussion(name), "{name}");
+        }
     }
 
     #[test]

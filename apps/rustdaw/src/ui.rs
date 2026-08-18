@@ -19,7 +19,8 @@ use daw_project::{
     ProjectClip, ProjectDocument, ProjectTrack, TrackEffects, TrackKind, load, save_atomic,
 };
 use daw_songimport::{
-    CancelFlag, ImportProgress, ImportSource, IngestOptions, Ingested, ProjectSummary,
+    CancelFlag, ImportProgress, ImportSource, IngestOptions, Ingested, MAX_TRANSPOSE_SEMITONES,
+    ProjectSummary,
 };
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
@@ -232,6 +233,9 @@ struct SongImportState {
     /// Index into `TempoHint::PRESETS`. Roughly where to expect the tempo:
     /// fast music imports at half speed without it.
     tempo_hint: usize,
+    /// Semitones to move the song by on the way in, for practising in a key
+    /// that suits the singer. Negative is down.
+    transpose: i32,
     /// Songs the pipeline has already processed; `None` until first loaded.
     catalog: Option<Vec<ProjectSummary>>,
     catalog_error: Option<String>,
@@ -256,6 +260,7 @@ impl Default for SongImportState {
             align_to_bar: true,
             import_midi: true,
             tempo_hint: 0,
+            transpose: 0,
             catalog: None,
             catalog_error: None,
             catalog_receiver: None,
@@ -1397,6 +1402,7 @@ impl RustDawApp {
             tempo_hint: self.song_import.selected_tempo_hint(),
             import_midi: self.song_import.import_midi,
             detect_chords: true,
+            transpose_semitones: self.song_import.transpose,
         };
         let cancel = CancelFlag::new();
         let thread_cancel = cancel.clone();
@@ -1797,6 +1803,48 @@ impl RustDawApp {
                              tempo is still measured from the audio; this only settles the tie, \
                              so a slow song picked as \"very fast\" still reports its own tempo.",
                         );
+                });
+
+                // Singers ask for a lower key at the last minute, so this sits
+                // with the other import options and applies to the songs below
+                // as well: re-importing an already-separated song at another
+                // transposition is a few seconds of conversion.
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Transpose");
+                    ui.add(
+                        egui::DragValue::new(&mut self.song_import.transpose)
+                            .range(-MAX_TRANSPOSE_SEMITONES..=MAX_TRANSPOSE_SEMITONES)
+                            .speed(0.1)
+                            .suffix(" st"),
+                    )
+                    .on_hover_text(
+                        "Moves the song into another key without changing its tempo. The drums \
+                         are left alone — a kit has no key — and the chord chart and \
+                         transcription move with the audio.\nApplies to already-processed songs \
+                         too, so the same song can be imported at two keys to rehearse both.",
+                    );
+                    // Both directions: a singer asking for a higher key is as
+                    // ordinary as one asking for a lower one, and the box beside
+                    // these goes the whole octave either way.
+                    for semitones in [-4, -2, -1, 0, 1, 2, 4] {
+                        let label = if semitones == 0 {
+                            "0".to_owned()
+                        } else {
+                            format!("{semitones:+}")
+                        };
+                        if ui
+                            .selectable_label(self.song_import.transpose == semitones, label)
+                            .clicked()
+                        {
+                            self.song_import.transpose = semitones;
+                        }
+                    }
+                    ui.label(
+                        RichText::new(transpose_description(self.song_import.transpose))
+                            .small()
+                            .color(theme::MUTED),
+                    );
                 });
 
                 ui.separator();
@@ -5606,6 +5654,35 @@ fn draw_midi_clip(
 /// Reads a WAV's layout and length, if it is one this session can play as it
 /// stands: the engine does not resample, so anything else has to be converted
 /// by [`convert_import_audio`] first.
+/// Names a transposition the way a musician would say it, so the number in the
+/// box is not the only thing to go on.
+fn transpose_description(semitones: i32) -> String {
+    const INTERVALS: [&str; 13] = [
+        "unison",
+        "minor 2nd",
+        "major 2nd",
+        "minor 3rd",
+        "major 3rd",
+        "perfect 4th",
+        "tritone",
+        "perfect 5th",
+        "minor 6th",
+        "major 6th",
+        "minor 7th",
+        "major 7th",
+        "octave",
+    ];
+    if semitones == 0 {
+        return "original key".to_owned();
+    }
+    let direction = if semitones < 0 { "down" } else { "up" };
+    let name = INTERVALS
+        .get(semitones.unsigned_abs() as usize)
+        .copied()
+        .unwrap_or("more than an octave");
+    format!("{direction} a {name}")
+}
+
 /// What the last export did, shown in a dialog until it is dismissed.
 ///
 /// The status bar alone was not enough: it is one line at the bottom of a wide

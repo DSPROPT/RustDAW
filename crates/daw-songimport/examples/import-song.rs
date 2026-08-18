@@ -8,6 +8,9 @@
 //! cargo run -p daw-songimport --example import-song -- <url>     # run the pipeline first
 //! cargo run -p daw-songimport --example import-song -- <file>    # …on a local audio file
 //! ```
+//!
+//! A second argument transposes the import, in semitones: `-- <id> -4` imports
+//! the song four semitones down to rehearse in a lower key.
 
 use anyhow::Result;
 use daw_songimport::{CancelFlag, ImportProgress, ImportSource, IngestOptions};
@@ -28,8 +31,13 @@ fn main() -> Result<()> {
         ImportSource::ExistingProject(argument)
     };
 
+    let transpose: i32 = std::env::args()
+        .nth(2)
+        .map_or(Ok(0), |value| value.parse())
+        .expect("the second argument is a number of semitones");
     let options = IngestOptions {
         destination_root: daw_songimport::default_song_root(),
+        transpose_semitones: transpose,
         ..IngestOptions::default()
     };
     let cancel = CancelFlag::new();

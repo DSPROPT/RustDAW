@@ -663,6 +663,29 @@ beat grid, and the notes are rebased through seconds so a transcription written 
 3.10/3.11, and is simply skipped elsewhere, in which case a song imports as stems
 only.
 
+### Practising in another key
+
+Singers ask for a lower key, sometimes on the night. **Transpose** in the import
+window moves the whole song by up to an octave, in semitones, without touching
+its tempo — the stems are pitch-shifted through ffmpeg's rubberband filter, which
+leaves their length exactly as it was, so the beat grid, the bar alignment and
+the click all still line up.
+
+Everything that has a key moves together. The chord chart is detected *after* the
+shift, so it reads in the key you are actually hearing, and the transcribed MIDI
+is transposed by the same interval. Two things deliberately stay put: the drum
+stem, because a kit has no key and moving it down four semitones only makes it
+sound like a duller kit, and the channel-10 drum transcription, where note 38 is
+a snare rather than a pitch.
+
+The setting applies to already-processed songs too, and re-importing one is
+seconds of conversion rather than a separation run — so rehearsing a song at -2
+and at -4 is two imports of the same entry in the list. Each lands in its own
+session named for the shift (`Song (-4 st)`), so they do not overwrite each
+other. Where ffmpeg was built without librubberband, a resampling fallback is
+used instead and the import says so; it is rougher, and the fix is an ffmpeg
+built with rubberband.
+
 The separation itself is Demucs and the transcription is basic-pitch, run by a
 self-contained Python worker that ships in this repo under
 [`crates/daw-songimport/worker`](crates/daw-songimport/worker). Install it once per
