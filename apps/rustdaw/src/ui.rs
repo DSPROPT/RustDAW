@@ -1289,8 +1289,7 @@ impl RustDawApp {
             .add_filter(
                 "Audio",
                 &[
-                    "wav", "wave", "mp3", "flac", "m4a", "aac", "ogg", "opus", "aiff", "aif",
-                    "wma",
+                    "wav", "wave", "mp3", "flac", "m4a", "aac", "ogg", "opus", "aiff", "aif", "wma",
                 ],
             )
             .pick_files()
@@ -2496,10 +2495,14 @@ impl RustDawApp {
         let spawned = std::thread::Builder::new()
             .name("rekey".to_owned())
             .spawn(move || {
-                let outcome =
-                    daw_songimport::rekey_session(&mut document, &session_dir, semitones, &|_, _| {})
-                        .map(|rekeyed| (document, rekeyed))
-                        .map_err(|error| format!("{error:#}"));
+                let outcome = daw_songimport::rekey_session(
+                    &mut document,
+                    &session_dir,
+                    semitones,
+                    &|_, _| {},
+                )
+                .map(|rekeyed| (document, rekeyed))
+                .map_err(|error| format!("{error:#}"));
                 let _ = sender.send(outcome);
                 repaint.request_repaint();
             });
@@ -2575,7 +2578,9 @@ impl RustDawApp {
                     self.status_message = format!("Key changed; playback preload failed: {error}");
                 }
             }
-            Ok(Err(error)) => self.status_message = format!("The key could not be changed: {error}"),
+            Ok(Err(error)) => {
+                self.status_message = format!("The key could not be changed: {error}");
+            }
             Err(TryRecvError::Empty) => self.transpose_receiver = Some(receiver),
             Err(TryRecvError::Disconnected) => {
                 self.status_message = "The re-key stopped before it finished".to_owned();
@@ -2645,10 +2650,7 @@ impl RustDawApp {
                         if ui
                             .add_enabled(
                                 !running,
-                                egui::Button::selectable(
-                                    self.transpose_wanted == semitones,
-                                    label,
-                                ),
+                                egui::Button::selectable(self.transpose_wanted == semitones, label),
                             )
                             .clicked()
                         {
@@ -6135,7 +6137,11 @@ fn convert_import_audio_into(
         .args(["-ar", &expected_rate.to_string()])
         .args([
             "-ac",
-            if layout == ChannelLayout::Mono { "1" } else { "2" },
+            if layout == ChannelLayout::Mono {
+                "1"
+            } else {
+                "2"
+            },
         ])
         .args(["-c:a", "pcm_s24le"])
         .arg(&destination)
@@ -6646,7 +6652,10 @@ mod tests {
     /// uses. Where it is absent the import itself cannot work either, so they
     /// pass rather than fail on a machine that is missing it.
     fn ffmpeg_missing() -> bool {
-        Command::new(ffmpeg_program()).arg("-version").output().is_err()
+        Command::new(ffmpeg_program())
+            .arg("-version")
+            .output()
+            .is_err()
     }
 
     #[test]
@@ -6656,7 +6665,8 @@ mod tests {
         }
         let directory =
             std::env::temp_dir().join(format!("rustdaw-convert-{}", std::process::id()));
-        let source = std::env::temp_dir().join(format!("rustdaw-convert-{}.wav", std::process::id()));
+        let source =
+            std::env::temp_dir().join(format!("rustdaw-convert-{}.wav", std::process::id()));
         write_test_wav(&source, 2, 44_100);
 
         let (converted, layout, frames) =

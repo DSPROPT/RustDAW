@@ -82,7 +82,10 @@ pub fn rekey_session(
         }
     }
 
-    let total = jobs.iter().filter(|(_, _, target)| target.is_some()).count();
+    let total = jobs
+        .iter()
+        .filter(|(_, _, target)| target.is_some())
+        .count();
     if let Some(directory) = jobs
         .iter()
         .find_map(|(_, _, target)| target.as_ref().and_then(|path| path.parent()))
@@ -125,7 +128,9 @@ pub fn rekey_session(
             }));
         }
         for handle in handles {
-            handle.join().map_err(|_| anyhow::anyhow!("a stem conversion panicked"))??;
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("a stem conversion panicked"))??;
         }
         Ok(())
     })?;
@@ -255,15 +260,14 @@ fn transpose_midi(document: &mut ProjectDocument, delta: i32) -> usize {
         }
         for clip in &mut track.midi_clips {
             let before = clip.notes.len();
-            clip.notes.retain_mut(|note| {
-                match u8::try_from(i32::from(note.pitch) + delta) {
+            clip.notes
+                .retain_mut(|note| match u8::try_from(i32::from(note.pitch) + delta) {
                     Ok(pitch) if pitch <= 127 => {
                         note.pitch = pitch;
                         true
                     }
                     _ => false,
-                }
-            });
+                });
             dropped += before - clip.notes.len();
         }
     }

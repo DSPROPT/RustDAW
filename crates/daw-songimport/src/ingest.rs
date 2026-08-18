@@ -879,8 +879,7 @@ mod tests {
         // twelve-tone equal temperament asks for: an octave down is half.
         let down_an_octave = pitch_filter(-12, 48_000).expect("a shift");
         assert!(
-            down_an_octave.contains("0.500000000")
-                || down_an_octave.contains("asetrate=24000"),
+            down_an_octave.contains("0.500000000") || down_an_octave.contains("asetrate=24000"),
             "{down_an_octave}"
         );
         let up_an_octave = pitch_filter(12, 48_000).expect("a shift");

@@ -218,8 +218,8 @@ impl WorkerClient {
     ///
     /// Returns an error if the file cannot be read or the worker rejects it.
     pub fn submit_file(&self, path: &Path) -> Result<Job> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("could not read {}", path.display()))?;
+        let bytes =
+            std::fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
         if bytes.is_empty() {
             bail!("{} is empty", path.display());
         }

@@ -24,10 +24,10 @@ fn main() -> Result<()> {
         document.name, document.transpose_semitones, document.key
     );
     let started = std::time::Instant::now();
-    let outcome = daw_songimport::rekey_session(&mut document, directory, semitones, &|fraction,
-     stem| {
-        println!("  {:.0}% {stem}", fraction * 100.0);
-    })?;
+    let outcome =
+        daw_songimport::rekey_session(&mut document, directory, semitones, &|fraction, stem| {
+            println!("  {:.0}% {stem}", fraction * 100.0);
+        })?;
     daw_project::save_atomic(&document, &path)?;
     println!(
         "after:  {:+} st, key {:?} — {} rendered, {} reused, in {:.1}s",

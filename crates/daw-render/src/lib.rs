@@ -445,7 +445,10 @@ mod tests {
                 }
             })
             .collect();
-        samples.chunks_exact(2).map(|pair| [pair[0], pair[1]]).collect()
+        samples
+            .chunks_exact(2)
+            .map(|pair| [pair[0], pair[1]])
+            .collect()
     }
 
     fn noise_track(name: &str, source: &Path, seconds: u64) -> ProjectTrack {
