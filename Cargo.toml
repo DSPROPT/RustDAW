@@ -4,6 +4,7 @@ members = [
     "apps/rustdaw",
     "crates/daw-analysis",
     "crates/daw-audio-linux",
+    "crates/daw-control",
     "crates/daw-core",
     "crates/daw-engine",
     "crates/daw-master",
@@ -17,7 +18,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.10.5"
+version = "0.10.6"
 edition = "2024"
 license = "GPL-3.0-or-later"
 rust-version = "1.85"
@@ -32,6 +33,7 @@ pedantic = "warn"
 [workspace.dependencies]
 anyhow = "1.0.104"
 crossbeam-queue = "0.3.12"
+midir = "0.11.0"
 cpal = { version = "0.18.1", features = ["pulseaudio"] }
 eframe = "0.33.3"
 hound = "3.5.1"

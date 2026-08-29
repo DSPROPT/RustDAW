@@ -1,3 +1,4 @@
+mod footcontrol;
 mod piano_roll;
 mod theme;
 mod tuner;

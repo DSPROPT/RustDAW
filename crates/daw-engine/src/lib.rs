@@ -10,6 +10,7 @@ pub mod soundfont;
 mod synth;
 pub(crate) mod tone;
 mod transport;
+mod wah;
 
 pub use delay::Delay;
 pub use effects::{ChannelStrip, ChannelStripParams};
@@ -23,3 +24,4 @@ pub use soundfont::{SampledSynth, SoundFontBank, SoundFontError};
 pub use synth::{MAX_VOICES, Synth, midi_to_frequency};
 pub use tone::ToneStack;
 pub use transport::Transport;
+pub use wah::Wah;

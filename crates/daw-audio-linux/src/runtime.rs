@@ -5,7 +5,7 @@ use crossbeam_queue::ArrayQueue;
 use daw_core::{ChannelLayout, SamplePosition, SampleRate};
 use daw_engine::{
     ChannelStrip, ChannelStripParams, GmBank, Metronome, NoiseGate, Reverb, SampledSynth,
-    SoundFontBank, Synth, ToneStack,
+    SoundFontBank, Synth, ToneStack, Wah,
 };
 use daw_midi::ScheduledNote;
 use daw_nam::NamProcessor;
@@ -1516,6 +1516,7 @@ fn output_stream<T: cpal::SizedSample + Copy + Send + 'static>(
     let mut mixer = TrackMixer::new(sample_rate, soundfont)?;
     let mut monitor_effects = ChannelStrip::new(sample_rate, ChannelStripParams::default());
     let mut monitor_nam: Option<ActiveNam> = None;
+    let mut monitor_wah = Wah::new(sample_rate);
     let mut was_playing = false;
     let mut test_phase = 0.0_f32;
     // Pitch-preserving time-stretcher, carried across callbacks so its overlap
@@ -1682,6 +1683,7 @@ fn output_stream<T: cpal::SizedSample + Copy + Send + 'static>(
                             &queues.monitor,
                             &mut monitor_effects,
                             &mut monitor_nam,
+                            &mut monitor_wah,
                         );
                         let test_frames = shared.output_test_frames.load(Ordering::Relaxed);
                         let rendered_test_frames =
@@ -1758,6 +1760,7 @@ fn output_stream<T: cpal::SizedSample + Copy + Send + 'static>(
                                     &queues.monitor,
                                     &mut monitor_effects,
                                     &mut monitor_nam,
+                                    &mut monitor_wah,
                                 );
                                 // Wraps within one render chunk of the mark
                                 // rather than on the exact sample; making it
@@ -1818,6 +1821,7 @@ fn render_source_block(
     monitor_queue: &ArrayQueue<[f32; 2]>,
     monitor_effects: &mut ChannelStrip,
     monitor_nam: &mut Option<ActiveNam>,
+    monitor_wah: &mut Wah,
 ) {
     scratch_left[..frames].fill(0.0);
     scratch_right[..frames].fill(0.0);
@@ -1863,6 +1867,7 @@ fn render_source_block(
         &mut scratch_right[..frames],
         monitor_effects,
         monitor_nam,
+        monitor_wah,
     );
 }
 
@@ -1873,6 +1878,7 @@ fn mix_monitoring(
     output_right: &mut [f32],
     effects: &mut ChannelStrip,
     nam: &mut Option<ActiveNam>,
+    wah: &mut Wah,
 ) {
     if !shared.monitoring.load(Ordering::Acquire) {
         while queue.pop().is_some() {}
@@ -1885,6 +1891,11 @@ fn mix_monitoring(
             *sample = queue
                 .pop()
                 .map_or(0.0, |frame| (frame[0] + frame[1]) * 0.5 * nam.input_gain);
+        }
+        let params = effects.params();
+        // In front of the amp, and mono, which is where a pedal actually is.
+        if params.wah_enabled {
+            wah.process_mono(&mut nam.mono[..count], params.wah_position, params.wah_mix);
         }
         // A failed amp must not mean silence. Whatever went wrong — a block
         // bigger than the model was prepared for, a model that throws — the
@@ -1913,9 +1924,16 @@ fn mix_monitoring(
             *right += processed[0][1];
         }
     } else {
+        // The pedal still works with the amp bypassed or absent: a wah is
+        // not part of the amplifier, and switching one off is not a reason to
+        // lose the other.
+        let params = effects.params();
         for (left, right) in output_left.iter_mut().zip(output_right) {
             if let Some(frame) = queue.pop() {
                 let mut processed = [frame];
+                if params.wah_enabled {
+                    wah.process_stereo(&mut processed, params.wah_position, params.wah_mix);
+                }
                 effects.process_stereo(&mut processed);
                 *left += processed[0][0];
                 *right += processed[0][1];
@@ -2030,6 +2048,10 @@ struct TrackMixer {
     /// reason.
     effects: Vec<ChannelStrip>,
     nam: Vec<Option<ActiveNam>>,
+    /// One wah per track, built whether or not it is switched on. It is a few
+    /// floats, and a pedal that has to be allocated the moment it is stepped
+    /// on is a pedal that allocates on the audio thread.
+    wah: Vec<Wah>,
     scratch: Vec<Vec<[f32; 2]>>,
     synths: Vec<Synth>,
     /// One sound font player per track, when the session has a font. Present or
@@ -2073,6 +2095,9 @@ impl TrackMixer {
                 .map(|_| ChannelStrip::new(sample_rate, ChannelStripParams::default()))
                 .collect(),
             nam: (0..MIXER_TRACK_CAPACITY).map(|_| None).collect(),
+            wah: (0..MIXER_TRACK_CAPACITY)
+                .map(|_| Wah::new(sample_rate))
+                .collect(),
             scratch: (0..MIXER_TRACK_CAPACITY)
                 .map(|_| vec![[0.0_f32; 2]; CLICK_SCRATCH_FRAMES])
                 .collect(),
@@ -2130,6 +2155,9 @@ impl TrackMixer {
         }
         for strip in &mut self.effects {
             strip.clear_tails();
+        }
+        for wah in &mut self.wah {
+            wah.reset();
         }
         self.reverb.clear();
         self.reverb_tail = 0;
@@ -2202,6 +2230,18 @@ impl TrackMixer {
                 continue;
             }
             let scratch = &mut self.scratch[track_id];
+            // A wah is a pedal on the floor in front of the amplifier, so it
+            // runs before the capture rather than in the strip after it. The
+            // two are not interchangeable: sweeping a peak across a signal
+            // that has already been distorted is a thinner, different effect.
+            let params = self.effects[track_id].params();
+            if params.wah_enabled {
+                self.wah[track_id].process_stereo(
+                    &mut scratch[..frame_count],
+                    params.wah_position,
+                    params.wah_mix,
+                );
+            }
             if let Some(nam) = &mut self.nam[track_id] {
                 nam.process_stereo(&mut scratch[..frame_count]);
             }
@@ -3056,6 +3096,7 @@ mod tests {
             &mut right,
             &mut effects,
             &mut None,
+            &mut Wah::new(SampleRate::DEFAULT),
         );
 
         assert!((left[0] - 0.35).abs() < f32::EPSILON);
@@ -3092,6 +3133,7 @@ mod tests {
             &mut right,
             &mut effects,
             &mut None,
+            &mut Wah::new(SampleRate::DEFAULT),
         );
 
         assert!(queue.len() < deep, "the backlog was not trimmed");
@@ -3131,6 +3173,7 @@ mod tests {
             &mut right,
             &mut effects,
             &mut None,
+            &mut Wah::new(SampleRate::DEFAULT),
         );
 
         assert_eq!(
@@ -3183,6 +3226,7 @@ mod tests {
             &mut right,
             &mut effects,
             &mut nam,
+            &mut Wah::new(SampleRate::DEFAULT),
         );
 
         assert!(left.iter().all(|value| value.is_finite()));
@@ -3235,6 +3279,7 @@ mod tests {
             &mut right,
             &mut effects,
             &mut nam,
+            &mut Wah::new(SampleRate::DEFAULT),
         );
 
         assert!(
@@ -3299,6 +3344,7 @@ mod tests {
             &queue,
             &mut effects,
             &mut None,
+            &mut Wah::new(SampleRate::DEFAULT),
         );
         (left, queue)
     }

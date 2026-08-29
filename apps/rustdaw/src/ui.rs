@@ -6,12 +6,14 @@
     clippy::too_many_lines
 )]
 
+use crate::footcontrol::{self, FootControlState, FootPreferences};
 use crate::piano_roll::{self, PianoRollState};
 use crate::theme;
 use daw_audio_linux::{
     AudioRuntime, AudioRuntimeConfig, RuntimeSnapshot, RuntimeTransportState,
     enumerate_pipewire_devices,
 };
+use daw_control::{Action as FootAction, Command as FootCommand};
 use daw_core::{ChannelLayout, SamplePosition};
 use daw_engine::ChannelStripParams;
 use daw_midi::{MidiClip, TempoMap};
@@ -451,6 +453,8 @@ pub struct RustDawApp {
     /// An in-flight TONE3000 download. The flow waits on the user's browser,
     /// so it runs on its own thread and reports back here.
     amp_fetch: Option<Receiver<Result<daw_tone3000::FetchedModel, String>>>,
+    /// The foot controller, and what its switches do.
+    foot: FootControlState,
 }
 
 impl RustDawApp {
@@ -474,6 +478,18 @@ impl RustDawApp {
             .map(track_from_project)
             .collect::<Vec<_>>();
         let (available_inputs, available_outputs) = available_audio_devices();
+        // A pedal that has never been set up gets the four switches these
+        // boxes leave the factory sending, pointed at the first captures on
+        // disk, so it does something the first time it is stepped on. Once
+        // there is a file, it is obeyed as written — including a switch
+        // somebody deliberately unbound.
+        let mut foot = FootControlState::default();
+        if let Ok(saved) = load_foot_preferences() {
+            foot = FootControlState::from_preferences(saved);
+        } else {
+            foot.seed(&daw_nam::discover());
+        }
+        foot.autoconnect();
         let mut app = Self {
             runtime,
             audio_error,
@@ -533,6 +549,7 @@ impl RustDawApp {
             redo_stack: Vec::new(),
             amp_library: daw_nam::discover(),
             amp_fetch: None,
+            foot,
             song_import: SongImportState::default(),
             tempo_map: document_tempo_map,
             piano_roll: PianoRollState::default(),
@@ -3399,6 +3416,199 @@ impl RustDawApp {
         }
     }
 
+    /// Which track a foot switch acts on.
+    ///
+    /// Whatever is being monitored, because that is the guitar in the
+    /// player's hands. The selected track when nothing is, because that is
+    /// the one the channel strip is already showing them.
+    fn foot_target_track(&self) -> Option<usize> {
+        self.tracks
+            .iter()
+            .position(|track| track.monitoring)
+            .or_else(|| (self.selected_track < self.tracks.len()).then_some(self.selected_track))
+    }
+
+    /// Reads the pedal and does what it asked for.
+    fn apply_foot_commands(&mut self) {
+        for command in self.foot.poll() {
+            let (action, position) = match command {
+                FootCommand::Press(action) => (action, None),
+                FootCommand::Move(action, position) => (action, Some(position)),
+            };
+            match action {
+                // The transport belongs to the session rather than to any one
+                // track, so it is dealt with before a track is chosen.
+                FootAction::PlayPause => self.toggle_play(),
+                FootAction::Record => self.toggle_record(),
+                FootAction::Stop => {
+                    if let Some(runtime) = &self.runtime {
+                        runtime.stop();
+                    }
+                    self.finish_recording_clip();
+                }
+                pedalboard => self.apply_foot_action(pedalboard, position),
+            }
+        }
+        if self.foot.dirty {
+            self.foot.dirty = false;
+            if let Err(error) = save_foot_preferences(&self.foot.preferences()) {
+                self.status_message = format!("Foot controller settings were not saved: {error}");
+            }
+        }
+    }
+
+    /// Carries out one switch or pedal movement on the track it is aimed at.
+    fn apply_foot_action(&mut self, action: FootAction, position: Option<f32>) {
+        let Some(index) = self.foot_target_track() else {
+            return;
+        };
+        let mut status = None;
+        let mut lit = None;
+        let (changed, model_changed) = {
+            let library = &self.amp_library;
+            let foot = &self.foot;
+            let Some(track) = self.tracks.get_mut(index) else {
+                return;
+            };
+            let before = track.effects;
+            let before_model = track.nam_model.clone();
+            match action {
+                FootAction::SelectAmp(slot) => {
+                    if let Some(path) = foot.slot(slot) {
+                        track.nam_model = Some(path.clone());
+                        track.effects.nam_enabled = true;
+                        lit = Some(Some(slot));
+                        status = Some(format!(
+                            "Amp {}: {}",
+                            slot.saturating_add(1),
+                            capture_name(path)
+                        ));
+                    } else {
+                        status = Some(format!(
+                            "Amp {} has no capture on it yet",
+                            slot.saturating_add(1)
+                        ));
+                    }
+                }
+                FootAction::NextAmp | FootAction::PreviousAmp => {
+                    let forward = action == FootAction::NextAmp;
+                    if let Some(path) = stepped_amp(library, track.nam_model.as_deref(), forward) {
+                        status = Some(format!("Amp: {}", capture_name(&path)));
+                        track.nam_model = Some(path);
+                        track.effects.nam_enabled = true;
+                        // Stepping leaves the library, not a switch, so no
+                        // switch should be lit as though it had been pressed.
+                        lit = Some(None);
+                    }
+                }
+                FootAction::ToggleAmp => {
+                    track.effects.nam_enabled = !track.effects.nam_enabled;
+                    status = Some(
+                        if track.effects.nam_enabled {
+                            "Amp on"
+                        } else {
+                            "Amp bypassed"
+                        }
+                        .to_owned(),
+                    );
+                }
+                FootAction::ToggleWah => {
+                    track.effects.wah_enabled = !track.effects.wah_enabled;
+                    status = Some(
+                        if track.effects.wah_enabled {
+                            "Wah on"
+                        } else {
+                            "Wah bypassed"
+                        }
+                        .to_owned(),
+                    );
+                }
+                FootAction::WahPedal => {
+                    // Only where the pedal is. Sweeping it does not switch the
+                    // wah on: a foot resting on an expression pedal is not a
+                    // request for an effect nobody asked for.
+                    if let Some(position) = position {
+                        track.effects.wah_position = position.clamp(0.0, 1.0);
+                    }
+                }
+                FootAction::ToggleDelay => {
+                    track.effects.delay_enabled = !track.effects.delay_enabled;
+                    status = Some(
+                        if track.effects.delay_enabled {
+                            "Delay on"
+                        } else {
+                            "Delay off"
+                        }
+                        .to_owned(),
+                    );
+                }
+                FootAction::ToggleReverb => {
+                    track.effects.reverb_enabled = !track.effects.reverb_enabled;
+                    status = Some(
+                        if track.effects.reverb_enabled {
+                            "Reverb on"
+                        } else {
+                            "Reverb off"
+                        }
+                        .to_owned(),
+                    );
+                }
+                // Done before a track is chosen, above.
+                FootAction::PlayPause | FootAction::Record | FootAction::Stop => {}
+            }
+            (
+                track.effects != before || track.nam_model != before_model,
+                track.nam_model != before_model
+                    || track.effects.nam_enabled != before.nam_enabled,
+            )
+        };
+        if let Some(lit) = lit {
+            self.foot.set_active(lit);
+        }
+        if changed {
+            self.dirty = true;
+            if let Some(error) = self.push_track_effects(index, model_changed) {
+                if let Some(track) = self.tracks.get_mut(index) {
+                    track.effects.nam_enabled = false;
+                }
+                status = Some(format!("NAM model failed: {error}"));
+            }
+        }
+        if let Some(status) = status {
+            self.status_message = status;
+        }
+    }
+
+    /// Sends one track's effects to the engine, and to the monitor path too
+    /// when that track is the one being listened to.
+    ///
+    /// Returns the reason a capture would not load, which is the only failure
+    /// worth reporting: the others are a full command queue, and the next
+    /// change carries the same settings again anyway.
+    fn push_track_effects(&self, index: usize, model_changed: bool) -> Option<String> {
+        let runtime = self.runtime.as_ref()?;
+        let track = self.tracks.get(index)?;
+        let params = channel_strip_params(track.effects);
+        let model = track
+            .nam_model
+            .as_deref()
+            .filter(|_| track.effects.nam_enabled);
+        let _ = runtime.set_track_effects(index, params);
+        let mut failure = None;
+        if model_changed {
+            if let Err(error) = runtime.set_track_nam_model(index, model, params) {
+                failure = Some(error.to_string());
+            }
+        }
+        if track.monitoring {
+            let _ = runtime.set_monitor_effects(params);
+            if model_changed {
+                let _ = runtime.set_monitor_nam_model(model, params);
+            }
+        }
+        failure
+    }
+
     /// Feeds the tuner and draws it.
     ///
     /// The tap on the input is opened only while the window is, so a closed
@@ -3525,6 +3735,48 @@ impl RustDawApp {
                             // one row of controls, then the model it is
                             // playing. The tone stack belongs to the amp, not
                             // to the channel EQ beside it.
+                            // In signal order: the wah is a pedal on the
+                            // floor in front of the amp, and the engine runs
+                            // it there.
+                            channel_module(
+                                ui,
+                                "WAH",
+                                track.effects.wah_enabled,
+                                150.0,
+                                |ui| {
+                                    illuminated_toggle(
+                                        ui,
+                                        "WAH IN",
+                                        &mut track.effects.wah_enabled,
+                                        theme::YELLOW,
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.horizontal(|ui| {
+                                        // Shown as percentages of the pedal's
+                                        // travel, which is what an expression
+                                        // pedal sends and what a foot means.
+                                        let mut pedal = track.effects.wah_position * 100.0;
+                                        rotary_knob(
+                                            ui, "PEDAL", &mut pedal, 0.0, 100.0, "%",
+                                            theme::YELLOW,
+                                        );
+                                        set_percentage(&mut track.effects.wah_position, pedal);
+                                        let mut mix = track.effects.wah_mix * 100.0;
+                                        rotary_knob(
+                                            ui, "MIX", &mut mix, 0.0, 100.0, "%", theme::BLUE,
+                                        );
+                                        set_percentage(&mut track.effects.wah_mix, mix);
+                                    });
+                                    ui.label(
+                                        RichText::new(
+                                            "Bind an expression pedal to this in FOOT",
+                                        )
+                                        .small()
+                                        .color(theme::MUTED),
+                                    );
+                                },
+                            );
+
                             channel_module(
                                 ui,
                                 "NEURAL AMP MODELER",
@@ -5063,6 +5315,19 @@ impl eframe::App for RustDawApp {
                         self.tuner.open = !self.tuner.open;
                     }
                     if ui
+                        .selectable_label(self.foot.open, "FOOT")
+                        .on_hover_text(
+                            "Set up a MIDI foot controller: change amps, kick the wah in and \
+                             drive the transport without putting the guitar down.",
+                        )
+                        .clicked()
+                    {
+                        self.foot.open = !self.foot.open;
+                        if self.foot.open {
+                            self.foot.refresh_ports();
+                        }
+                    }
+                    if ui
                         .button("EXPORT MIX")
                         .on_hover_text("Render the session to one stereo WAV")
                         .clicked()
@@ -5365,6 +5630,17 @@ impl eframe::App for RustDawApp {
         self.mixer_window(context, &snapshot);
         self.inserts_window(context, &snapshot);
         self.run_tuner(context);
+        let foot_target = self
+            .foot_target_track()
+            .and_then(|index| self.tracks.get(index))
+            .map(|track| track.name.clone());
+        self.apply_foot_commands();
+        footcontrol::window(
+            context,
+            &mut self.foot,
+            &self.amp_library,
+            foot_target.as_deref(),
+        );
         self.poll_song_import(context);
         self.poll_rekey();
         self.poll_amp_fetch();
@@ -6331,6 +6607,27 @@ fn audio_preferences_path() -> anyhow::Result<PathBuf> {
     Ok(base.join("rustdaw").join("audio.json"))
 }
 
+fn foot_preferences_path() -> anyhow::Result<PathBuf> {
+    Ok(audio_preferences_path()?.with_file_name("foot.json"))
+}
+
+fn load_foot_preferences() -> anyhow::Result<FootPreferences> {
+    let bytes = std::fs::read(foot_preferences_path()?)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn save_foot_preferences(preferences: &FootPreferences) -> anyhow::Result<()> {
+    let path = foot_preferences_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid foot controller preferences path"))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, serde_json::to_vec_pretty(preferences)?)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
 fn load_audio_preferences() -> anyhow::Result<AudioPreferences> {
     let bytes = std::fs::read(audio_preferences_path()?)?;
     Ok(serde_json::from_slice(&bytes)?)
@@ -6472,6 +6769,9 @@ fn track_to_project(track: &Track) -> ProjectTrack {
 
 fn channel_strip_params(effects: TrackEffects) -> ChannelStripParams {
     ChannelStripParams {
+        wah_enabled: effects.wah_enabled,
+        wah_position: effects.wah_position,
+        wah_mix: effects.wah_mix,
         nam_enabled: effects.nam_enabled,
         nam_input_db: effects.nam_input_db,
         nam_output_db: effects.nam_output_db,
@@ -6503,6 +6803,46 @@ fn channel_strip_params(effects: TrackEffects) -> ChannelStripParams {
         gate_threshold_db: effects.gate_threshold_db,
         gate_release_ms: effects.gate_release_ms,
     }
+}
+
+/// Writes a knob's percentage back as a fraction, and only when it moved.
+///
+/// Scaling out and back in again is not exactly lossless, and a control that
+/// reports a change every repaint would leave the session permanently unsaved.
+fn set_percentage(fraction: &mut f32, percentage: f32) {
+    if (percentage - *fraction * 100.0).abs() > 1e-4 {
+        *fraction = (percentage / 100.0).clamp(0.0, 1.0);
+    }
+}
+
+/// A capture's name, as it reads in a message about it.
+fn capture_name(path: &std::path::Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("amp")
+        .to_owned()
+}
+
+/// The capture either side of `current` in the library.
+///
+/// Wraps at both ends: stepping through a library with a foot is a loop, not
+/// something to run off the end of and have to look down to fix.
+fn stepped_amp(
+    library: &[daw_nam::AmpModel],
+    current: Option<&std::path::Path>,
+    forward: bool,
+) -> Option<PathBuf> {
+    let count = library.len();
+    if count == 0 {
+        return None;
+    }
+    let position = current.and_then(|path| library.iter().position(|model| model.path == path));
+    let next = match position {
+        None => 0,
+        Some(index) if forward => (index + 1) % count,
+        Some(index) => (index + count - 1) % count,
+    };
+    library.get(next).map(|model| model.path.clone())
 }
 
 fn moved_start_frame(origin: u64, frame_delta: i64) -> u64 {

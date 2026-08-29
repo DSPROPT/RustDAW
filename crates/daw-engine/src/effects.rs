@@ -8,6 +8,14 @@ use crate::reverb::Reverb;
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChannelStripParams {
+    /// A wah pedal, in front of the amp rather than in the strip. The runtime
+    /// runs it there; it is carried here because it is dialled with the rest
+    /// of the channel and travels on the same updates.
+    pub wah_enabled: bool,
+    /// Where the pedal is, `0` heel-down to `1` toe-down.
+    pub wah_position: f32,
+    /// The wet fraction, `0` to `1`.
+    pub wah_mix: f32,
     pub nam_enabled: bool,
     pub nam_input_db: f32,
     pub nam_output_db: f32,
@@ -54,6 +62,9 @@ pub struct ChannelStripParams {
 impl Default for ChannelStripParams {
     fn default() -> Self {
         Self {
+            wah_enabled: false,
+            wah_position: 0.0,
+            wah_mix: crate::wah::DEFAULT_MIX,
             nam_enabled: false,
             nam_input_db: 0.0,
             nam_output_db: 0.0,

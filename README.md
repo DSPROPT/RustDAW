@@ -9,7 +9,7 @@
 [![CI](https://github.com/DSPROPT/RustDAW/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DSPROPT/RustDAW/actions/workflows/ci.yml)
 [![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-[![Download](https://img.shields.io/badge/download-.deb%20v0.10.5-4ac470.svg)](#install-on-ubuntu)
+[![Download](https://img.shields.io/badge/download-.deb%20v0.10.6-4ac470.svg)](#install-on-ubuntu)
 
 </div>
 
@@ -60,8 +60,8 @@ and [The timeline](#the-timeline). Everything above it is the manual.
 No Rust toolchain needed. Download the package and install it:
 
 ```bash
-wget https://github.com/DSPROPT/RustDAW/raw/main/dist/rustdaw_0.10.5_amd64.deb
-sudo apt install ./rustdaw_0.10.5_amd64.deb
+wget https://github.com/DSPROPT/RustDAW/raw/main/dist/rustdaw_0.10.6_amd64.deb
+sudo apt install ./rustdaw_0.10.6_amd64.deb
 ```
 
 Then launch **RustDAW** from the applications menu, or run `rustdaw` from a
@@ -750,12 +750,12 @@ Build the optimized `.deb` from a source checkout with:
 ./packaging/build-deb.sh
 ```
 
-The package is written to `dist/rustdaw_0.10.5_amd64.deb` and installs the `rustdaw`
+The package is written to `dist/rustdaw_0.10.6_amd64.deb` and installs the `rustdaw`
 executable, desktop launcher, and application icon. Installation is explicit and
 remains under the user's control:
 
 ```bash
-sudo apt install ./dist/rustdaw_0.10.5_amd64.deb
+sudo apt install ./dist/rustdaw_0.10.6_amd64.deb
 ```
 
 The native window embeds the RustDAW icon and the desktop launcher declares

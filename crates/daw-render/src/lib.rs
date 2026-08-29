@@ -1,7 +1,7 @@
 //! Deterministic offline stereo rendering for `RustDAW` sessions.
 
 use anyhow::{Context, Result, bail};
-use daw_engine::{ChannelStrip, ChannelStripParams, NoiseGate, ToneStack};
+use daw_engine::{ChannelStrip, ChannelStripParams, NoiseGate, ToneStack, Wah};
 use daw_nam::NamProcessor;
 use daw_project::ProjectDocument;
 
@@ -200,6 +200,9 @@ fn render_track(
             daw_core::SampleRate::new(sample_rate_hz)
                 .context("project sample rate cannot be zero")?,
             ChannelStripParams {
+                wah_enabled: track.effects.wah_enabled,
+                wah_position: track.effects.wah_position,
+                wah_mix: track.effects.wah_mix,
                 nam_enabled: track.effects.nam_enabled,
                 nam_input_db: track.effects.nam_input_db,
                 nam_output_db: track.effects.nam_output_db,
@@ -236,6 +239,7 @@ fn render_track(
             .context("project sample rate cannot be zero")?;
         let mut gate = NoiseGate::new(sample_rate);
         let mut tone = ToneStack::new(sample_rate);
+        let mut wah = Wah::new(sample_rate);
         let mut nam = if track.effects.nam_enabled {
             track
                 .nam_model
@@ -248,6 +252,16 @@ fn render_track(
         };
         for clip in &track.clips {
             let mut samples = read_wav(&clip.path, sample_rate_hz)?;
+            // In front of the amp, and running whether or not there is one,
+            // exactly as the runtime has it. An export that dropped the wah
+            // would not be the take that was played.
+            if track.effects.wah_enabled {
+                wah.process_stereo(
+                    &mut samples,
+                    track.effects.wah_position,
+                    track.effects.wah_mix,
+                );
+            }
             if let Some(nam) = &mut nam {
                 let input_gain = db_to_gain(track.effects.nam_input_db);
                 let normalize = if track.effects.nam_normalize {

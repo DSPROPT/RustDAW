@@ -12,6 +12,7 @@ daw-audio-linux = { path = "../../crates/daw-audio-linux" }
 daw-master = { path = "../../crates/daw-master" }
 daw-nam = { path = "../../crates/daw-nam" }
 daw-tone3000 = { path = "../../crates/daw-tone3000" }
+daw-control = { path = "../../crates/daw-control" }
 daw-core = { path = "../../crates/daw-core" }
 daw-engine = { path = "../../crates/daw-engine" }
 daw-midi = { path = "../../crates/daw-midi" }

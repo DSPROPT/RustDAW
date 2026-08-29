@@ -252,6 +252,14 @@ impl ProjectTrack {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TrackEffects {
+    /// A wah pedal in front of the amp. Its position is where the expression
+    /// pedal last left it, so a session opens with the pedal where it was.
+    #[serde(default)]
+    pub wah_enabled: bool,
+    #[serde(default)]
+    pub wah_position: f32,
+    #[serde(default = "default_wah_mix")]
+    pub wah_mix: f32,
     #[serde(default)]
     pub nam_enabled: bool,
     #[serde(default)]
@@ -304,6 +312,9 @@ pub struct TrackEffects {
 impl Default for TrackEffects {
     fn default() -> Self {
         Self {
+            wah_enabled: false,
+            wah_position: 0.0,
+            wah_mix: default_wah_mix(),
             nam_enabled: false,
             nam_input_db: 0.0,
             nam_output_db: 0.0,
@@ -506,6 +517,10 @@ fn temporary_path(path: &Path) -> PathBuf {
 /// is worse than an unasked-for noise floor.
 const fn default_nam_gate_db() -> f32 {
     -95.0
+}
+/// Enough dry signal left under the peak to keep the guitar sounding like one.
+const fn default_wah_mix() -> f32 {
+    0.7
 }
 /// Tone controls sit at noon.
 const fn default_tone_position() -> f32 {
