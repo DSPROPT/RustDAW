@@ -53,3 +53,8 @@ uuid = { version = "1.24.0", features = ["serde", "v4"] }
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+[profile.dev]
+# Full DWARF symbols pushed each debug binary past 300 MB; line tables keep
+# backtraces and panic locations while cutting artifact size dramatically.
+debug = "line-tables-only"

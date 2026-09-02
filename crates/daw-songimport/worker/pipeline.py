@@ -361,11 +361,26 @@ def transcribe_muscriptor(source: Path, into: Path, on_progress: ProgressFn) -> 
     )
     if result.returncode != 0 or not destination.is_file():
         destination.unlink(missing_ok=True)
-        tail = (result.stderr or "").strip().splitlines()[-1:] or ["muscriptor failed"]
-        raise RuntimeError(tail[0])
+        raise RuntimeError(_muscriptor_error(result.stderr))
     remove_bar_offset(destination)
     on_progress("transcribe", 100.0, "transcription complete")
     return {"song": "midi/song.mid"}
+
+
+def _muscriptor_error(stderr: str | None) -> str:
+    """The one line worth reporting out of a failed MuScriptor run.
+
+    MuScriptor prints its own failures as ``Error: …`` and then, for the gated
+    weights, several more lines of instructions — so the last line is a footnote
+    ("see the README") and the first ``Error:`` is the actual reason. Anything
+    that fails without one (a crash, a killed process) leaves a traceback, whose
+    last line is the useful part instead.
+    """
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    for line in lines:
+        if line.startswith("Error: "):
+            return line.removeprefix("Error: ")
+    return lines[-1] if lines else "muscriptor failed"
 
 
 def transcribe_basic_pitch(
