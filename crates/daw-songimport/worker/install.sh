@@ -6,13 +6,27 @@
 # launcher that RustDAW discovers automatically. Re-runnable: it updates an
 # existing install in place.
 #
-# Usage: crates/daw-songimport/worker/install.sh
+# Usage: crates/daw-songimport/worker/install.sh [--with-muscriptor]
+#
+# --with-muscriptor also installs the MuScriptor transcription backend into a
+# second virtualenv (RUSTDAW_MUSCRIPTOR=1 does the same). It is opt-in because
+# it is another torch download and because its model weights are CC BY-NC 4.0 —
+# non-commercial — while basic-pitch's are not. See requirements-muscriptor.txt.
 #
 # The heavy model checkpoints (~2-3 GB for Demucs) are NOT downloaded here; they
 # download on the first real import. Only the code and Python packages are set up.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+WITH_MUSCRIPTOR="${RUSTDAW_MUSCRIPTOR:-0}"
+for argument in "$@"; do
+  case "$argument" in
+    --with-muscriptor) WITH_MUSCRIPTOR=1 ;;
+    --no-muscriptor) WITH_MUSCRIPTOR=0 ;;
+    *) echo "error: unknown option $argument" >&2; exit 2 ;;
+  esac
+done
 
 # --- Resolve the data directory, matching supervisor.rs / store.py ------------
 if [ -n "${CHORDS_STUDIO_DATA:-}" ]; then
@@ -84,6 +98,32 @@ if "$DATA_DIR/venv/bin/pip" install -r "$DATA_DIR/app/requirements-transcribe.tx
 else
   echo "    transcription unavailable on this Python/platform — separation, tempo" >&2
   echo "    and chords still work; MIDI transcription is simply skipped." >&2
+fi
+
+# --- Optional: the MuScriptor backend, in its own virtualenv ------------------
+# Separate on purpose. MuScriptor floors NumPy at 2 and beat-this brings its own
+# torch pin, so installing it next to Demucs would re-resolve a separation stack
+# that already works. The worker finds it by path and drives it as a subprocess,
+# so the two never share an interpreter.
+if [ "$WITH_MUSCRIPTOR" = "1" ]; then
+  echo "==> Installing the MuScriptor transcription backend (separate venv)"
+  MUSCRIPTOR_VENV="$DATA_DIR/venv-muscriptor"
+  if [ ! -x "$MUSCRIPTOR_VENV/bin/python" ]; then
+    "$PYTHON" -m venv "$MUSCRIPTOR_VENV"
+  fi
+  "$MUSCRIPTOR_VENV/bin/python" -m pip install --upgrade pip >/dev/null
+  if "$MUSCRIPTOR_VENV/bin/pip" install -r "$DATA_DIR/app/requirements-muscriptor.txt"; then
+    echo "    MuScriptor installed — it becomes the transcription backend."
+    echo "    The weights are gated and non-commercial (CC BY-NC 4.0): accept the"
+    echo "    licence at https://huggingface.co/MuScriptor and authenticate once with"
+    echo "      \"$MUSCRIPTOR_VENV/bin/hf\" auth login"
+    echo "    (or export HF_TOKEN). Until then the import falls back to basic-pitch."
+  else
+    echo "    MuScriptor could not be installed — basic-pitch stays the backend." >&2
+    rm -rf -- "$MUSCRIPTOR_VENV"
+  fi
+else
+  echo "==> Skipping MuScriptor (pass --with-muscriptor to install it)"
 fi
 
 # --- Write the launcher RustDAW starts ---------------------------------------

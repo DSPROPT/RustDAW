@@ -20,7 +20,7 @@
 mod bindings;
 mod calibration;
 
-pub use bindings::{AMP_SLOTS, Action, Binding, Bindings, Command, Trigger};
+pub use bindings::{AMP_SLOTS, Action, Binding, Bindings, Command, PRESET_SLOTS, Trigger};
 pub use calibration::{Calibration, CalibrationRun, Stage};
 
 use crossbeam_queue::ArrayQueue;

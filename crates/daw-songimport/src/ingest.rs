@@ -268,8 +268,13 @@ pub fn ingest_project(
                 } else {
                     let count = instrument_tracks.len();
                     document.tracks.extend(instrument_tracks);
+                    let backend = manifest
+                        .stages
+                        .get("transcribe")
+                        .and_then(|stage| stage.backend.as_deref())
+                        .map_or_else(String::new, |backend| format!(" ({backend})"));
                     notes.push(format!(
-                        "Imported {count} instrument track(s) from the transcription."
+                        "Imported {count} instrument track(s) from the transcription{backend}."
                     ));
                 }
             }

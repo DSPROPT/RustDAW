@@ -1,5 +1,6 @@
 mod footcontrol;
 mod piano_roll;
+mod presets;
 mod theme;
 mod tuner;
 mod ui;

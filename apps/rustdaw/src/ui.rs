@@ -8,6 +8,7 @@
 
 use crate::footcontrol::{self, FootControlState, FootPreferences};
 use crate::piano_roll::{self, PianoRollState};
+use crate::presets::{self, PresetPanel, PresetRequest};
 use crate::theme;
 use daw_audio_linux::{
     AudioRuntime, AudioRuntimeConfig, RuntimeSnapshot, RuntimeTransportState,
@@ -18,7 +19,8 @@ use daw_core::{ChannelLayout, SamplePosition};
 use daw_engine::ChannelStripParams;
 use daw_midi::{MidiClip, TempoMap};
 use daw_project::{
-    ProjectClip, ProjectDocument, ProjectTrack, TrackEffects, TrackKind, load, save_atomic,
+    PresetLibrary, ProjectClip, ProjectDocument, ProjectTrack, TrackEffects, TrackKind, load,
+    save_atomic,
 };
 use daw_songimport::{
     CancelFlag, ImportProgress, ImportSource, IngestOptions, Ingested, MAX_TRANSPOSE_SEMITONES,
@@ -174,6 +176,9 @@ struct Track {
     gain_db: f32,
     pan: f32,
     effects: TrackEffects,
+    /// The preset the strip was last recalled from, so the bar can name it and
+    /// say whether it has been dialled away from since.
+    preset: Option<Uuid>,
     nam_model: Option<PathBuf>,
     clips: Vec<Clip>,
     kind: TrackKind,
@@ -346,6 +351,7 @@ impl Track {
             gain_db: 0.0,
             pan: 0.0,
             effects: TrackEffects::default(),
+            preset: None,
             nam_model: None,
             clips: Vec::new(),
             kind: TrackKind::Audio,
@@ -455,6 +461,12 @@ pub struct RustDawApp {
     amp_fetch: Option<Receiver<Result<daw_tone3000::FetchedModel, String>>>,
     /// The foot controller, and what its switches do.
     foot: FootControlState,
+    /// Every rig saved on this machine, shared by every track and every
+    /// session. Loaded once at startup and written back as it changes.
+    presets: PresetLibrary,
+    /// What the preset bar is in the middle of: a name being typed, a delete
+    /// waiting to be confirmed.
+    preset_panel: PresetPanel,
 }
 
 impl RustDawApp {
@@ -489,6 +501,12 @@ impl RustDawApp {
         } else {
             foot.seed(&daw_nam::discover());
         }
+        // A rig saved before is a rig somebody wants under their foot, so any
+        // that are not on a switch yet are put on the empty ones. A file that
+        // has never been written yields an empty library, which puts nothing
+        // anywhere and says so in both panels.
+        let presets = load_preset_library().unwrap_or_default();
+        foot.seed_presets(&presets);
         foot.autoconnect();
         let mut app = Self {
             runtime,
@@ -550,6 +568,8 @@ impl RustDawApp {
             amp_library: daw_nam::discover(),
             amp_fetch: None,
             foot,
+            presets,
+            preset_panel: PresetPanel::default(),
             song_import: SongImportState::default(),
             tempo_map: document_tempo_map,
             piano_roll: PianoRollState::default(),
@@ -3462,6 +3482,36 @@ impl RustDawApp {
         let Some(index) = self.foot_target_track() else {
             return;
         };
+        // A rig replaces the whole strip at once, so it goes through the same
+        // path the preset bar uses rather than being unpicked into the
+        // module-by-module edits below.
+        match action {
+            FootAction::SelectPreset(slot) => {
+                let Some(id) = self.foot.preset_slot(slot) else {
+                    self.status_message =
+                        format!("Preset {} has no rig on it yet", slot.saturating_add(1));
+                    return;
+                };
+                self.foot.set_active_preset(Some(slot));
+                self.status_message = self.recall_preset(index, id);
+                return;
+            }
+            FootAction::NextPreset | FootAction::PreviousPreset => {
+                let from = self.tracks.get(index).and_then(|track| track.preset);
+                let forward = action == FootAction::NextPreset;
+                let Some(id) = self.presets.stepped(from, forward).map(|preset| preset.id) else {
+                    self.status_message =
+                        "No presets saved yet — build one in the channel strip".to_owned();
+                    return;
+                };
+                // Stepping leaves the library rather than a switch, so no
+                // switch should light up as though it had been pressed.
+                self.foot.set_active_preset(None);
+                self.status_message = self.recall_preset(index, id);
+                return;
+            }
+            _ => {}
+        }
         let mut status = None;
         let mut lit = None;
         let (changed, model_changed) = {
@@ -3553,8 +3603,13 @@ impl RustDawApp {
                         .to_owned(),
                     );
                 }
-                // Done before a track is chosen, above.
-                FootAction::PlayPause | FootAction::Record | FootAction::Stop => {}
+                // Done before a track is chosen, or before this match, above.
+                FootAction::PlayPause
+                | FootAction::Record
+                | FootAction::Stop
+                | FootAction::SelectPreset(_)
+                | FootAction::NextPreset
+                | FootAction::PreviousPreset => {}
             }
             (
                 track.effects != before || track.nam_model != before_model,
@@ -3577,6 +3632,124 @@ impl RustDawApp {
         if let Some(status) = status {
             self.status_message = status;
         }
+    }
+
+    /// Puts a stored rig on a track and tells the engine about it, returning
+    /// what to say about the change.
+    ///
+    /// This is the whole of what a preset switch does: one capture, one wah,
+    /// one tone stack, one set of dynamics and time effects, all landing
+    /// together so the change happens between two bars rather than across a
+    /// dozen mouse movements.
+    fn recall_preset(&mut self, index: usize, id: Uuid) -> String {
+        let Some(preset) = self.presets.get(id).cloned() else {
+            return "That preset is no longer in the library".to_owned();
+        };
+        let Some(track) = self.tracks.get_mut(index) else {
+            return "No track to put a preset on".to_owned();
+        };
+        let before = track.effects;
+        let before_model = track.nam_model.clone();
+        preset.recall(&mut track.effects, &mut track.nam_model);
+        track.preset = Some(id);
+        let model_changed =
+            track.nam_model != before_model || track.effects.nam_enabled != before.nam_enabled;
+        self.dirty = true;
+        // The rig brought its own capture, so whichever amp switch was lit is
+        // no longer the reason the amp sounds the way it does.
+        self.foot.set_active(None);
+        self.preset_panel.reset();
+        if let Some(error) = self.push_track_effects(index, model_changed) {
+            if let Some(track) = self.tracks.get_mut(index) {
+                track.effects.nam_enabled = false;
+            }
+            return format!("{}: the capture would not load — {error}", preset.name);
+        }
+        format!("Preset: {}", preset.name)
+    }
+
+    /// Carries out what the preset bar asked for, on the track it was drawn
+    /// over.
+    fn apply_preset_request(&mut self, index: usize, request: PresetRequest) {
+        self.status_message = match request {
+            PresetRequest::Recall(id) => self.recall_preset(index, id),
+            PresetRequest::Save(id) => {
+                let Some(track) = self.tracks.get(index) else {
+                    return;
+                };
+                let (effects, model) = (track.effects, track.nam_model.clone());
+                if self.presets.update(id, effects, model) {
+                    let name = self.preset_name(id);
+                    self.store_presets()
+                        .unwrap_or_else(|| format!("Saved {name}"))
+                } else {
+                    "That preset is no longer in the library".to_owned()
+                }
+            }
+            PresetRequest::SaveAs(name) => {
+                let Some(track) = self.tracks.get(index) else {
+                    return;
+                };
+                let (effects, model) = (track.effects, track.nam_model.clone());
+                let id = self.presets.add(&name, effects, model);
+                if let Some(track) = self.tracks.get_mut(index) {
+                    track.preset = Some(id);
+                    self.dirty = true;
+                }
+                // Straight onto a free switch: a rig worth saving is a rig
+                // worth being able to step on, and the alternative is a
+                // second trip to another window to say so.
+                self.foot.seed_presets(&self.presets);
+                let name = self.preset_name(id);
+                self.store_presets()
+                    .unwrap_or_else(|| format!("Saved preset {name}"))
+            }
+            PresetRequest::Rename(id, name) => {
+                if self.presets.rename(id, &name) {
+                    let name = self.preset_name(id);
+                    self.store_presets()
+                        .unwrap_or_else(|| format!("Renamed to {name}"))
+                } else {
+                    "That preset is no longer in the library".to_owned()
+                }
+            }
+            PresetRequest::Delete(id) => {
+                let name = self.preset_name(id);
+                if self.presets.remove(id) {
+                    self.foot.forget_preset(id);
+                    // The strip keeps playing what it is playing. Deleting a
+                    // rig throws away the way back to it, not the sound in
+                    // the room.
+                    for track in &mut self.tracks {
+                        if track.preset == Some(id) {
+                            track.preset = None;
+                            self.dirty = true;
+                        }
+                    }
+                    self.store_presets()
+                        .unwrap_or_else(|| format!("Deleted preset {name}"))
+                } else {
+                    "That preset is no longer in the library".to_owned()
+                }
+            }
+        };
+    }
+
+    /// A rig's name, for a message about it.
+    fn preset_name(&self, id: Uuid) -> String {
+        self.presets
+            .get(id)
+            .map_or_else(|| "the preset".to_owned(), |preset| preset.name.clone())
+    }
+
+    /// Writes the library out, reporting only a failure.
+    ///
+    /// A preset that looked saved and was not is the one failure here worth
+    /// interrupting somebody for; the success is already visible in the bar.
+    fn store_presets(&self) -> Option<String> {
+        save_preset_library(&self.presets)
+            .err()
+            .map(|error| format!("Presets were not saved: {error}"))
     }
 
     /// Sends one track's effects to the engine, and to the monitor path too
@@ -3700,10 +3873,23 @@ impl RustDawApp {
         // Set inside the window and acted on once its borrow has ended.
         let mut rescan_amps = false;
         let mut fetch_amp = false;
+        // Set inside the window and carried out below, for the same reason:
+        // the library cannot be written while the strip it describes is
+        // borrowed for editing.
+        let mut preset_request = None;
         let amp_library = &self.amp_library;
+        let preset_library = &self.presets;
+        let preset_panel = &mut self.preset_panel;
         let track = &mut self.tracks[track_index];
         let before = track.effects;
         let before_nam_model = track.nam_model.clone();
+        let current_preset = track.preset;
+        // Whether the strip has been dialled away from the rig it came from.
+        // Recomputed every repaint rather than flagged on edit, so a knob
+        // taken back to where it started stops reading as a change.
+        let preset_modified = current_preset
+            .and_then(|id| preset_library.get(id))
+            .is_some_and(|preset| !preset.holds(&track.effects, track.nam_model.as_deref()));
         let input_peak = if track.layout == ChannelLayout::Mono {
             snapshot.input_peaks[track.input_left.min(3)]
         } else {
@@ -3729,6 +3915,24 @@ impl RustDawApp {
                                 ui.label(RichText::new("v1 · 48 kHz").small().color(theme::MUTED));
                             });
                         });
+                        ui.separator();
+                        // The whole strip under one name, above the modules
+                        // it names: this is the row somebody reaches for
+                        // between two songs, and every one below it is the
+                        // row they reach for while dialling one in.
+                        egui::Frame::new()
+                            .fill(presets::BAR_FILL)
+                            .corner_radius(3.0)
+                            .inner_margin(6.0)
+                            .show(ui, |ui| {
+                                preset_request = presets::bar(
+                                    ui,
+                                    preset_panel,
+                                    preset_library,
+                                    current_preset,
+                                    preset_modified,
+                                );
+                            });
                         ui.separator();
                         ui.horizontal_top(|ui| {
                             // Laid out as the Neural Amp Modeler plugin is:
@@ -4316,6 +4520,9 @@ impl RustDawApp {
                     }
                 }
             }
+        }
+        if let Some(request) = preset_request {
+            self.apply_preset_request(track_index, request);
         }
         if fetch_amp {
             self.start_amp_fetch();
@@ -5639,6 +5846,7 @@ impl eframe::App for RustDawApp {
             context,
             &mut self.foot,
             &self.amp_library,
+            &self.presets,
             foot_target.as_deref(),
         );
         self.poll_song_import(context);
@@ -6611,6 +6819,20 @@ fn foot_preferences_path() -> anyhow::Result<PathBuf> {
     Ok(audio_preferences_path()?.with_file_name("foot.json"))
 }
 
+/// Where the rigs live: beside the preferences rather than in a session, for
+/// the reason [`daw_project::preset`] gives — a rig belongs to the player.
+fn preset_library_path() -> anyhow::Result<PathBuf> {
+    Ok(audio_preferences_path()?.with_file_name("presets.json"))
+}
+
+fn load_preset_library() -> anyhow::Result<PresetLibrary> {
+    daw_project::preset::load(&preset_library_path()?)
+}
+
+fn save_preset_library(library: &PresetLibrary) -> anyhow::Result<()> {
+    daw_project::preset::save(library, &preset_library_path()?)
+}
+
 fn load_foot_preferences() -> anyhow::Result<FootPreferences> {
     let bytes = std::fs::read(foot_preferences_path()?)?;
     Ok(serde_json::from_slice(&bytes)?)
@@ -6707,6 +6929,7 @@ fn track_from_project(track: ProjectTrack) -> Track {
         gain_db: track.gain_db,
         pan: track.pan,
         effects: track.effects,
+        preset: track.preset,
         nam_model: track.nam_model,
         clips: track
             .clips
@@ -6746,6 +6969,7 @@ fn track_to_project(track: &Track) -> ProjectTrack {
         gain_db: track.gain_db,
         pan: track.pan,
         effects: track.effects,
+        preset: track.preset,
         nam_model: track.nam_model.clone(),
         clips: track
             .clips

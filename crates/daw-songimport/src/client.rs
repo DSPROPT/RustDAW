@@ -39,6 +39,10 @@ pub struct HealthModels {
     pub demucs: Option<String>,
     #[serde(default)]
     pub drumsep: bool,
+    /// The `MuScriptor` variant the worker would transcribe with, when that
+    /// backend is installed; `None` leaves the stems to basic-pitch.
+    #[serde(default)]
+    pub muscriptor: Option<String>,
 }
 
 /// One pipeline job. `percent` is 0–100 as sent by the worker.

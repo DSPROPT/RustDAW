@@ -11,6 +11,13 @@ use crate::Message;
 /// and the rest sit unbound.
 pub const AMP_SLOTS: usize = 8;
 
+/// How many whole rigs a pedal can choose between.
+///
+/// The same reasoning as [`AMP_SLOTS`], and the same number: a preset switch
+/// and an amp switch compete for the same feet, and there is no case for
+/// offering fewer of one than the other.
+pub const PRESET_SLOTS: usize = 8;
+
 /// The value at which a switch counts as pressed.
 ///
 /// Switches that send control changes send `127` down and `0` up. Acting on
@@ -65,6 +72,11 @@ pub enum Action {
     NextAmp,
     PreviousAmp,
     ToggleAmp,
+    /// Recall the whole rig in one of the preset slots: the capture, the wah,
+    /// the tone stack, the dynamics and the time effects, all at once.
+    SelectPreset(u8),
+    NextPreset,
+    PreviousPreset,
     ToggleWah,
     /// The expression pedal itself, which sweeps the wah rather than
     /// switching anything.
@@ -83,10 +95,15 @@ impl Action {
         let mut actions: Vec<Self> = (0..AMP_SLOTS)
             .map(|slot| Self::SelectAmp(u8::try_from(slot).unwrap_or(0)))
             .collect();
+        actions.extend(
+            (0..PRESET_SLOTS).map(|slot| Self::SelectPreset(u8::try_from(slot).unwrap_or(0))),
+        );
         actions.extend([
             Self::NextAmp,
             Self::PreviousAmp,
             Self::ToggleAmp,
+            Self::NextPreset,
+            Self::PreviousPreset,
             Self::ToggleWah,
             Self::WahPedal,
             Self::ToggleDelay,
@@ -112,6 +129,9 @@ impl Action {
             Self::NextAmp => "Next amp".to_owned(),
             Self::PreviousAmp => "Previous amp".to_owned(),
             Self::ToggleAmp => "Amp on/off".to_owned(),
+            Self::SelectPreset(slot) => format!("Preset {}", slot.saturating_add(1)),
+            Self::NextPreset => "Next preset".to_owned(),
+            Self::PreviousPreset => "Previous preset".to_owned(),
             Self::ToggleWah => "Wah on/off".to_owned(),
             Self::WahPedal => "Wah pedal".to_owned(),
             Self::ToggleDelay => "Delay on/off".to_owned(),
@@ -358,7 +378,7 @@ mod tests {
     #[test]
     fn every_action_can_be_named_and_offered() {
         let actions = Action::all();
-        assert_eq!(actions.len(), AMP_SLOTS + 10);
+        assert_eq!(actions.len(), AMP_SLOTS + PRESET_SLOTS + 12);
         assert!(actions.iter().all(|action| !action.label().is_empty()));
         assert_eq!(
             actions

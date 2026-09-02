@@ -54,6 +54,10 @@ pub struct SongFiles {
 pub struct StageRecord {
     #[serde(default)]
     pub status: String,
+    /// Which implementation ran the stage, when there is more than one that
+    /// could have. Only transcription writes it so far.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

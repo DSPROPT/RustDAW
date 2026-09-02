@@ -1,8 +1,10 @@
 //! Versioned `RustDAW` project documents and atomic persistence.
 
 pub mod chart;
+pub mod preset;
 
 pub use chart::{ChartBeat, chord_chart, format_chart};
+pub use preset::{ChannelPreset, PresetLibrary};
 
 use anyhow::{Context, Result, bail};
 use daw_core::ChannelLayout;
@@ -172,6 +174,12 @@ pub struct ProjectTrack {
     pub pan: f32,
     #[serde(default)]
     pub effects: TrackEffects,
+    /// The preset this strip was last recalled from, so reopening a session
+    /// knows which rig is on the track and whether it has been dialled away
+    /// from it since. The settings above are the authority either way: a
+    /// preset deleted between sessions changes nothing about how it sounds.
+    #[serde(default)]
+    pub preset: Option<Uuid>,
     /// Neural Amp Modeler capture used by this guitar track.
     #[serde(default)]
     pub nam_model: Option<PathBuf>,
@@ -203,6 +211,7 @@ impl ProjectTrack {
             gain_db: 0.0,
             pan: 0.0,
             effects: TrackEffects::default(),
+            preset: None,
             nam_model: None,
             clips: Vec::new(),
             midi_clips: Vec::new(),
@@ -455,18 +464,26 @@ pub fn save_atomic(document: &ProjectDocument, path: &Path) -> Result<()> {
     if document.version != CURRENT_PROJECT_VERSION {
         bail!("refusing to save an unsupported project version");
     }
+    let bytes = serde_json::to_vec_pretty(document).context("failed to serialize project")?;
+    write_atomic(&bytes, path)
+}
+
+/// Writes bytes to `path` through a sibling temporary file and a rename, so a
+/// crash mid-write leaves the previous file rather than half of a new one.
+pub(crate) fn write_atomic(bytes: &[u8], path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let temporary = temporary_path(path);
-    let bytes = serde_json::to_vec_pretty(document).context("failed to serialize project")?;
     {
         use std::io::Write;
         let mut file = std::fs::File::create(&temporary)
             .with_context(|| format!("failed to create {}", temporary.display()))?;
-        file.write_all(&bytes).context("failed to write project")?;
-        file.sync_all().context("failed to sync project")?;
+        file.write_all(bytes)
+            .with_context(|| format!("failed to write {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", temporary.display()))?;
     }
     std::fs::rename(&temporary, path)
         .with_context(|| format!("failed to replace {}", path.display()))?;

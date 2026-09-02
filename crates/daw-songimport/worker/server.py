@@ -51,6 +51,21 @@ def _demucs_available() -> bool:
     return importlib.util.find_spec("demucs") is not None
 
 
+def _muscriptor() -> str | None:
+    """The MuScriptor variant transcription would run, or None if it is absent.
+
+    Reuses the cached device rather than probing torch again: picking the
+    variant only needs to know whether there is a GPU.
+    """
+    try:
+        from pipeline import muscriptor_binary, muscriptor_model
+    except Exception:  # noqa: BLE001 — health must never fail on a bad import
+        return None
+    if muscriptor_binary() is None:
+        return None
+    return muscriptor_model(_device())
+
+
 def _new_job() -> dict:
     return {
         "id": uuid.uuid4().hex[:12],
@@ -107,6 +122,7 @@ class Handler(BaseHTTPRequestHandler):
                     "models": {
                         "demucs": "htdemucs_6s" if _demucs_available() else None,
                         "drumsep": False,
+                        "muscriptor": _muscriptor(),
                     },
                 },
             )

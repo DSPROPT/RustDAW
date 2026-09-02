@@ -5,6 +5,14 @@ inside the function that needs it, so the HTTP server and the ``store`` self-tes
 keep working before the models are installed, and a missing package surfaces as a
 clear per-stage error instead of an import failure at start-up.
 
+Transcription has two backends. MuScriptor is preferred when it is installed: it
+is multi-instrument, so one pass over the mix replaces one basic-pitch pass per
+stem and brings back the drum kit the per-stem path has to leave out. It lives in
+its own virtualenv (its NumPy 2 floor does not agree with the Demucs stack here)
+and is driven as a subprocess, so nothing it needs is installed alongside these
+packages. basic-pitch stays the fallback, and remains the only backend whose
+weights are free of a non-commercial clause.
+
 The pipeline writes exactly the project layout ``store`` documents and RustDAW
 reads. It does the separation and transcription; RustDAW converts the stems to
 the session rate and builds the session.
@@ -59,8 +67,104 @@ def to_wav(source: Path, into: Path) -> Path:
         raise RuntimeError(f"could not decode audio to WAV: {tail[0]}")
     return destination
 
-# GM program numbers for the melodic stems we transcribe. Drums are a kit and
-# vocals are too noisy to transcribe usefully, so both are left to their stems.
+# MuScriptor delays every note so that bar 1 starts on a real downbeat, and
+# writes the amount into the MIDI as a marker with this prefix.
+MUSCRIPTOR_BAR_OFFSET = "muscriptor:bar_offset="
+
+
+def muscriptor_binary() -> str | None:
+    """The MuScriptor CLI to drive, or ``None`` when it is not installed.
+
+    ``MUSCRIPTOR_BIN`` wins, then the virtualenv ``install.sh --with-muscriptor``
+    creates beside the worker's own, then the PATH — so an install made with uv
+    or pipx is picked up without any of ours.
+    """
+    override = os.environ.get("MUSCRIPTOR_BIN")
+    if override:
+        return override if Path(override).is_file() else None
+    from store import data_dir
+
+    candidate = data_dir() / "venv-muscriptor" / "bin" / "muscriptor"
+    if candidate.is_file():
+        return str(candidate)
+    return shutil.which("muscriptor")
+
+
+def muscriptor_model(device: str | None = None) -> str:
+    """Which published variant to run.
+
+    ``medium`` is MuScriptor's own default and wants a GPU. It decodes
+    autoregressively over five-second chunks, which on a CPU-only machine takes
+    long enough to dominate the whole import, so ``small`` is used there
+    instead. ``MUSCRIPTOR_MODEL`` overrides both.
+    """
+    override = os.environ.get("MUSCRIPTOR_MODEL")
+    if override:
+        return override
+    return "small" if (device or torch_device()) == "cpu" else "medium"
+
+
+def remove_bar_offset(path: Path) -> None:
+    """Move a MuScriptor transcription back onto audio time, in place.
+
+    A MIDI file has no pickup measure — bar 1 starts at tick 0 — so the only way
+    to put a bar line on the first downbeat is to delay the music, by up to a
+    whole bar. RustDAW lays the transcription against the stems on a beat grid it
+    detects itself, where that delay is not alignment but a bar of drift, so it
+    comes back out. The marker records exactly how much, including the lag
+    correction already applied to the model's onsets, so subtracting it leaves
+    the notes where they sound in the audio.
+    """
+    import mido
+
+    midi = mido.MidiFile(str(path))
+    offset_seconds: float | None = None
+    tempo = 500_000
+    for track in midi.tracks:
+        for message in track:
+            if message.type == "set_tempo":
+                tempo = message.tempo
+            elif message.type == "marker" and message.text.startswith(MUSCRIPTOR_BAR_OFFSET):
+                try:
+                    offset_seconds = float(message.text.removeprefix(MUSCRIPTOR_BAR_OFFSET))
+                except ValueError:
+                    offset_seconds = None
+    if not offset_seconds:
+        return
+    shift = round(offset_seconds * 1_000_000 * midi.ticks_per_beat / tempo)
+    if shift <= 0:
+        return
+
+    for track in midi.tracks:
+        absolute = 0
+        moved: list[tuple[int, object]] = []
+        for message in track:
+            absolute += message.time
+            if message.type == "marker" and message.text.startswith(MUSCRIPTOR_BAR_OFFSET):
+                # Dropped with the shift it describes, so that reading this file
+                # again does not delay it a second time.
+                continue
+            # Only the notes were delayed; the tempo, the time signature and the
+            # end of track stay where they are. Clamping at zero costs at most
+            # the lag correction (~25 ms) on the very first notes, which is the
+            # only way any of them can land before the start.
+            when = absolute if message.is_meta else max(0, absolute - shift)
+            moved.append((when, message))
+        # Stable, so a meta event and a note that now share a tick keep the
+        # order they were written in.
+        moved.sort(key=lambda pair: pair[0])
+        previous = 0
+        for when, message in moved:
+            message.time = when - previous
+            previous = when
+        track[:] = [message for _, message in moved]
+    midi.save(str(path))
+
+
+# GM program numbers for the melodic stems basic-pitch transcribes. Drums are a
+# kit and vocals are too noisy to transcribe usefully, so both are left to their
+# stems. MuScriptor needs none of this: it names its own tracks and picks its own
+# programs, drums included.
 STEM_PROGRAMS = {
     "bass": 33,  # Electric Bass (finger)
     "piano": 0,  # Acoustic Grand Piano
@@ -202,7 +306,71 @@ def separate(source: Path, into: Path, on_progress: ProgressFn) -> dict[str, str
     return stems
 
 
-def transcribe(into: Path, stems: dict[str, str], on_progress: ProgressFn) -> dict[str, str] | None:
+def transcribe(
+    source: Path, into: Path, stems: dict[str, str], on_progress: ProgressFn
+) -> tuple[dict[str, str] | None, str | None]:
+    """Transcribe the song into ``midi/song.mid``, best backend first.
+
+    Returns the manifest ``midi`` map and the backend that produced it, so the
+    import can say which one ran. A MuScriptor that is installed but fails —
+    unaccepted model licence, no HuggingFace token, no room on the GPU — falls
+    back to basic-pitch rather than losing the transcription altogether.
+    """
+    if muscriptor_binary() is not None:
+        model = muscriptor_model()
+        try:
+            midi = transcribe_muscriptor(source, into, on_progress)
+        except Exception as error:  # noqa: BLE001 — the fallback is the point
+            on_progress("transcribe", 0.0, f"muscriptor unavailable ({error}); using basic-pitch")
+        else:
+            if midi is not None:
+                return midi, f"muscriptor {model}"
+    return transcribe_basic_pitch(into, stems, on_progress), "basic-pitch"
+
+
+def transcribe_muscriptor(source: Path, into: Path, on_progress: ProgressFn) -> dict[str, str] | None:
+    """Transcribe the whole mix with MuScriptor into ``midi/song.mid``.
+
+    One pass over the mix, not one per stem: the model is multi-instrument, so it
+    decides for itself which instruments are playing, names each track after one
+    and writes the drum kit to channel 10 — all of which RustDAW's importer
+    already reads. Returns ``None`` when MuScriptor is not installed.
+    """
+    binary = muscriptor_binary()
+    if binary is None:
+        return None
+    model = muscriptor_model()
+    midi_dir = into / "midi"
+    midi_dir.mkdir(parents=True, exist_ok=True)
+    destination = midi_dir / "song.mid"
+    on_progress("transcribe", 0.0, f"transcribing with muscriptor ({model})")
+    result = subprocess.run(
+        [
+            binary, "transcribe", str(source),
+            "--format", "midi",
+            "--output", str(destination),
+            "--model", model,
+            "--device", "auto",
+            # The notes are played, not engraved, so they are never quantised;
+            # the detected tempo still goes into the file, and best-effort keeps
+            # a song with no steady tempo from failing the whole stage.
+            "--detect-tempo", "best-effort",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not destination.is_file():
+        destination.unlink(missing_ok=True)
+        tail = (result.stderr or "").strip().splitlines()[-1:] or ["muscriptor failed"]
+        raise RuntimeError(tail[0])
+    remove_bar_offset(destination)
+    on_progress("transcribe", 100.0, "transcription complete")
+    return {"song": "midi/song.mid"}
+
+
+def transcribe_basic_pitch(
+    into: Path, stems: dict[str, str], on_progress: ProgressFn
+) -> dict[str, str] | None:
     """Transcribe the melodic stems into one multi-track ``midi/song.mid``.
 
     Each stem becomes a named instrument with a General MIDI program, so RustDAW
@@ -276,10 +444,10 @@ def run(url: str, on_progress: ProgressFn | None = None) -> str:
 
         stems = separate(source, directory, progress)
         try:
-            midi = transcribe(directory, stems, progress)
+            midi, backend = transcribe(source, directory, stems, progress)
         except Exception as error:  # noqa: BLE001 — transcription is best-effort
             progress("transcribe", 100.0, f"transcription skipped: {error}")
-            midi = None
+            midi, backend = None, None
         try:
             beat_grid = analyse_beats(source, progress)
         except Exception as error:  # noqa: BLE001 — beat detection is best-effort
@@ -301,7 +469,10 @@ def run(url: str, on_progress: ProgressFn | None = None) -> str:
             stages={
                 "download": {"status": "done"},
                 "separate": {"status": "done"},
-                "transcribe": {"status": "done" if midi else "skipped"},
+                "transcribe": {
+                    "status": "done" if midi else "skipped",
+                    **({"backend": backend} if midi and backend else {}),
+                },
             },
         )
         progress("finalize", 100.0, "done")

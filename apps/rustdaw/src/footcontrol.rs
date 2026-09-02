@@ -15,10 +15,12 @@ use std::path::PathBuf;
 
 use daw_control::{
     AMP_SLOTS, Action, Bindings, Calibration, CalibrationRun, Command, ControlSurface, Message,
-    Stage, Trigger,
+    PRESET_SLOTS, Stage, Trigger,
 };
+use daw_project::PresetLibrary;
 use eframe::egui::{self, Align2, Color32, FontId, RichText, Stroke};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::theme;
 
@@ -40,6 +42,10 @@ pub struct FootPreferences {
     /// an older file, which is why it is a list rather than a fixed array.
     #[serde(default)]
     pub slots: Vec<Option<PathBuf>>,
+    /// The rig each preset switch recalls, by id rather than by name so
+    /// renaming a preset does not silently unbind the switch it is on.
+    #[serde(default)]
+    pub preset_slots: Vec<Option<Uuid>>,
     /// How far the expression pedal actually travels.
     #[serde(default)]
     pub calibration: Calibration,
@@ -51,6 +57,7 @@ pub struct FootControlState {
     port: Option<String>,
     bindings: Bindings,
     slots: Vec<Option<PathBuf>>,
+    preset_slots: Vec<Option<Uuid>>,
     /// The open connection. Dropping it releases the port.
     surface: Option<ControlSurface>,
     /// Why the last attempt to connect failed, shown until the next one.
@@ -87,6 +94,8 @@ pub struct FootControlState {
     calibration_error: Option<String>,
     /// The amp slot last selected, so the panel can light it up.
     active: Option<u8>,
+    /// The preset slot last recalled, lit for the same reason.
+    active_preset: Option<u8>,
     /// Set when something worth writing to disk changed.
     pub dirty: bool,
 }
@@ -98,6 +107,7 @@ impl Default for FootControlState {
             port: None,
             bindings: Bindings::footswitch(),
             slots: vec![None; AMP_SLOTS],
+            preset_slots: vec![None; PRESET_SLOTS],
             surface: None,
             error: None,
             ports: Vec::new(),
@@ -109,6 +119,7 @@ impl Default for FootControlState {
             run: None,
             calibration_error: None,
             active: None,
+            active_preset: None,
             dirty: false,
         }
     }
@@ -126,6 +137,9 @@ impl FootControlState {
         for (slot, saved) in state.slots.iter_mut().zip(preferences.slots) {
             *slot = saved;
         }
+        for (slot, saved) in state.preset_slots.iter_mut().zip(preferences.preset_slots) {
+            *slot = saved;
+        }
         state
     }
 
@@ -135,6 +149,7 @@ impl FootControlState {
             port: self.port.clone(),
             bindings: self.bindings.clone(),
             slots: self.slots.clone(),
+            preset_slots: self.preset_slots.clone(),
             calibration: self.calibration,
         }
     }
@@ -162,6 +177,54 @@ impl FootControlState {
     /// Remembers which switch is lit, once the amp has actually loaded.
     pub fn set_active(&mut self, slot: Option<u8>) {
         self.active = slot;
+    }
+
+    /// The rig a preset switch recalls.
+    #[must_use]
+    pub fn preset_slot(&self, slot: u8) -> Option<Uuid> {
+        self.preset_slots.get(usize::from(slot)).copied().flatten()
+    }
+
+    /// Puts a rig on a preset switch, or takes it off with `None`.
+    pub fn set_preset_slot(&mut self, slot: u8, preset: Option<Uuid>) {
+        if let Some(entry) = self.preset_slots.get_mut(usize::from(slot)) {
+            *entry = preset;
+            self.dirty = true;
+        }
+    }
+
+    /// Remembers which preset switch is lit.
+    pub fn set_active_preset(&mut self, slot: Option<u8>) {
+        self.active_preset = slot;
+    }
+
+    /// Fills empty preset switches from the library, in its own order.
+    ///
+    /// Same reasoning as [`Self::seed`]: eight menus to fill in before a
+    /// pedal does anything is eight reasons not to bother. A rig on the wrong
+    /// switch is heard and moved in seconds.
+    pub fn seed_presets(&mut self, presets: &PresetLibrary) {
+        let unassigned: Vec<Uuid> = presets
+            .presets()
+            .iter()
+            .map(|preset| preset.id)
+            .filter(|id| !self.preset_slots.contains(&Some(*id)))
+            .collect();
+        let empty = self.preset_slots.iter_mut().filter(|slot| slot.is_none());
+        for (slot, id) in empty.zip(unassigned) {
+            *slot = Some(id);
+            self.dirty = true;
+        }
+    }
+
+    /// Takes a deleted rig off every switch it was on.
+    pub fn forget_preset(&mut self, preset: Uuid) {
+        for slot in &mut self.preset_slots {
+            if *slot == Some(preset) {
+                *slot = None;
+                self.dirty = true;
+            }
+        }
     }
 
     #[must_use]
@@ -383,6 +446,7 @@ pub fn window(
     context: &egui::Context,
     state: &mut FootControlState,
     library: &[daw_nam::AmpModel],
+    presets: &PresetLibrary,
     target: Option<&str>,
 ) {
     let mut open = state.open;
@@ -415,6 +479,10 @@ pub fn window(
             expression_pedal(ui, state);
             ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| {
+                // Rigs before amps: a preset switch changes the capture too,
+                // and more besides, so it is the one most feet want.
+                preset_switches(ui, state, presets);
+                ui.add_space(10.0);
                 amp_switches(ui, state, library);
                 ui.add_space(10.0);
                 other_switches(ui, state);
@@ -815,6 +883,83 @@ fn pedal_view(ui: &mut egui::Ui, position: f32, live: bool) {
     );
 }
 
+/// The switches that recall whole rigs, and which rig each one holds.
+fn preset_switches(ui: &mut egui::Ui, state: &mut FootControlState, presets: &PresetLibrary) {
+    ui.label(
+        RichText::new("PRESETS ON THE SWITCHES")
+            .small()
+            .monospace()
+            .color(theme::MUTED),
+    );
+    ui.label(
+        RichText::new(
+            "One switch, one whole rig: the capture, the wah, the tone stack, the dynamics and \
+             the time effects together. Build them in the channel strip.",
+        )
+        .small()
+        .color(theme::MUTED),
+    );
+    if presets.is_empty() {
+        ui.label(
+            RichText::new(
+                "No presets yet. Dial a sound in the channel strip and press SAVE AS to keep it.",
+            )
+            .small()
+            .color(theme::YELLOW),
+        );
+        return;
+    }
+    egui::Grid::new("foot_preset_slots")
+        .num_columns(4)
+        .spacing([8.0, 6.0])
+        .show(ui, |ui| {
+            for slot in 0..PRESET_SLOTS {
+                let index = u8::try_from(slot).unwrap_or(0);
+                let action = Action::SelectPreset(index);
+                let lit = state.active_preset == Some(index);
+                ui.label(
+                    RichText::new(action.label())
+                        .monospace()
+                        .small()
+                        .color(if lit { theme::GREEN } else { theme::TEXT }),
+                );
+                learn_button(ui, state, action);
+                let chosen = state.preset_slot(index);
+                // A switch holding a rig that has since been deleted says so
+                // rather than reading as empty: the two are fixed differently.
+                let name = chosen.map_or_else(
+                    || "Empty".to_owned(),
+                    |id| {
+                        presets
+                            .get(id)
+                            .map_or_else(|| "Deleted".to_owned(), |preset| preset.name.clone())
+                    },
+                );
+                let mut wanted = None;
+                egui::ComboBox::from_id_salt(("foot_preset_slot", slot))
+                    .selected_text(RichText::new(name).small())
+                    .width(240.0)
+                    .show_ui(ui, |ui| {
+                        for preset in presets.presets() {
+                            if ui
+                                .selectable_label(chosen == Some(preset.id), &preset.name)
+                                .clicked()
+                            {
+                                wanted = Some(Some(preset.id));
+                            }
+                        }
+                    });
+                if ui.button("✕").on_hover_text("Empty this switch").clicked() {
+                    wanted = Some(None);
+                }
+                if let Some(wanted) = wanted {
+                    state.set_preset_slot(index, wanted);
+                }
+                ui.end_row();
+            }
+        });
+}
+
 fn amp_switches(ui: &mut egui::Ui, state: &mut FootControlState, library: &[daw_nam::AmpModel]) {
     ui.label(
         RichText::new("AMPS ON THE SWITCHES")
@@ -898,7 +1043,7 @@ fn other_switches(ui: &mut egui::Ui, state: &mut FootControlState) {
         .show(ui, |ui| {
             for action in Action::all()
                 .into_iter()
-                .filter(|action| !matches!(action, Action::SelectAmp(_)))
+                .filter(|action| !matches!(action, Action::SelectAmp(_) | Action::SelectPreset(_)))
             {
                 ui.label(RichText::new(action.label()).monospace().small());
                 learn_button(ui, state, action);
@@ -1158,5 +1303,89 @@ mod tests {
         let restored = FootControlState::from_preferences(state.preferences());
         assert_eq!(restored.calibration, state.calibration);
         assert_eq!(restored.pedal_controller(), Some(11));
+    }
+
+    /// Two rigs, in the order a foot would step through them.
+    fn library() -> PresetLibrary {
+        let mut presets = PresetLibrary::default();
+        presets.add("Clean", daw_project::TrackEffects::default(), None);
+        presets.add("Solo", daw_project::TrackEffects::default(), None);
+        presets
+    }
+
+    #[test]
+    fn saved_rigs_land_on_the_switches_without_anybody_filling_in_a_menu() {
+        let presets = library();
+        let mut state = FootControlState::default();
+        state.seed_presets(&presets);
+        assert_eq!(state.preset_slot(0), Some(presets.presets()[0].id));
+        assert_eq!(state.preset_slot(1), Some(presets.presets()[1].id));
+        assert_eq!(state.preset_slot(2), None);
+        assert!(state.dirty, "the seeding has to reach the disk");
+    }
+
+    #[test]
+    fn seeding_twice_does_not_put_one_rig_on_two_switches() {
+        // Every save runs the seed again, and a rig reachable from two
+        // switches is a switch somebody thinks is broken.
+        let mut presets = library();
+        let mut state = FootControlState::default();
+        state.seed_presets(&presets);
+        let third = presets.add("Funk", daw_project::TrackEffects::default(), None);
+        state.seed_presets(&presets);
+        assert_eq!(state.preset_slot(2), Some(third));
+        assert_eq!(state.preset_slot(3), None);
+        assert_eq!(state.preset_slot(0), Some(presets.presets()[0].id));
+    }
+
+    #[test]
+    fn a_rig_moved_by_hand_is_left_where_it_was_put() {
+        let presets = library();
+        let mut state = FootControlState::default();
+        let solo = presets.presets()[1].id;
+        state.set_preset_slot(4, Some(solo));
+        state.seed_presets(&presets);
+        assert_eq!(state.preset_slot(4), Some(solo), "the switch was moved");
+        // Only the rig that was not on a switch yet gets seeded.
+        assert_eq!(state.preset_slot(0), Some(presets.presets()[0].id));
+        assert_eq!(state.preset_slot(1), None);
+    }
+
+    #[test]
+    fn deleting_a_rig_takes_it_off_every_switch_it_was_on() {
+        let presets = library();
+        let mut state = FootControlState::default();
+        state.seed_presets(&presets);
+        let clean = presets.presets()[0].id;
+        state.set_preset_slot(5, Some(clean));
+        state.forget_preset(clean);
+        assert_eq!(state.preset_slot(0), None);
+        assert_eq!(state.preset_slot(5), None);
+        assert_eq!(state.preset_slot(1), Some(presets.presets()[1].id));
+    }
+
+    #[test]
+    fn the_rigs_on_the_switches_are_remembered_between_sessions() {
+        let presets = library();
+        let mut state = FootControlState::default();
+        state.seed_presets(&presets);
+        let restored = FootControlState::from_preferences(state.preferences());
+        assert_eq!(restored.preset_slot(0), Some(presets.presets()[0].id));
+        assert_eq!(restored.preset_slot(1), Some(presets.presets()[1].id));
+    }
+
+    #[test]
+    fn a_preferences_file_written_before_presets_existed_still_loads() {
+        // The pedal predates the rigs, so every file already on disk has no
+        // preset switches in it at all.
+        let json = r#"{"port":"SINCO","slots":[null,null]}"#;
+        let preferences: FootPreferences = serde_json::from_str(json).expect("an older file");
+        let state = FootControlState::from_preferences(preferences);
+        assert_eq!(state.preset_slot(0), None);
+        // And the pedal it does describe is still driven by it.
+        assert_eq!(
+            state.bindings.trigger_for(Action::SelectAmp(0)),
+            Some(Trigger::Program(0))
+        );
     }
 }

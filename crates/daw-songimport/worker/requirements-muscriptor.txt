@@ -1,0 +1,14 @@
+# Optional MIDI transcription backend, installed into its OWN virtualenv by
+# `install.sh --with-muscriptor` and driven as a subprocess. It is deliberately
+# not in requirements.txt: MuScriptor floors NumPy at 2 while the Demucs stack
+# here runs on 1.26, and beat-this brings its own torch pin, so sharing one
+# environment would resolve the working separation stack out from under itself.
+#
+# MuScriptor is multi-instrument, so it replaces four basic-pitch passes over
+# the stems with one pass over the mix and transcribes the drum kit too. The
+# code is MIT, but the model weights are CC BY-NC 4.0 and gated: accept the
+# licence at https://huggingface.co/MuScriptor and authenticate (HF_TOKEN, or
+# `hf auth login`) before the first transcription, or the stage falls back to
+# basic-pitch. Non-commercial use only — which is why basic-pitch stays the
+# default backend and this file is opt-in.
+muscriptor>=0.3
