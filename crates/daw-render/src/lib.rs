@@ -1,9 +1,18 @@
 //! Deterministic offline stereo rendering for `RustDAW` sessions.
 
 use anyhow::{Context, Result, bail};
-use daw_engine::{ChannelStrip, ChannelStripParams, NoiseGate, ToneStack, Wah};
+use daw_engine::{
+    ChannelStrip, ChannelStripParams, GmBank, NoiseGate, Reverb, SampledSynth, SoundFontBank, Synth,
+    ToneStack, Wah,
+};
+use daw_midi::ScheduledNote;
 use daw_nam::NamProcessor;
 use daw_project::ProjectDocument;
+use std::sync::Arc;
+
+/// Frames rendered per synth block. The synth is block-based like the runtime's
+/// callback, and offline the size only decides how often the loop turns over.
+const SYNTH_BLOCK: usize = 1_024;
 
 /// The loudness a normalised capture is brought to, matching the runtime so an
 /// export sounds like what was monitored.
@@ -18,14 +27,36 @@ use std::path::Path;
 /// output filesystem failures.
 pub fn export_stereo(project: &ProjectDocument, destination: &Path) -> Result<u64> {
     let frame_count = render_length(project)?;
+    let sample_rate = daw_core::SampleRate::new(project.sample_rate)
+        .context("project sample rate cannot be zero")?;
+    let instruments = Instruments::new(sample_rate);
+    let tempo = project.tempo_map();
     let mut mix = vec![[0.0_f32; 2]; frame_count];
+    let mut send = vec![[0.0_f32; 2]; frame_count];
+    let mut any_instrument = false;
 
     for track in audible_tracks(project) {
-        let rendered = render_track(track, project.sample_rate, frame_count)?;
-        for (output, frame) in mix.iter_mut().zip(rendered) {
+        let rendered = render_track(
+            track,
+            project.sample_rate,
+            frame_count,
+            &instruments,
+            &tempo,
+        )?;
+        for (output, frame) in mix.iter_mut().zip(&rendered.audio) {
             output[0] += frame[0];
             output[1] += frame[1];
         }
+        any_instrument |= !rendered.reverb_send.is_empty();
+        for (slot, frame) in send.iter_mut().zip(&rendered.reverb_send) {
+            slot[0] += frame[0];
+            slot[1] += frame[1];
+        }
+    }
+
+    // One room for every instrument, added once — the runtime's bus, offline.
+    if any_instrument {
+        add_instrument_reverb(&mut mix, &send, sample_rate);
     }
 
     // The master stage. Everything above is the mix; this is the one thing
@@ -76,9 +107,11 @@ impl StemExport {
 /// [`StemExport::clipped`] reports that per stem rather than leaving it as a
 /// difference nobody notices until the stems are used somewhere else.
 ///
-/// Instrument tracks are skipped: their MIDI is played by the live synthesiser
-/// and the offline renderer has no audio for them. Only tracks with audio clips
-/// come out, and the returned list says which those were.
+/// Instrument tracks come out too, synthesised the way the runtime plays them,
+/// each carrying its own share of the instrument reverb — which is the same
+/// signal as the mix's single shared room, because a reverb is linear. Only
+/// tracks with nothing at all to play are left out, and the returned list says
+/// which ones were written.
 ///
 /// # Errors
 ///
@@ -86,15 +119,26 @@ impl StemExport {
 /// output filesystem failures.
 pub fn export_stems(project: &ProjectDocument, directory: &Path) -> Result<Vec<StemExport>> {
     let frame_count = render_length(project)?;
+    let sample_rate = daw_core::SampleRate::new(project.sample_rate)
+        .context("project sample rate cannot be zero")?;
+    let instruments = Instruments::new(sample_rate);
+    let tempo = project.tempo_map();
     std::fs::create_dir_all(directory)
         .with_context(|| format!("failed to create {}", directory.display()))?;
 
     let mut written = Vec::new();
     for (index, track) in audible_tracks(project)
-        .filter(|track| !track.clips.is_empty())
+        .filter(|track| !track.clips.is_empty() || !track.midi_clips.is_empty())
         .enumerate()
     {
-        let rendered = render_track(track, project.sample_rate, frame_count)?;
+        let rendered = render_track(
+            track,
+            project.sample_rate,
+            frame_count,
+            &instruments,
+            &tempo,
+        )?;
+        let rendered = rendered.audio_with_reverb(sample_rate);
         // Numbered so the files sort in mixer order, and so two tracks sharing
         // a name do not write over each other.
         let path = directory.join(format!(
@@ -116,16 +160,218 @@ pub fn export_stems(project: &ProjectDocument, directory: &Path) -> Result<Vec<S
     Ok(written)
 }
 
+/// Adds the instrument reverb to a finished mix.
+///
+/// The runtime runs one reverb for every instrument track and takes it straight
+/// to the master rather than back through the strips, so it is added here at the
+/// same point. Being linear, one room over the summed sends is the same signal
+/// as a room per track summed — which is what lets the stems still add up.
+fn add_instrument_reverb(
+    mix: &mut [[f32; 2]],
+    send: &[[f32; 2]],
+    sample_rate: daw_core::SampleRate,
+) {
+    let mut reverb = Reverb::new(sample_rate);
+    let mut left = vec![0.0_f32; SYNTH_BLOCK];
+    let mut right = vec![0.0_f32; SYNTH_BLOCK];
+    let mut start = 0_usize;
+    while start < mix.len() {
+        let frames = SYNTH_BLOCK.min(mix.len() - start);
+        left[..frames].fill(0.0);
+        right[..frames].fill(0.0);
+        reverb.process(
+            &send[start..start + frames],
+            &mut left[..frames],
+            &mut right[..frames],
+        );
+        for (offset, frame) in mix[start..start + frames].iter_mut().enumerate() {
+            frame[0] += left[offset];
+            frame[1] += right[offset];
+        }
+        start += frames;
+    }
+}
+
+/// What instrument tracks are played by, offline.
+///
+/// The runtime prefers an installed `SoundFont` and falls back to the synthesised
+/// bank; an export has to make the same choice or it is not the mix that was
+/// monitored. Discovered once per export, not once per track.
+struct Instruments {
+    /// Both banks are found on first use, not on construction: an export of a
+    /// session with no notes should not go looking for a `SoundFont` on disk or
+    /// build several megabytes of wavetables to then throw them away.
+    soundfont: std::sync::OnceLock<Option<SoundFontBank>>,
+    bank: std::sync::OnceLock<Arc<GmBank>>,
+    sample_rate: daw_core::SampleRate,
+}
+
+impl Instruments {
+    fn new(sample_rate: daw_core::SampleRate) -> Self {
+        Self {
+            soundfont: std::sync::OnceLock::new(),
+            bank: std::sync::OnceLock::new(),
+            sample_rate,
+        }
+    }
+
+    /// A voice for one track. Each track gets its own so that two instruments
+    /// playing at once never take each other's voices.
+    fn voice(&self, program: u8, is_drum_kit: bool) -> Instrument {
+        let mut instrument = match self
+            .soundfont
+            .get_or_init(SoundFontBank::discover)
+            .as_ref()
+            .and_then(|bank| bank.player(self.sample_rate).ok())
+        {
+            Some(player) => Instrument::Sampled(Box::new(player)),
+            None => Instrument::Bank(Box::new(Synth::new(
+                self.sample_rate,
+                Arc::clone(
+                    self.bank
+                        .get_or_init(|| Arc::new(GmBank::new(self.sample_rate))),
+                ),
+            ))),
+        };
+        // Order matters for the sampled player: the kit and the program pick
+        // the preset together.
+        instrument.set_drum_kit(is_drum_kit);
+        instrument.set_program(program);
+        instrument
+    }
+}
+
+/// One track's synthesiser: a `SoundFont` preset, or the built-in bank.
+enum Instrument {
+    Sampled(Box<SampledSynth>),
+    Bank(Box<Synth>),
+}
+
+impl Instrument {
+    fn set_program(&mut self, program: u8) {
+        match self {
+            Self::Sampled(player) => player.set_program(program),
+            Self::Bank(synth) => synth.set_program(program),
+        }
+    }
+
+    fn set_drum_kit(&mut self, is_drum_kit: bool) {
+        match self {
+            Self::Sampled(player) => player.set_drum_kit(is_drum_kit),
+            Self::Bank(synth) => synth.set_drum_kit(is_drum_kit),
+        }
+    }
+
+    fn render(&mut self, notes: &[ScheduledNote], block_start: u64, left: &mut [f32], right: &mut [f32]) {
+        match self {
+            Self::Sampled(player) => player.render(notes, block_start, left, right),
+            Self::Bank(synth) => synth.render(notes, block_start, left, right),
+        }
+    }
+
+    /// How far into the room this instrument sits, as the runtime has it.
+    fn reverb_send(&self) -> f32 {
+        match self {
+            Self::Sampled(player) => player.reverb_send(),
+            Self::Bank(synth) => synth.reverb_send(),
+        }
+    }
+}
+
+/// One track rendered: its audio, and what it sends to the instrument reverb.
+///
+/// The two are kept apart because the reverb is a bus, not an insert: the
+/// runtime sends instruments to it and takes its output straight to the master,
+/// past the track strips, so an export that folded it into the track would put
+/// it through the strip twice over.
+struct TrackRender {
+    audio: Vec<[f32; 2]>,
+    /// Empty for a track with no notes.
+    reverb_send: Vec<[f32; 2]>,
+}
+
+impl TrackRender {
+    /// This track on its own, room and all — what a stem has to be.
+    ///
+    /// A stem is played by itself, so the reverb it would have contributed to
+    /// the mix has to travel with it. Summing the stems still reproduces the
+    /// mix because the same rooms are being added, just in a different order.
+    fn audio_with_reverb(mut self, sample_rate: daw_core::SampleRate) -> Vec<[f32; 2]> {
+        if !self.reverb_send.is_empty() {
+            add_instrument_reverb(&mut self.audio, &self.reverb_send, sample_rate);
+        }
+        self.audio
+    }
+}
+
+/// Renders one instrument track's notes to audio, before the strip.
+///
+/// Returns `None` when the track has nothing to play, so a session with no
+/// instruments never builds a synthesiser.
+fn render_notes(
+    track: &daw_project::ProjectTrack,
+    instruments: &Instruments,
+    tempo: &daw_midi::TempoMap,
+    sample_rate_hz: u32,
+    frame_count: usize,
+) -> Option<(Vec<[f32; 2]>, f32)> {
+    let mut notes: Vec<ScheduledNote> = track
+        .midi_clips
+        .iter()
+        .flat_map(|clip| clip.schedule(tempo, sample_rate_hz))
+        .collect();
+    if notes.is_empty() {
+        return None;
+    }
+    // The synth walks the list with a cursor and relies on this order.
+    notes.sort_by_key(|note| note.start_frame);
+
+    let mut voice = instruments.voice(track.program.unwrap_or(0), track.drum_kit);
+    let mut rendered = vec![[0.0_f32; 2]; frame_count];
+    let mut left = vec![0.0_f32; SYNTH_BLOCK];
+    let mut right = vec![0.0_f32; SYNTH_BLOCK];
+    let mut start = 0_usize;
+    while start < frame_count {
+        let frames = SYNTH_BLOCK.min(frame_count - start);
+        left[..frames].fill(0.0);
+        right[..frames].fill(0.0);
+        voice.render(
+            &notes,
+            start as u64,
+            &mut left[..frames],
+            &mut right[..frames],
+        );
+        for (offset, frame) in rendered[start..start + frames].iter_mut().enumerate() {
+            frame[0] = left[offset];
+            frame[1] = right[offset];
+        }
+        start += frames;
+    }
+    Some((rendered, voice.reverb_send()))
+}
+
 /// How long the rendered session is, in frames: the end of its last clip.
+///
+/// Notes count as well as audio. An instrument track carries no clips at all,
+/// so measuring only those would cut a transcribed song off at whatever the
+/// stems happen to end at — or produce nothing for a session that is only MIDI.
 fn render_length(project: &ProjectDocument) -> Result<usize> {
-    let end_frame = project
+    let tempo = project.tempo_map();
+    let audio_end = project
         .tracks
         .iter()
         .flat_map(|track| &track.clips)
         .map(|clip| clip.end_frame)
         .max()
         .unwrap_or(0);
-    usize::try_from(end_frame).context("session is too long to render")
+    let notes_end = project
+        .tracks
+        .iter()
+        .flat_map(|track| &track.midi_clips)
+        .map(|clip| tempo.tick_to_frame(clip.end_tick(), project.sample_rate))
+        .max()
+        .unwrap_or(0);
+    usize::try_from(audio_end.max(notes_end)).context("session is too long to render")
 }
 
 /// The tracks a listener would hear: unmuted, and soloed if anything is.
@@ -187,13 +433,80 @@ fn write_stereo_wav(destination: &Path, frames: &[[f32; 2]], sample_rate: u32) -
 // One pass over the track's clips through the full insert chain. Splitting it
 // would mean threading the whole per-track state through helpers for no gain in
 // clarity.
+/// Runs one buffer through the track's chain: wah in front of the amp, the amp
+/// itself, then the strip.
+///
+/// Shared by the clips and the notes so an instrument track is processed the
+/// way the runtime processes it — as a track like any other, not as a special
+/// case that quietly skips half the rig.
+#[allow(clippy::too_many_arguments)]
+fn apply_track_chain(
+    samples: &mut [[f32; 2]],
+    track: &daw_project::ProjectTrack,
+    gate: &mut NoiseGate,
+    tone: &mut ToneStack,
+    wah: &mut Wah,
+    nam: &mut Option<NamProcessor>,
+    processor: &mut ChannelStrip,
+) -> Result<()> {
+    // In front of the amp, and running whether or not there is one,
+    // exactly as the runtime has it. An export that dropped the wah
+    // would not be the take that was played.
+    if track.effects.wah_enabled {
+        wah.process_stereo(
+            samples,
+            track.effects.wah_position,
+            track.effects.wah_mix,
+        );
+    }
+    if let Some(nam) = nam {
+        let input_gain = db_to_gain(track.effects.nam_input_db);
+        let normalize = if track.effects.nam_normalize {
+            nam.loudness().map_or(1.0, |loudness| {
+                #[allow(clippy::cast_possible_truncation)]
+                let difference = (NORMALIZE_TARGET_DB - loudness) as f32;
+                db_to_gain(difference.clamp(-24.0, 24.0))
+            })
+        } else {
+            1.0
+        };
+        let output_gain = db_to_gain(track.effects.nam_output_db) * normalize;
+        let mut mono = vec![0.0_f32; 2_048];
+        for block in samples.chunks_mut(2_048) {
+            let block_len = block.len();
+            for (sample, frame) in mono[..block_len].iter_mut().zip(block.iter()) {
+                *sample = (frame[0] + frame[1]) * 0.5 * input_gain;
+            }
+            gate.process(&mut mono[..block_len], track.effects.nam_gate_db);
+            nam.process(&mut mono[..block_len])
+                .map_err(anyhow::Error::msg)?;
+            for (frame, sample) in block.iter_mut().zip(&mono[..block_len]) {
+                *frame = [*sample * output_gain; 2];
+            }
+            if track.effects.nam_tone_enabled {
+                tone.process(
+                    block,
+                    track.effects.nam_bass,
+                    track.effects.nam_middle,
+                    track.effects.nam_treble,
+                );
+            }
+        }
+    }
+    processor.process_stereo(samples);
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn render_track(
     track: &daw_project::ProjectTrack,
     sample_rate_hz: u32,
     frame_count: usize,
-) -> Result<Vec<[f32; 2]>> {
+    instruments: &Instruments,
+    tempo: &daw_midi::TempoMap,
+) -> Result<TrackRender> {
     let mut rendered = vec![[0.0_f32; 2]; frame_count];
+    let mut reverb_send = Vec::new();
     {
         let gain = db_to_gain(track.gain_db);
         let mut processor = ChannelStrip::new(
@@ -252,51 +565,7 @@ fn render_track(
         };
         for clip in &track.clips {
             let mut samples = read_wav(&clip.path, sample_rate_hz)?;
-            // In front of the amp, and running whether or not there is one,
-            // exactly as the runtime has it. An export that dropped the wah
-            // would not be the take that was played.
-            if track.effects.wah_enabled {
-                wah.process_stereo(
-                    &mut samples,
-                    track.effects.wah_position,
-                    track.effects.wah_mix,
-                );
-            }
-            if let Some(nam) = &mut nam {
-                let input_gain = db_to_gain(track.effects.nam_input_db);
-                let normalize = if track.effects.nam_normalize {
-                    nam.loudness().map_or(1.0, |loudness| {
-                        #[allow(clippy::cast_possible_truncation)]
-                        let difference = (NORMALIZE_TARGET_DB - loudness) as f32;
-                        db_to_gain(difference.clamp(-24.0, 24.0))
-                    })
-                } else {
-                    1.0
-                };
-                let output_gain = db_to_gain(track.effects.nam_output_db) * normalize;
-                let mut mono = vec![0.0_f32; 2_048];
-                for block in samples.chunks_mut(2_048) {
-                    let block_len = block.len();
-                    for (sample, frame) in mono[..block_len].iter_mut().zip(block.iter()) {
-                        *sample = (frame[0] + frame[1]) * 0.5 * input_gain;
-                    }
-                    gate.process(&mut mono[..block_len], track.effects.nam_gate_db);
-                    nam.process(&mut mono[..block_len])
-                        .map_err(anyhow::Error::msg)?;
-                    for (frame, sample) in block.iter_mut().zip(&mono[..block_len]) {
-                        *frame = [*sample * output_gain; 2];
-                    }
-                    if track.effects.nam_tone_enabled {
-                        tone.process(
-                            block,
-                            track.effects.nam_bass,
-                            track.effects.nam_middle,
-                            track.effects.nam_treble,
-                        );
-                    }
-                }
-            }
-            processor.process_stereo(&mut samples);
+            apply_track_chain(&mut samples, track, &mut gate, &mut tone, &mut wah, &mut nam, &mut processor)?;
             let wanted = usize::try_from(clip.length()).unwrap_or(usize::MAX);
             let start = usize::try_from(clip.start_frame).context("clip starts too late")?;
             // The clip reads a window of its source rather than the whole file:
@@ -321,8 +590,55 @@ fn render_track(
                 output[1] += frame[1] * gain * right_pan_gain;
             }
         }
+
+        // Notes go through the same chain the clips do, because on the runtime
+        // an instrument track is a track like any other. What it does not share
+        // is the reverb: that one is a bus, so the send is measured here and
+        // handed back for the mix to add once, past every strip.
+        if let Some((mut samples, send)) =
+            render_notes(track, instruments, tempo, sample_rate_hz, frame_count)
+        {
+            apply_track_chain(
+                &mut samples,
+                track,
+                &mut gate,
+                &mut tone,
+                &mut wah,
+                &mut nam,
+                &mut processor,
+            )?;
+            let left_pan_gain = if track.pan > 0.0 {
+                1.0 - track.pan
+            } else {
+                1.0
+            };
+            let right_pan_gain = if track.pan < 0.0 {
+                1.0 + track.pan
+            } else {
+                1.0
+            };
+            if send > 0.0 {
+                reverb_send = vec![[0.0_f32; 2]; frame_count];
+            }
+            for (index, frame) in samples.iter().enumerate() {
+                let Some(output) = rendered.get_mut(index) else {
+                    break;
+                };
+                let left = frame[0] * gain * left_pan_gain;
+                let right = frame[1] * gain * right_pan_gain;
+                output[0] += left;
+                output[1] += right;
+                if let Some(slot) = reverb_send.get_mut(index) {
+                    slot[0] = left * send;
+                    slot[1] = right * send;
+                }
+            }
+        }
     }
-    Ok(rendered)
+    Ok(TrackRender {
+        audio: rendered,
+        reverb_send,
+    })
 }
 
 /// Matches the finished mix to a reference record.
@@ -477,6 +793,82 @@ mod tests {
             end_frame: 48_000 * seconds,
         });
         track
+    }
+
+    /// An instrument track holding one sustained note from the very start.
+    fn note_track(name: &str, program: u8, seconds: u64) -> ProjectTrack {
+        let mut track = ProjectTrack::instrument(name, Some(program));
+        let bar = u64::from(daw_midi::TICKS_PER_QUARTER) * 4;
+        let mut clip = daw_midi::MidiClip::new("Notes", 0, bar * seconds);
+        // A whole note from the downbeat: one bar of four beats.
+        clip.insert_note(daw_midi::Note::new(60, 100, 0, bar));
+        track.midi_clips.push(clip);
+        track
+    }
+
+    #[test]
+    fn an_instrument_track_is_heard_in_the_exported_mix() {
+        let temp = std::env::temp_dir();
+        let destination = temp.join(format!("rustdaw-midi-mix-{}.wav", std::process::id()));
+
+        let mut project = ProjectDocument {
+            sample_rate: 48_000,
+            tracks: vec![note_track("Piano", 0, 1)],
+            ..ProjectDocument::default()
+        };
+        project.tempo = 120;
+
+        let frames = export_stereo(&project, &destination).unwrap();
+        assert!(frames > 0, "a session that is only notes must still render");
+        let rendered = read_frames(&destination);
+        let peak = rendered
+            .iter()
+            .flat_map(|frame| [frame[0].abs(), frame[1].abs()])
+            .fold(0.0_f32, f32::max);
+        assert!(
+            peak > 0.001,
+            "the synthesised note must reach the mix, got a peak of {peak}"
+        );
+        std::fs::remove_file(&destination).ok();
+    }
+
+    #[test]
+    fn an_instrument_track_is_written_as_its_own_stem() {
+        let name = format!("rustdaw-midi-stems-{}", std::process::id());
+        let temp = std::env::temp_dir();
+        let source = temp.join(format!("{name}.wav"));
+        let directory = temp.join(&name);
+        write_noise(&source, 1, 0.2);
+
+        let mut project = ProjectDocument {
+            sample_rate: 48_000,
+            tracks: vec![
+                noise_track("Bass", &source, 1),
+                note_track("Piano", 0, 1),
+            ],
+            ..ProjectDocument::default()
+        };
+        project.tempo = 120;
+
+        let written = export_stems(&project, &directory).unwrap();
+        assert_eq!(
+            written.len(),
+            2,
+            "the instrument track must be exported alongside the audio one, got {:?}",
+            written.iter().map(|stem| &stem.track).collect::<Vec<_>>()
+        );
+        let piano = written
+            .iter()
+            .find(|stem| stem.track == "Piano")
+            .expect("the instrument track must have a stem");
+        assert!(
+            piano.peak > 0.001,
+            "the instrument stem must not be silence, got a peak of {}",
+            piano.peak
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+        std::fs::remove_file(&source).ok();
     }
 
     #[test]

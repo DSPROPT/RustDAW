@@ -2450,11 +2450,15 @@ impl RustDawApp {
             ));
             return;
         }
-        if self.tracks.iter().all(|track| track.clips.is_empty()) {
+        if self
+            .tracks
+            .iter()
+            .all(|track| track.clips.is_empty() && track.midi_clips.is_empty())
+        {
             self.status_message = "Nothing to export yet".to_owned();
             self.export_report = Some(ExportReport::failed(
                 "Nothing to export",
-                "This session has no audio clips yet.".to_owned(),
+                "This session has no audio clips or notes yet.".to_owned(),
             ));
             return;
         }
@@ -2786,13 +2790,17 @@ impl RustDawApp {
         let exportable = self
             .tracks
             .iter()
-            .filter(|track| !track.clips.is_empty() && !track.muted && (!any_solo || track.solo))
+            .filter(|track| {
+                (!track.clips.is_empty() || !track.midi_clips.is_empty())
+                    && !track.muted
+                    && (!any_solo || track.solo)
+            })
             .count();
         if exportable == 0 {
             self.status_message = "Nothing to export yet".to_owned();
             self.export_report = Some(ExportReport::failed(
                 "Nothing to export",
-                "No audible track in this session has audio clips.".to_owned(),
+                "No audible track in this session has audio clips or notes.".to_owned(),
             ));
             return;
         }
@@ -2819,21 +2827,12 @@ impl RustDawApp {
                 // Everything the session has that a stem could not be made of,
                 // said plainly rather than left as a silent difference in count.
                 let mut notes = Vec::new();
-                let instruments = self
-                    .tracks
-                    .iter()
-                    .filter(|track| track.kind.is_instrument())
-                    .count();
-                if instruments > 0 {
-                    notes.push(format!(
-                        "{instruments} instrument track(s) skipped — MIDI is not rendered offline"
-                    ));
-                }
                 let silenced = self
                     .tracks
                     .iter()
                     .filter(|track| {
-                        !track.clips.is_empty() && (track.muted || (any_solo && !track.solo))
+                        (!track.clips.is_empty() || !track.midi_clips.is_empty())
+                            && (track.muted || (any_solo && !track.solo))
                     })
                     .count();
                 if silenced > 0 {
