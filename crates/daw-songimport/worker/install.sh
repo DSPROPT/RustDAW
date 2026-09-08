@@ -114,10 +114,17 @@ if [ "$WITH_MUSCRIPTOR" = "1" ]; then
   "$MUSCRIPTOR_VENV/bin/python" -m pip install --upgrade pip >/dev/null
   if "$MUSCRIPTOR_VENV/bin/pip" install -r "$DATA_DIR/app/requirements-muscriptor.txt"; then
     echo "    MuScriptor installed — it becomes the transcription backend."
-    echo "    The weights are gated and non-commercial (CC BY-NC 4.0): accept the"
-    echo "    licence at https://huggingface.co/MuScriptor and authenticate once with"
+    echo "    The weights are gated and non-commercial (CC BY-NC 4.0). Accept the"
+    echo "    licence for each variant you will run at https://huggingface.co/MuScriptor"
+    echo "    — medium on a GPU, small on a CPU-only machine — then authenticate:"
     echo "      \"$MUSCRIPTOR_VENV/bin/hf\" auth login"
-    echo "    (or export HF_TOKEN). Until then the import falls back to basic-pitch."
+    echo "    That is enough, because the token it stores is read from the HuggingFace"
+    echo "    cache no matter how the worker was started. Use a worker-only token"
+    echo "    instead when this machine's HuggingFace account has to stay a different"
+    echo "    one — RustDAW starts the worker from the desktop, where an exported"
+    echo "    HF_TOKEN never reaches it, so the token goes in a file it reads itself:"
+    echo "      printf %s \"hf_...\" > \"$DATA_DIR/muscriptor.token\" && chmod 600 \"$DATA_DIR/muscriptor.token\""
+    echo "    Until one of the two is in place the import falls back to basic-pitch."
   else
     echo "    MuScriptor could not be installed — basic-pitch stays the backend." >&2
     rm -rf -- "$MUSCRIPTOR_VENV"

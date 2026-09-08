@@ -90,6 +90,29 @@ def muscriptor_binary() -> str | None:
     return shutil.which("muscriptor")
 
 
+def muscriptor_token() -> str | None:
+    """A HuggingFace token for the gated weights, when one is set aside here.
+
+    ``HF_TOKEN`` in the environment wins and needs no help — the subprocess
+    inherits it. Otherwise ``muscriptor.token`` beside the worker's projects is
+    read, which is the only place a token can live and still be found: RustDAW
+    starts the worker from a desktop session, where nothing exported in a shell
+    ever arrives, and writing one into the machine's own ``hf auth login`` would
+    change which HuggingFace account everything else on it uses.
+
+    Returns ``None`` when the environment already carries one or there is no
+    file, both of which mean the subprocess needs no extra environment.
+    """
+    if os.environ.get("HF_TOKEN"):
+        return None
+    from store import data_dir
+
+    path = data_dir() / "muscriptor.token"
+    if not path.is_file():
+        return None
+    return path.read_text().strip() or None
+
+
 def muscriptor_model(device: str | None = None) -> str:
     """Which published variant to run.
 
@@ -344,6 +367,7 @@ def transcribe_muscriptor(source: Path, into: Path, on_progress: ProgressFn) -> 
     midi_dir.mkdir(parents=True, exist_ok=True)
     destination = midi_dir / "song.mid"
     on_progress("transcribe", 0.0, f"transcribing with muscriptor ({model})")
+    token = muscriptor_token()
     result = subprocess.run(
         [
             binary, "transcribe", str(source),
@@ -358,6 +382,7 @@ def transcribe_muscriptor(source: Path, into: Path, on_progress: ProgressFn) -> 
         ],
         capture_output=True,
         text=True,
+        env={**os.environ, "HF_TOKEN": token} if token else None,
     )
     if result.returncode != 0 or not destination.is_file():
         destination.unlink(missing_ok=True)
