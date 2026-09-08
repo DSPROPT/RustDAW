@@ -398,6 +398,11 @@ enum PlaybackCommand {
         gain: f32,
         pan: f32,
     },
+    SetTrackInstrument {
+        track_id: usize,
+        program: u8,
+        is_drum_kit: bool,
+    },
     SetTrackEffects {
         track_id: usize,
         params: ChannelStripParams,
@@ -947,6 +952,30 @@ impl AudioRuntime {
     pub fn set_track_audible(&self, track_id: usize, audible: bool) -> Result<()> {
         self.playback_commands
             .push(PlaybackCommand::SetTrackAudible { track_id, audible })
+            .map_err(|_| anyhow::anyhow!("audio command queue is full"))
+    }
+
+    /// Changes the sound one instrument track plays, without resending its
+    /// notes.
+    ///
+    /// Takes effect on the next block, so an instrument can be chosen by ear
+    /// while the transport runs rather than only at the next start.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the real-time command queue is full.
+    pub fn set_track_instrument(
+        &self,
+        track_id: usize,
+        program: u8,
+        is_drum_kit: bool,
+    ) -> Result<()> {
+        self.playback_commands
+            .push(PlaybackCommand::SetTrackInstrument {
+                track_id,
+                program: program.min(127),
+                is_drum_kit,
+            })
             .map_err(|_| anyhow::anyhow!("audio command queue is full"))
     }
 
@@ -1588,6 +1617,23 @@ fn output_stream<T: cpal::SizedSample + Copy + Send + 'static>(
                                     part.pan = pan;
                                 }
                             }
+                        }
+                        PlaybackCommand::SetTrackInstrument {
+                            track_id,
+                            program,
+                            is_drum_kit,
+                        } => {
+                            for part in midi_slots.iter_mut().flatten() {
+                                if part.track_id == track_id {
+                                    part.program = program;
+                                    part.is_drum_kit = is_drum_kit;
+                                }
+                            }
+                            // The notes already sounding were started on the old
+                            // sound and cannot be changed mid-flight, so they are
+                            // stopped rather than left ringing as the instrument
+                            // the track no longer is.
+                            mixer.silence_track(track_id);
                         }
                         PlaybackCommand::SetTrackEffects { track_id, params } => {
                             mixer.set_track_effects(track_id, params);

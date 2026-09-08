@@ -16,7 +16,7 @@ use daw_audio_linux::{
 };
 use daw_control::{Action as FootAction, Command as FootCommand};
 use daw_core::{ChannelLayout, SamplePosition};
-use daw_engine::ChannelStripParams;
+use daw_engine::{ChannelStripParams, Family, program_name};
 use daw_midi::{MidiClip, TempoMap};
 use daw_project::{
     PresetLibrary, ProjectClip, ProjectDocument, ProjectTrack, TrackEffects, TrackKind, load,
@@ -38,6 +38,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// What the channel-10 kit is called in the instrument picker. It is not one of
+/// the 128 programs, so it needs a name of its own.
+const DRUM_KIT_LABEL: &str = "Drum Kit";
 const HEADER_WIDTH: f32 = 265.0;
 const TRACK_HEIGHT: f32 = 112.0;
 const MIN_RECORDING_SPACE_BYTES: u64 = 256 * 1024 * 1024;
@@ -4932,34 +4935,105 @@ impl RustDawApp {
                     );
                 });
                 ui.horizontal(|ui| {
-                    ui.label("IN");
-                    egui::ComboBox::from_id_salt(("input", index))
-                        .selected_text(match track.layout {
-                            ChannelLayout::Mono => self
-                                .audio_preferences
-                                .input_labels
-                                .get(track.input_left)
-                                .cloned()
-                                .unwrap_or_else(|| format!("Input {}", track.input_left + 1)),
-                            ChannelLayout::Stereo => "Inputs 1–2".to_owned(),
-                        })
-                        .width(104.0)
-                        .show_ui(ui, |ui| {
-                            if track.layout == ChannelLayout::Mono {
-                                let input_count = self.runtime.as_ref().map_or(4, |runtime| {
-                                    usize::from(runtime.input_channels()).min(4)
-                                });
-                                for channel in 0..input_count {
-                                    ui.selectable_value(
-                                        &mut track.input_left,
-                                        channel,
-                                        &self.audio_preferences.input_labels[channel],
-                                    );
-                                }
+                    // An instrument track has no input to choose — it is played
+                    // by the synthesiser — so the slot the input picker occupies
+                    // on an audio track carries the sound it plays instead.
+                    if track.kind.is_instrument() {
+                        ui.label("SND");
+                        let mut instrument_changed = false;
+                        egui::ComboBox::from_id_salt(("instrument", index))
+                            .selected_text(if track.drum_kit {
+                                DRUM_KIT_LABEL.to_owned()
                             } else {
-                                ui.label("Inputs 1–2");
+                                program_name(track.program.unwrap_or(0)).to_owned()
+                            })
+                            .width(104.0)
+                            .show_ui(ui, |ui| {
+                                egui::ScrollArea::vertical().max_height(320.0).show(
+                                    ui,
+                                    |ui| {
+                                        // The kit is not one of the 128 programs
+                                        // — on General MIDI it is a channel — so
+                                        // it sits above them rather than among
+                                        // them.
+                                        if ui
+                                            .selectable_label(track.drum_kit, DRUM_KIT_LABEL)
+                                            .clicked()
+                                        {
+                                            track.drum_kit = true;
+                                            instrument_changed = true;
+                                        }
+                                        let mut family = None;
+                                        for program in 0..=127_u8 {
+                                            let group = Family::of_program(program);
+                                            if family != Some(group) {
+                                                ui.add_space(4.0);
+                                                ui.label(
+                                                    RichText::new(group.name())
+                                                        .small()
+                                                        .color(theme::MUTED),
+                                                );
+                                                family = Some(group);
+                                            }
+                                            let chosen = !track.drum_kit
+                                                && track.program.unwrap_or(0) == program;
+                                            if ui
+                                                .selectable_label(chosen, program_name(program))
+                                                .clicked()
+                                            {
+                                                track.program = Some(program);
+                                                track.drum_kit = false;
+                                                instrument_changed = true;
+                                            }
+                                        }
+                                    },
+                                );
+                            });
+                        if instrument_changed {
+                            self.dirty = true;
+                            // Straight to the audio thread, so the sound can be
+                            // chosen by ear while the song plays. The next sync
+                            // sends it again with the notes, which costs nothing
+                            // and keeps the two in step if this one is dropped.
+                            if let Some(runtime) = &self.runtime {
+                                let _ = runtime.set_track_instrument(
+                                    index,
+                                    track.program.unwrap_or(0),
+                                    track.drum_kit,
+                                );
                             }
-                        });
+                            self.playback_synced = false;
+                        }
+                    } else {
+                        ui.label("IN");
+                        egui::ComboBox::from_id_salt(("input", index))
+                            .selected_text(match track.layout {
+                                ChannelLayout::Mono => self
+                                    .audio_preferences
+                                    .input_labels
+                                    .get(track.input_left)
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("Input {}", track.input_left + 1)),
+                                ChannelLayout::Stereo => "Inputs 1–2".to_owned(),
+                            })
+                            .width(104.0)
+                            .show_ui(ui, |ui| {
+                                if track.layout == ChannelLayout::Mono {
+                                    let input_count = self.runtime.as_ref().map_or(4, |runtime| {
+                                        usize::from(runtime.input_channels()).min(4)
+                                    });
+                                    for channel in 0..input_count {
+                                        ui.selectable_value(
+                                            &mut track.input_left,
+                                            channel,
+                                            &self.audio_preferences.input_labels[channel],
+                                        );
+                                    }
+                                } else {
+                                    ui.label("Inputs 1–2");
+                                }
+                            });
+                    }
                     ui.add(
                         egui::DragValue::new(&mut track.gain_db)
                             .range(-60.0..=12.0)
