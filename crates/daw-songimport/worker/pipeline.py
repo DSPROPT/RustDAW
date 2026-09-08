@@ -476,44 +476,95 @@ def run(url: str, on_progress: ProgressFn | None = None) -> str:
     with tempfile.TemporaryDirectory() as scratch:
         scratch_dir = Path(scratch)
         downloaded, metadata = download(url, scratch_dir, progress)
-        # Decode to WAV once so the codec never trips up Demucs or librosa.
-        source = to_wav(downloaded, scratch_dir)
+        return _process(downloaded, scratch_dir, metadata, url, progress)
 
-        directory = project_dir(make_project_id(metadata.get("title")))
-        directory.mkdir(parents=True, exist_ok=True)
 
-        stems = separate(source, directory, progress)
-        try:
-            midi, backend = transcribe(source, directory, stems, progress)
-        except Exception as error:  # noqa: BLE001 — transcription is best-effort
-            progress("transcribe", 100.0, f"transcription skipped: {error}")
-            midi, backend = None, None
-        try:
-            beat_grid = analyse_beats(source, progress)
-        except Exception as error:  # noqa: BLE001 — beat detection is best-effort
-            progress("analyze", 100.0, f"tempo detection skipped: {error}")
-            beat_grid = None
+def run_file(
+    audio: Path, on_progress: ProgressFn | None = None, title: str | None = None
+) -> str:
+    """Run the pipeline for a file already on this machine.
 
-        progress("finalize", 50.0, "writing manifest")
-        write_manifest(
-            directory,
-            title=metadata.get("title"),
-            artist=metadata.get("artist"),
-            style=None,
-            source_url=url,
-            duration=metadata.get("duration"),
-            stems=stems,
-            drumkit=None,
-            midi=midi,
-            beat_grid=beat_grid,
-            stages={
-                "download": {"status": "done"},
-                "separate": {"status": "done"},
-                "transcribe": {
-                    "status": "done" if midi else "skipped",
-                    **({"backend": backend} if midi and backend else {}),
-                },
+    The same work as :func:`run` with the download stage already done, so a song
+    that was never on the internet goes through exactly the path a link does.
+
+    ``title`` is the name to file it under. It is passed in rather than taken
+    from ``audio`` because an upload is stored under a name of the worker's own
+    making, and the song the person chose is the one they want to see again.
+    """
+    progress = on_progress or _noop
+    if not audio.is_file():
+        raise RuntimeError(f"no such file: {audio}")
+    progress("download", 100.0, "using the uploaded file")
+    metadata = {"title": title or audio.stem, "artist": None, "duration": None}
+    with tempfile.TemporaryDirectory() as scratch:
+        return _process(audio, Path(scratch), metadata, None, progress)
+
+
+def wav_duration(path: Path) -> float | None:
+    """Length of a WAV in seconds, or ``None`` if it cannot be read.
+
+    A link brings its duration along in the download metadata; a file has to be
+    measured, and by this point it has already been decoded to a plain WAV, so
+    the header is enough and nothing has to be loaded.
+    """
+    import wave
+
+    try:
+        with wave.open(str(path), "rb") as handle:
+            rate = handle.getframerate()
+            return handle.getnframes() / rate if rate else None
+    except Exception:  # noqa: BLE001 — a duration is a nicety, never a failure
+        return None
+
+
+def _process(
+    downloaded: Path,
+    scratch_dir: Path,
+    metadata: dict,
+    source_url: str | None,
+    progress: ProgressFn,
+) -> str:
+    """Separate, transcribe and analyse one downloaded or uploaded song."""
+    # Decode to WAV once so the codec never trips up Demucs or librosa.
+    source = to_wav(downloaded, scratch_dir)
+
+    directory = project_dir(make_project_id(metadata.get("title")))
+    directory.mkdir(parents=True, exist_ok=True)
+    if metadata.get("duration") is None:
+        metadata["duration"] = wav_duration(source)
+
+    stems = separate(source, directory, progress)
+    try:
+        midi, backend = transcribe(source, directory, stems, progress)
+    except Exception as error:  # noqa: BLE001 — transcription is best-effort
+        progress("transcribe", 100.0, f"transcription skipped: {error}")
+        midi, backend = None, None
+    try:
+        beat_grid = analyse_beats(source, progress)
+    except Exception as error:  # noqa: BLE001 — beat detection is best-effort
+        progress("analyze", 100.0, f"tempo detection skipped: {error}")
+        beat_grid = None
+
+    progress("finalize", 50.0, "writing manifest")
+    write_manifest(
+        directory,
+        title=metadata.get("title"),
+        artist=metadata.get("artist"),
+        style=None,
+        source_url=source_url,
+        duration=metadata.get("duration"),
+        stems=stems,
+        drumkit=None,
+        midi=midi,
+        beat_grid=beat_grid,
+        stages={
+            "download": {"status": "done"},
+            "separate": {"status": "done"},
+            "transcribe": {
+                "status": "done" if midi else "skipped",
+                **({"backend": backend} if midi and backend else {}),
             },
-        )
-        progress("finalize", 100.0, "done")
-        return directory.name
+        },
+    )
+    progress("finalize", 100.0, "done")
+    return directory.name

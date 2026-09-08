@@ -53,6 +53,16 @@ def projects_dir() -> Path:
     return data_dir() / "projects"
 
 
+def uploads_dir() -> Path:
+    """Where a song imported from this machine is copied before it is processed.
+
+    RustDAW hands over the bytes in one request rather than a path, so the file
+    it read is kept here for the run: renaming or deleting the original while
+    the pipeline works cannot disturb it.
+    """
+    return data_dir() / "uploads"
+
+
 _SLUG = re.compile(r"[^a-z0-9]+")
 
 

@@ -2,10 +2,11 @@
 
 Implements the exact endpoints RustDAW's ``client.rs`` calls:
 
-* ``GET  /api/health``      -> ``{ok, cuda, models}``
-* ``GET  /api/projects``    -> ``[ProjectSummary]``
-* ``POST /api/jobs``        -> start a job for ``{url}``, returns a ``Job``
-* ``GET  /api/jobs/<id>``   -> poll a ``Job``
+* ``GET  /api/health``        -> ``{ok, cuda, models}``
+* ``GET  /api/projects``      -> ``[ProjectSummary]``
+* ``POST /api/jobs``          -> start a job for ``{url}``, returns a ``Job``
+* ``POST /api/jobs/upload``   -> start a job for an uploaded file, returns a ``Job``
+* ``GET  /api/jobs/<id>``     -> poll a ``Job``
 
 Jobs run on background threads; their state lives in memory. The server binds to
 127.0.0.1 only, so nothing is ever reachable off the machine. Only the standard
@@ -17,9 +18,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import store
 
@@ -85,17 +88,70 @@ def _update(job_id: str, **fields) -> None:
             job.update(fields)
 
 
-def _run_job(job_id: str, url: str) -> None:
+def _run(job_id: str, start) -> None:
+    """Run one pipeline entry point, reporting into the job registry."""
+
     def on_progress(stage: str, percent: float, message: str) -> None:
         _update(job_id, status="running", stage=stage, percent=float(percent), message=message)
 
     try:
-        import pipeline
-
-        project_id = pipeline.run(url, on_progress)
+        project_id = start(on_progress)
         _update(job_id, status="done", percent=100.0, projectId=project_id, message="done")
     except Exception as error:  # noqa: BLE001 — any failure becomes a reported job error
         _update(job_id, status="error", error=str(error), message=str(error))
+
+
+def _run_job(job_id: str, url: str) -> None:
+    def start(on_progress):
+        import pipeline
+
+        return pipeline.run(url, on_progress)
+
+    _run(job_id, start)
+
+
+def _run_upload_job(job_id: str, upload: tuple[Path, str]) -> None:
+    audio, title = upload
+
+    def start(on_progress):
+        import pipeline
+
+        return pipeline.run_file(audio, on_progress, title=title)
+
+    _run(job_id, start)
+
+
+def _multipart_file(body: bytes, content_type: str) -> tuple[str, bytes] | None:
+    """The single ``file`` part of a multipart body, as ``(filename, bytes)``.
+
+    RustDAW sends exactly one part, under a random boundary that cannot occur in
+    the payload, so this reads that shape rather than the whole of RFC 7578.
+    """
+    match = re.search(r'boundary=(?:"([^"]+)"|([^;\s]+))', content_type)
+    if not match:
+        return None
+    delimiter = b"--" + (match.group(1) or match.group(2)).encode()
+    for chunk in body.split(delimiter):
+        head, blank, data = chunk.partition(b"\r\n\r\n")
+        if not blank or b'name="file"' not in head:
+            continue
+        found = re.search(br'filename="([^"]*)"', head)
+        name = found.group(1).decode("utf-8", "replace") if found else "upload.bin"
+        # The CRLF closing the part belongs to the delimiter, not to the file.
+        return name, data[:-2] if data.endswith(b"\r\n") else data
+    return None
+
+
+def _store_upload(name: str, data: bytes) -> Path:
+    """Write an uploaded song into the worker's own uploads folder."""
+    # Only the extension is taken from the client, because ffmpeg picks its
+    # decoder from it; the rest of the name is ours, so no upload can be made to
+    # land outside the folder or overwrite an earlier one.
+    suffix = "".join(char for char in Path(name).suffix if char.isalnum() or char == ".")
+    destination = store.uploads_dir() / f"{uuid.uuid4().hex[:12]}{suffix[:16]}"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(data)
+    return destination
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -139,14 +195,39 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, {"error": "not found"})
 
+    def _start(self, target, argument) -> None:
+        """Register a job, run it on its own thread and answer with it."""
+        job = _new_job()
+        with _LOCK:
+            _JOBS[job["id"]] = job
+        threading.Thread(target=target, args=(job["id"], argument), daemon=True).start()
+        self._send(200, job)
+
     def do_POST(self) -> None:  # noqa: N802 — required name
         path = self.path.split("?", 1)[0]
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        # The body is always read, even when the path is wrong: answering an
+        # upload without reading it closes the connection while the client is
+        # still writing, which reaches it as a broken pipe instead of the 404.
+        raw = self.rfile.read(length) if length else b""
+
+        if path == "/api/jobs/upload":
+            part = _multipart_file(raw, self.headers.get("Content-Type", ""))
+            if part is None:
+                self._send(400, {"error": "expected one multipart 'file' part"})
+                return
+            name, data = part
+            if not data:
+                self._send(400, {"error": "the uploaded file is empty"})
+                return
+            self._start(_run_upload_job, (_store_upload(name, data), Path(name).stem))
+            return
+
         if path != "/api/jobs":
             self._send(404, {"error": "not found"})
             return
-        length = int(self.headers.get("Content-Length", 0) or 0)
         try:
-            body = json.loads(self.rfile.read(length) or b"{}")
+            body = json.loads(raw or b"{}")
         except json.JSONDecodeError:
             self._send(400, {"error": "invalid JSON body"})
             return
@@ -154,11 +235,7 @@ class Handler(BaseHTTPRequestHandler):
         if not (url.startswith("http://") or url.startswith("https://")):
             self._send(400, {"error": "only http(s) links are accepted"})
             return
-        job = _new_job()
-        with _LOCK:
-            _JOBS[job["id"]] = job
-        threading.Thread(target=_run_job, args=(job["id"], url), daemon=True).start()
-        self._send(200, job)
+        self._start(_run_job, url)
 
 
 def main() -> int:
