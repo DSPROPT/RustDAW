@@ -18,10 +18,20 @@ use uuid::Uuid;
 
 use crate::manifest::SongManifest;
 
-/// Below this peak a stem is silence in practice. Demucs always emits all six
-/// stems; on a song with no piano the piano stem is dither and nothing else,
-/// and importing it as a track is just clutter.
+/// Below this peak a stem is silence in practice: nothing in it ever moves.
 const SILENCE_CEILING_DB: f64 = -60.0;
+
+/// How far below the loudest stem's mean level a stem stops being an instrument
+/// and becomes leakage from the ones beside it.
+///
+/// Demucs always emits all six stems; on a song with no piano the piano stem is
+/// what leaked into it and nothing else. Its peak is no help — a leaked snare
+/// hit clips as high as a played one, which is why the peak test above passes
+/// every stem of every real song — so the level that decides is the mean, taken
+/// against the loudest stem so that it scales with the master's own loudness.
+/// 35 dB down is inaudible against the rest of the song, and well clear of a
+/// genuinely sparse part: a vocal that enters for two phrases sits 25 dB down.
+const BLEED_FLOOR_DB: f64 = 35.0;
 
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_excessive_bools, reason = "independent import switches")]
@@ -82,11 +92,21 @@ pub struct Ingested {
 struct ConvertedAudio {
     frames: u64,
     peak_db: Option<f64>,
+    mean_db: Option<f64>,
 }
 
 impl ConvertedAudio {
     fn is_silent(self) -> bool {
         self.peak_db.is_some_and(|peak| peak <= SILENCE_CEILING_DB)
+    }
+
+    /// Whether this stem is leakage, given the loudest mean in the same song.
+    ///
+    /// A stem whose mean could not be read is never dropped: a change in what
+    /// ffmpeg prints must not silently lose part of a song.
+    fn is_bleed(self, loudest_mean_db: f64) -> bool {
+        self.mean_db
+            .is_some_and(|mean| loudest_mean_db - mean >= BLEED_FLOOR_DB)
     }
 }
 
@@ -144,8 +164,8 @@ pub fn ingest_project(
         .detected_tempo()
         .map_or(4, |detected| detected.beats_per_bar);
 
-    let mut tracks = Vec::new();
     let mut skipped = Vec::new();
+    let mut converted = Vec::new();
     let total = sources.len().max(1);
     for (index, (stem_name, relative_path)) in sources.iter().enumerate() {
         #[allow(clippy::cast_precision_loss)]
@@ -162,23 +182,40 @@ pub fn ingest_project(
         // applied afterwards by the same code that re-keys a session later, so
         // the session keeps its original audio and changing key again shifts
         // that rather than shifting a shift.
-        let converted = convert_audio(&source, &destination, target_rate, 0)
+        let audio = convert_audio(&source, &destination, target_rate, 0)
             .with_context(|| format!("failed to convert the {stem_name} stem"))?;
 
-        if converted.frames == 0 || (options.skip_silent && converted.is_silent()) {
+        if audio.frames == 0 || (options.skip_silent && audio.is_silent()) {
             let _ = std::fs::remove_file(&destination);
             skipped.push(stem_name.clone());
             continue;
         }
+        converted.push((stem_name.clone(), destination, audio));
+    }
 
-        let mut track = ProjectTrack::new(title_case(stem_name), ChannelLayout::Stereo);
+    // Which stems are leakage can only be answered once they have all been
+    // measured, because the answer is relative to the loudest one. That also
+    // means the test can never empty a session: the loudest stem is not 35 dB
+    // below itself, so it always survives.
+    let loudest_mean_db = converted
+        .iter()
+        .filter_map(|(_, _, audio)| audio.mean_db)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut tracks = Vec::new();
+    for (stem_name, destination, audio) in converted {
+        if options.skip_silent && loudest_mean_db.is_finite() && audio.is_bleed(loudest_mean_db) {
+            let _ = std::fs::remove_file(&destination);
+            skipped.push(stem_name);
+            continue;
+        }
+        let mut track = ProjectTrack::new(title_case(&stem_name), ChannelLayout::Stereo);
         track.clips.push(ProjectClip {
             source_start_frame: 0,
             id: Uuid::new_v4(),
-            name: title_case(stem_name),
+            name: title_case(&stem_name),
             path: destination,
             start_frame: 0,
-            end_frame: converted.frames,
+            end_frame: audio.frames,
             source_path: None,
         });
         tracks.push(track);
@@ -258,7 +295,8 @@ pub fn ingest_project(
     }
 
     if options.import_midi {
-        match import_midi_tracks(project_dir, &document.tempo_map(), offset_seconds) {
+        match import_midi_tracks(project_dir, &document.tempo_map(), offset_seconds, beats_per_bar)
+        {
             Ok((instrument_tracks, skipped_midi)) => {
                 if !skipped_midi.is_empty() {
                     notes.push(format!("MIDI tracks left out: {}", skipped_midi.join(", ")));
@@ -511,6 +549,7 @@ fn import_midi_tracks(
     project_dir: &Path,
     tempo: &TempoMap,
     offset_seconds: f64,
+    beats_per_bar: u16,
 ) -> Result<(Vec<ProjectTrack>, Vec<String>)> {
     let path = project_dir.join("midi/song.mid");
     if !path.is_file() {
@@ -530,6 +569,9 @@ fn import_midi_tracks(
         tempo.seconds_to_tick(seconds)
     };
 
+    let split_ticks =
+        u64::from(CLIP_SPLIT_BARS) * u64::from(beats_per_bar) * u64::from(tempo.ticks_per_quarter());
+
     let mut tracks = Vec::new();
     let skipped = Vec::new();
     for source in file.sounding_tracks() {
@@ -538,8 +580,7 @@ fn import_midi_tracks(
         } else {
             title_case(&source.name)
         };
-        let mut clip = MidiClip::new(name.clone(), 0, 0);
-        clip.notes = source
+        let notes = source
             .notes
             .iter()
             .map(|note| {
@@ -548,21 +589,80 @@ fn import_midi_tracks(
                 daw_midi::Note::new(note.pitch, note.velocity, start, end - start)
             })
             .collect();
-        clip.resort();
-        clip.length_ticks = clip.notes.last().map_or(1, |note| note.end_tick()).max(1);
         // Channel 10 is the General MIDI drum kit, which the synth now plays.
         let mut track = if source.is_drums() {
-            ProjectTrack::drum_track(name)
+            ProjectTrack::drum_track(name.clone())
         } else {
-            ProjectTrack::instrument(name, source.program)
+            ProjectTrack::instrument(name.clone(), source.program)
         };
         // Instrument tracks start quiet: the stems are the reference and the
         // synth is there to be brought up against them, not to compete.
         track.gain_db = -9.0;
-        track.midi_clips.push(clip);
+        track.midi_clips = split_into_clips(&name, notes, split_ticks);
         tracks.push(track);
     }
     Ok((tracks, skipped))
+}
+
+/// A rest at least this many bars long ends a clip; the next note starts a new
+/// one. An instrument that enters at the last chorus used to be drawn as one
+/// clip from bar 1 to the end of the song with the notes somewhere inside it,
+/// which reads as an empty track. Cutting at the long rests puts a block on the
+/// timeline exactly where the instrument is playing and nowhere else. Two bars
+/// is past any rest inside a phrase and short enough to separate the sections.
+const CLIP_SPLIT_BARS: u16 = 2;
+
+/// Cuts one track's notes into clips at its long rests.
+///
+/// `notes` are positioned on the session's timeline; each clip returned starts
+/// at its own first note and holds its notes relative to that, which is how
+/// [`MidiClip`] stores them.
+fn split_into_clips(name: &str, mut notes: Vec<daw_midi::Note>, split_ticks: u64) -> Vec<MidiClip> {
+    notes.sort_by_key(|note| (note.start_tick, note.pitch));
+
+    let mut clips = Vec::new();
+    let mut current: Vec<daw_midi::Note> = Vec::new();
+    // The end of the last note still sounding, which is not the end of the last
+    // note that started: a held chord under a melody outlasts the notes over it.
+    let mut sounding_end = 0;
+    for note in notes {
+        if current.is_empty() {
+            sounding_end = note.end_tick();
+        } else if note.start_tick.saturating_sub(sounding_end) >= split_ticks {
+            clips.push(gather_clip(name, std::mem::take(&mut current)));
+            sounding_end = note.end_tick();
+        } else {
+            sounding_end = sounding_end.max(note.end_tick());
+        }
+        current.push(note);
+    }
+    if !current.is_empty() {
+        clips.push(gather_clip(name, current));
+    }
+    clips
+}
+
+/// One clip from notes already known to belong together, rebased onto its start.
+fn gather_clip(name: &str, notes: Vec<daw_midi::Note>) -> MidiClip {
+    let start = notes.first().map_or(0, |note| note.start_tick);
+    let end = notes
+        .iter()
+        .map(|note| note.end_tick())
+        .max()
+        .unwrap_or(start);
+    let mut clip = MidiClip::new(name.to_owned(), start, end.saturating_sub(start).max(1));
+    clip.notes = notes
+        .into_iter()
+        .map(|note| {
+            daw_midi::Note::new(
+                note.pitch,
+                note.velocity,
+                note.start_tick - start,
+                note.length_ticks,
+            )
+        })
+        .collect();
+    clip
 }
 
 /// Resamples one file into the session, reporting its length and peak.
@@ -739,9 +839,11 @@ fn convert_audio(
     }
 
     let frames = wav_frame_count(destination)?;
+    let report = String::from_utf8_lossy(&output.stderr);
     Ok(ConvertedAudio {
         frames,
-        peak_db: parse_max_volume(&String::from_utf8_lossy(&output.stderr)),
+        peak_db: parse_volume(&report, "max_volume:"),
+        mean_db: parse_volume(&report, "mean_volume:"),
     })
 }
 
@@ -752,15 +854,13 @@ fn wav_frame_count(path: &Path) -> Result<u64> {
     Ok(u64::from(reader.duration()))
 }
 
-/// Extracts `max_volume: -12.3 dB` from ffmpeg's `volumedetect` output.
+/// Extracts `max_volume: -12.3 dB` or `mean_volume: -22.7 dB` from ffmpeg's
+/// `volumedetect` output.
 /// Returns `None` when the line is absent or unparseable, which is treated as
 /// "assume there is signal" so a parsing change never silently drops a stem.
-fn parse_max_volume(stderr: &str) -> Option<f64> {
-    let line = stderr
-        .lines()
-        .rev()
-        .find(|line| line.contains("max_volume:"))?;
-    let value = line.split("max_volume:").nth(1)?.trim();
+fn parse_volume(stderr: &str, label: &str) -> Option<f64> {
+    let line = stderr.lines().rev().find(|line| line.contains(label))?;
+    let value = line.split(label).nth(1)?.trim();
     let number = value.strip_suffix("dB").unwrap_or(value).trim();
     if number.eq_ignore_ascii_case("-inf") {
         return Some(f64::NEG_INFINITY);
@@ -829,21 +929,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn max_volume_is_read_from_ffmpeg_output() {
+    fn both_levels_are_read_from_ffmpeg_output() {
         let stderr = "[Parsed_volumedetect_0 @ 0x55] n_samples: 100\n\
                       [Parsed_volumedetect_0 @ 0x55] mean_volume: -22.7 dB\n\
                       [Parsed_volumedetect_0 @ 0x55] max_volume: -0.4 dB\n";
-        assert_eq!(parse_max_volume(stderr), Some(-0.4));
+        assert_eq!(parse_volume(stderr, "max_volume:"), Some(-0.4));
+        assert_eq!(parse_volume(stderr, "mean_volume:"), Some(-22.7));
     }
 
     #[test]
     fn digital_silence_reports_negative_infinity() {
         let stderr = "[Parsed_volumedetect_0 @ 0x55] max_volume: -inf dB\n";
-        assert_eq!(parse_max_volume(stderr), Some(f64::NEG_INFINITY));
+        assert_eq!(
+            parse_volume(stderr, "max_volume:"),
+            Some(f64::NEG_INFINITY)
+        );
         assert!(
             ConvertedAudio {
                 frames: 1,
                 peak_db: Some(f64::NEG_INFINITY),
+                mean_db: Some(f64::NEG_INFINITY),
             }
             .is_silent()
         );
@@ -851,14 +956,19 @@ mod tests {
 
     #[test]
     fn unreadable_output_keeps_the_stem() {
-        assert_eq!(parse_max_volume("ffmpeg version 6.1.1\n"), None);
+        assert_eq!(parse_volume("ffmpeg version 6.1.1\n", "max_volume:"), None);
+        let unmeasured = ConvertedAudio {
+            frames: 1,
+            peak_db: None,
+            mean_db: None,
+        };
         assert!(
-            !ConvertedAudio {
-                frames: 1,
-                peak_db: None,
-            }
-            .is_silent(),
+            !unmeasured.is_silent(),
             "an unparsed peak must not be treated as silence"
+        );
+        assert!(
+            !unmeasured.is_bleed(-10.0),
+            "an unparsed mean must not be treated as leakage"
         );
     }
 
@@ -868,9 +978,80 @@ mod tests {
             !ConvertedAudio {
                 frames: 1,
                 peak_db: Some(-42.0),
+                mean_db: Some(-52.0),
             }
             .is_silent()
         );
+    }
+
+    #[test]
+    fn leakage_is_told_from_a_sparse_part_by_its_mean() {
+        // Measured from a real import: the guitar stem of a song with no
+        // guitar. Its peak is a leaked transient, so only the mean can tell.
+        let leaked = ConvertedAudio {
+            frames: 1,
+            peak_db: Some(-14.4),
+            mean_db: Some(-51.8),
+        };
+        assert!(!leaked.is_silent(), "the peak test cannot see this");
+        assert!(leaked.is_bleed(-14.6));
+
+        // A vocal that only enters for a couple of phrases, from the same set.
+        let sparse = ConvertedAudio {
+            frames: 1,
+            peak_db: Some(-13.3),
+            mean_db: Some(-44.3),
+        };
+        assert!(!sparse.is_bleed(-19.0));
+    }
+
+    #[test]
+    fn a_track_is_cut_into_clips_at_its_long_rests() {
+        let bar = 4 * 960;
+        let split = 2 * bar;
+        let note = |start: u64| daw_midi::Note::new(60, 100, start, 480);
+        let clips = split_into_clips(
+            "Piano",
+            vec![note(0), note(960), note(10 * bar), note(10 * bar + 960)],
+            split,
+        );
+        assert_eq!(clips.len(), 2);
+        assert_eq!(clips[0].start_tick, 0);
+        assert_eq!(clips[0].length_ticks, 960 + 480);
+        // The second clip starts where the instrument comes back in, not at
+        // bar 1, and its notes are relative to that.
+        assert_eq!(clips[1].start_tick, 10 * bar);
+        assert_eq!(clips[1].notes[0].start_tick, 0);
+        assert_eq!(clips[1].notes[1].start_tick, 960);
+    }
+
+    #[test]
+    fn a_rest_inside_a_phrase_does_not_cut_the_clip() {
+        let split = 2 * 4 * 960;
+        let note = |start: u64| daw_midi::Note::new(60, 100, start, 480);
+        let clips = split_into_clips("Bass", vec![note(0), note(4 * 960)], split);
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].notes.len(), 2);
+    }
+
+    #[test]
+    fn a_note_held_under_the_rest_keeps_the_clip_whole() {
+        // The melody stops for three bars but a pad is still sounding, so
+        // there is no rest to cut at.
+        let bar = 4 * 960;
+        let held = daw_midi::Note::new(48, 90, 0, 4 * bar);
+        let melody = daw_midi::Note::new(72, 100, 3 * bar, 480);
+        let clips = split_into_clips("Pad", vec![held, melody], 2 * bar);
+        assert_eq!(clips.len(), 1, "a sounding note is not a rest");
+    }
+
+    #[test]
+    fn a_track_with_no_rests_stays_one_clip() {
+        let note = |start: u64| daw_midi::Note::new(60, 100, start, 480);
+        let clips = split_into_clips("Drums", vec![note(0), note(480), note(960)], 2 * 4 * 960);
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].start_tick, 0);
+        assert_eq!(clips[0].length_ticks, 960 + 480);
     }
 
     #[test]

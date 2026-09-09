@@ -6,12 +6,19 @@ keep working before the models are installed, and a missing package surfaces as 
 clear per-stage error instead of an import failure at start-up.
 
 Transcription has two backends. MuScriptor is preferred when it is installed: it
-is multi-instrument, so one pass over the mix replaces one basic-pitch pass per
-stem and brings back the drum kit the per-stem path has to leave out. It lives in
-its own virtualenv (its NumPy 2 floor does not agree with the Demucs stack here)
-and is driven as a subprocess, so nothing it needs is installed alongside these
-packages. basic-pitch stays the fallback, and remains the only backend whose
-weights are free of a non-commercial clause.
+knows what instrument it is listening to, so it names its own tracks and brings
+back the drum kit basic-pitch has to leave out. It lives in its own virtualenv
+(its NumPy 2 floor does not agree with the Demucs stack here) and is driven as a
+subprocess, so nothing it needs is installed alongside these packages.
+basic-pitch stays the fallback, and remains the only backend whose weights are
+free of a non-commercial clause.
+
+Both backends run once per separated stem rather than once over the mix. The
+model decodes in five-second chunks and re-decides the instrument in every one,
+so over a mix a single guitar comes back as three tracks that each stop where
+the next begins — tracks that are mostly empty, and a part nobody played. A stem
+settles that question before the model is asked, and MuScriptor is additionally
+told which instruments the stem may contain.
 
 The pipeline writes exactly the project layout ``store`` documents and RustDAW
 reads. It does the separation and transcription; RustDAW converts the stems to
@@ -113,18 +120,81 @@ def muscriptor_token() -> str | None:
     return path.read_text().strip() or None
 
 
+# The published variants worth running on a GPU, best first. Each is gated
+# separately on HuggingFace, so a token that opened ``medium`` does not
+# necessarily open ``large``; the first one whose weights this machine can
+# actually fetch is the one used, and the answer is remembered for the process.
+MUSCRIPTOR_MODELS = ("large", "medium")
+
+_RESOLVED_MODEL: str | None = None
+
+
 def muscriptor_model(device: str | None = None) -> str:
     """Which published variant to run.
 
-    ``medium`` is MuScriptor's own default and wants a GPU. It decodes
-    autoregressively over five-second chunks, which on a CPU-only machine takes
-    long enough to dominate the whole import, so ``small`` is used there
-    instead. ``MUSCRIPTOR_MODEL`` overrides both.
+    The largest one this machine can reach, because transcription quality is
+    what the whole stage is for. Each variant is a separate gated repository, so
+    ``large`` is tried first and ``medium`` — MuScriptor's own default — is used
+    when its licence has not been accepted. Neither wants to run on a CPU: they
+    decode autoregressively over five-second chunks, which without a GPU takes
+    long enough to dominate the whole import, so ``small`` is used there.
+
+    ``MUSCRIPTOR_MODEL`` overrides all of it.
     """
     override = os.environ.get("MUSCRIPTOR_MODEL")
     if override:
         return override
-    return "small" if (device or torch_device()) == "cpu" else "medium"
+    if (device or torch_device()) == "cpu":
+        return "small"
+    global _RESOLVED_MODEL  # noqa: PLW0603 — one probe per process, not per stem
+    if _RESOLVED_MODEL is None:
+        _RESOLVED_MODEL = resolve_muscriptor_model()
+    return _RESOLVED_MODEL
+
+
+def resolve_muscriptor_model() -> str:
+    """The best variant whose weights this machine can fetch.
+
+    Asked by starting a transcription of a moment of silence: the CLI resolves
+    and downloads the weights before it decodes anything, so a variant that is
+    gated fails in about a second and one that is available costs only the
+    download it was going to do anyway. There is no lighter question to ask —
+    the weights being in the HuggingFace cache is not the same as the licence
+    still being accepted.
+    """
+    binary = muscriptor_binary()
+    if binary is None:
+        return MUSCRIPTOR_MODELS[-1]
+    token = muscriptor_token()
+    with tempfile.TemporaryDirectory() as scratch:
+        probe = Path(scratch) / "probe.wav"
+        silence = subprocess.run(
+            [
+                ffmpeg_binary(), "-nostdin", "-y", "-f", "lavfi",
+                "-i", "anullsrc=r=44100:cl=mono", "-t", "1", str(probe),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if silence.returncode != 0:
+            return MUSCRIPTOR_MODELS[-1]
+        for model in MUSCRIPTOR_MODELS[:-1]:
+            result = subprocess.run(
+                [
+                    binary, "transcribe", str(probe),
+                    "--format", "midi",
+                    "--output", str(Path(scratch) / "probe.mid"),
+                    "--model", model,
+                    "--device", "auto",
+                    "--detect-tempo", "false",
+                ],
+                capture_output=True,
+                text=True,
+                env={**os.environ, "HF_TOKEN": token} if token else None,
+            )
+            if result.returncode == 0:
+                return model
+    return MUSCRIPTOR_MODELS[-1]
 
 
 def remove_bar_offset(path: Path) -> None:
@@ -287,6 +357,79 @@ def download(url: str, into: Path, on_progress: ProgressFn) -> tuple[Path, dict]
     return files[0], metadata
 
 
+# Demucs always writes all six stems, so a song with no piano still gets a
+# piano stem: a few seconds of leaked transients and nothing else. Peak level
+# cannot tell that apart from real music — the leak clips just as high — so the
+# test is mean level relative to the loudest stem in the same mix, which scales
+# with the master's own loudness. 35 dB down is inaudible against the rest of
+# the song and is well clear of a genuinely sparse part: a vocal that only
+# enters for two phrases still lands around 25 dB down.
+BLEED_FLOOR_DB = 35.0
+
+
+def mean_volume_db(path: Path) -> float | None:
+    """Mean (RMS) level of a WAV in dBFS, or ``None`` when it cannot be read.
+
+    ``volumedetect`` reports it for the whole file in one pass, which is the
+    cheapest measurement available here and needs nothing that is not already
+    installed for the decode.
+    """
+    result = subprocess.run(
+        [
+            ffmpeg_binary(), "-nostdin", "-v", "info", "-i", str(path),
+            "-af", "volumedetect", "-f", "null", "-",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    for line in reversed((result.stderr or "").splitlines()):
+        if "mean_volume:" in line:
+            try:
+                return float(line.split("mean_volume:")[1].strip().removesuffix("dB").strip())
+            except ValueError:
+                return None
+    return None
+
+
+def drop_bleed_stems(levels: dict[str, float | None]) -> set[str]:
+    """The stems that are leakage rather than an instrument that is playing.
+
+    A stem whose level could not be measured is always kept: a parsing change
+    must never silently lose part of a song.
+    """
+    measured = {name: level for name, level in levels.items() if level is not None}
+    if not measured:
+        return set()
+    loudest = max(measured.values())
+    return {
+        name for name, level in measured.items() if loudest - level >= BLEED_FLOOR_DB
+    }
+
+
+def demucs_quality_args(device: str) -> list[str]:
+    """Separation-quality arguments suited to the machine this runs on.
+
+    ``--shifts`` averages the model over randomly shifted copies of the audio,
+    which is the one knob that reliably raises separation quality; it multiplies
+    the work by the shift count, so it is only worth having on a GPU. A wider
+    ``--overlap`` costs far less and softens the seams between the windows
+    Demucs stitches its output from, which is where the smearing that confuses
+    transcription comes from.
+
+    ``DEMUCS_SHIFTS`` and ``DEMUCS_OVERLAP`` override both.
+    """
+    shifts = os.environ.get("DEMUCS_SHIFTS") or ("2" if device != "cpu" else "0")
+    overlap = os.environ.get("DEMUCS_OVERLAP") or "0.5"
+    args = ["--overlap", overlap]
+    if shifts != "0":
+        args += ["--shifts", shifts]
+    if device == "cpu":
+        # Demucs is single-threaded per job; on this many cores the wall clock
+        # is otherwise several times longer than it needs to be.
+        args += ["-j", str(max(1, (os.cpu_count() or 2) // 2))]
+    return args
+
+
 def separate(source: Path, into: Path, on_progress: ProgressFn) -> dict[str, str]:
     """Run Demucs (``htdemucs_6s``) and copy the stems into ``into/stems``.
 
@@ -298,6 +441,7 @@ def separate(source: Path, into: Path, on_progress: ProgressFn) -> dict[str, str
 
     device = torch_device()
     out_root = into / "_demucs"
+    quality = demucs_quality_args(device)
     on_progress("separate", 0.0, f"separating stems on {device}")
     demucs_main(
         [
@@ -309,22 +453,35 @@ def separate(source: Path, into: Path, on_progress: ProgressFn) -> dict[str, str
             str(out_root),
             "--filename",
             "{stem}.{ext}",
+            *quality,
             str(source),
         ]
     )
     stems_dir = into / "stems"
     stems_dir.mkdir(parents=True, exist_ok=True)
-    stems: dict[str, str] = {}
+    produced: dict[str, Path] = {}
     # `--filename {stem}.{ext}` drops the stems straight into the model folder
     # rather than a per-track subfolder, so collect them wherever they landed.
     for wav in sorted((out_root / "htdemucs_6s").rglob("*.wav")):
-        name = wav.stem
-        destination = stems_dir / f"{name}.wav"
+        destination = stems_dir / f"{wav.stem}.wav"
         shutil.copyfile(wav, destination)
-        stems[name] = f"stems/{name}.wav"
+        produced[wav.stem] = destination
     shutil.rmtree(out_root, ignore_errors=True)
-    if not stems:
+    if not produced:
         raise RuntimeError("Demucs produced no stems")
+
+    on_progress("separate", 90.0, "checking which instruments are playing")
+    # The test is relative to the loudest stem, which is never 35 dB below
+    # itself, so this can never drop every stem of a song.
+    bleed = drop_bleed_stems({name: mean_volume_db(path) for name, path in produced.items()})
+    stems: dict[str, str] = {}
+    for name, path in produced.items():
+        if name in bleed:
+            path.unlink(missing_ok=True)
+            continue
+        stems[name] = f"stems/{name}.wav"
+    if bleed:
+        on_progress("separate", 95.0, f"not in this song: {', '.join(sorted(bleed))}")
     on_progress("separate", 100.0, "separation complete")
     return stems
 
@@ -342,7 +499,7 @@ def transcribe(
     if muscriptor_binary() is not None:
         model = muscriptor_model()
         try:
-            midi = transcribe_muscriptor(source, into, on_progress)
+            midi = transcribe_muscriptor(source, into, stems, on_progress)
         except Exception as error:  # noqa: BLE001 — the fallback is the point
             on_progress("transcribe", 0.0, f"muscriptor unavailable ({error}); using basic-pitch")
         else:
@@ -351,35 +508,146 @@ def transcribe(
     return transcribe_basic_pitch(into, stems, on_progress), "basic-pitch"
 
 
-def transcribe_muscriptor(source: Path, into: Path, on_progress: ProgressFn) -> dict[str, str] | None:
-    """Transcribe the whole mix with MuScriptor into ``midi/song.mid``.
+# Which MuScriptor instrument groups can plausibly be in each Demucs stem.
+# Passed as ``--instruments``, which forbids everything else from being decoded
+# at all. A stem holds one instrument by construction, so telling the model that
+# is the difference between a guitar track and a guitar that turns into a synth
+# lead halfway through the song. ``other`` is deliberately absent and
+# is decoded with no constraint at all: it is whatever Demucs could not name, so
+# there is no answer to forbid, and forbidding one only moves the notes onto an
+# instrument the model is still allowed to name. See
+# :func:`drop_covered_instruments`.
+STEM_INSTRUMENTS = {
+    "drums": ["drums"],
+    "bass": ["acoustic_bass", "electric_bass"],
+    "guitar": ["acoustic_guitar", "clean_electric_guitar", "distorted_electric_guitar"],
+    "piano": ["acoustic_piano", "electric_piano", "organ"],
+    "vocals": ["voice"],
+}
 
-    One pass over the mix, not one per stem: the model is multi-instrument, so it
-    decides for itself which instruments are playing, names each track after one
-    and writes the drum kit to channel 10 — all of which RustDAW's importer
-    already reads. Returns ``None`` when MuScriptor is not installed.
+# Stems to transcribe, in the order their tracks should appear.
+STEM_TRANSCRIBE_ORDER = ("drums", "bass", "guitar", "piano", "other", "vocals")
+
+
+def drop_covered_instruments(instruments: list, stems: dict[str, str]) -> list:
+    """Remove from the ``other`` stem what another stem already transcribes.
+
+    Demucs puts into ``other`` whatever it could not name, so the strings, horns
+    and keys of a song are there — but so is the leakage from every stem beside
+    it, and transcribing that is a second, worse copy of a part that already has
+    its own track.
+
+    The duplicates have to go afterwards rather than being forbidden up front.
+    Telling the decoder it may not say "drums" does not stop it hearing the drum
+    leakage; it makes it name that leakage something it is allowed to say, and a
+    stem with a guitar and some spill came back as nine tracks of woodwind and
+    brass with no guitar on any of them. Deciding after the fact costs nothing
+    and cannot distort what the model heard.
+
+    A stem dropped as bleed is not in ``stems``, so its instruments are not
+    covered and stay here — which matters, because Demucs failing to isolate a
+    guitar is exactly the case where the guitar is in ``other`` instead.
+    """
+    covered = {
+        group
+        for name, groups in STEM_INSTRUMENTS.items()
+        if name in stems
+        for group in groups
+    }
+    # The name alone decides, drum kit included: a kit here is dropped when the
+    # drum stem is the one carrying it, and kept when that stem was bleed and
+    # this is where the drums actually ended up.
+    return [
+        instrument
+        for instrument in instruments
+        # MuScriptor names a track after its instrument group, spaced rather
+        # than underscored ("electric bass" for ``electric_bass``).
+        if instrument.name.replace(" ", "_") not in covered
+    ]
+
+# An instrument holding less than this share of a stem's notes is a chunk the
+# model labelled differently from its neighbours, not a part someone played.
+# Only ``other`` is filtered this way; every other stem is collapsed to one
+# track regardless.
+FRAGMENT_SHARE = 0.02
+
+
+def per_stem_transcription() -> bool:
+    """Whether to transcribe each stem separately rather than the mix once.
+
+    Per stem is the default because it is what removes the holes: the model
+    decodes in five-second chunks and re-decides the instrument in each one, so
+    over a mix a single guitar arrives as three tracks that each stop where the
+    next begins. A stem answers that question before the model is asked. It
+    costs one pass per stem instead of one in total, so ``MUSCRIPTOR_PER_STEM=0``
+    goes back to the single pass.
+    """
+    return os.environ.get("MUSCRIPTOR_PER_STEM", "1") not in ("0", "false", "no")
+
+
+# How strongly a decode is held to the audio it is listening to, for a stem that
+# can only be one instrument. At the model's own default of 1.0 it drops
+# passages it is unsure of: on a test song the vocal stem came back with 21
+# seconds of clearly-sung audio transcribed as nothing. 1.5 brought that to 2
+# seconds and invented not one note in a silent passage. Higher does not help
+# and starts to cost: at 3.0 the same stem gained one more second of recall and
+# hallucinated notes across 26 seconds where the stem is silent.
+#
+# It is deliberately used on the singing and nowhere else, because that is the
+# only place it was measured to help. Guidance sharpens every decision the
+# decoder makes, including which instrument it is hearing, so on a stem with a
+# choice to make it sharpens that choice differently in each five-second chunk —
+# which is the fragmentation this whole path exists to remove. Measured on the
+# same song: the ``other`` stem went from one guitar track of 4166 notes to four
+# tracks whose guitar had 898 notes and a two-minute hole, and the piano stem
+# lost a quarter of its notes for no gain in what it found. Even the drum stem,
+# which can only be one instrument and so cannot fragment, came back no better
+# (1 second of missed playing became 3).
+#
+# ``MUSCRIPTOR_CFG`` overrides, and applies to every stem.
+STEM_CFG_COEF = {"vocals": "1.5"}
+DEFAULT_CFG_COEF = "1.0"
+
+
+def cfg_coef(stem: str | None) -> str:
+    """The guidance strength to decode ``stem`` with."""
+    override = os.environ.get("MUSCRIPTOR_CFG")
+    if override:
+        return override
+    return STEM_CFG_COEF.get(stem or "", DEFAULT_CFG_COEF)
+
+
+def run_muscriptor(
+    source: Path,
+    destination: Path,
+    instruments: list[str] | None,
+    stem: str | None = None,
+) -> None:
+    """One MuScriptor pass, written to ``destination`` and put back on audio time.
+
+    Raises with the model's own reason when the pass fails, so the caller can
+    decide between skipping one stem and abandoning the backend.
     """
     binary = muscriptor_binary()
     if binary is None:
-        return None
-    model = muscriptor_model()
-    midi_dir = into / "midi"
-    midi_dir.mkdir(parents=True, exist_ok=True)
-    destination = midi_dir / "song.mid"
-    on_progress("transcribe", 0.0, f"transcribing with muscriptor ({model})")
+        raise RuntimeError("muscriptor is not installed")
     token = muscriptor_token()
+    command = [
+        binary, "transcribe", str(source),
+        "--format", "midi",
+        "--output", str(destination),
+        "--model", muscriptor_model(),
+        "--device", "auto",
+        # The notes are played, not engraved, so they are never quantised;
+        # the detected tempo still goes into the file, and best-effort keeps
+        # a song with no steady tempo from failing the whole stage.
+        "--detect-tempo", "best-effort",
+        "--cfg-coef", cfg_coef(stem),
+    ]
+    if instruments:
+        command += ["--instruments", ",".join(instruments)]
     result = subprocess.run(
-        [
-            binary, "transcribe", str(source),
-            "--format", "midi",
-            "--output", str(destination),
-            "--model", model,
-            "--device", "auto",
-            # The notes are played, not engraved, so they are never quantised;
-            # the detected tempo still goes into the file, and best-effort keeps
-            # a song with no steady tempo from failing the whole stage.
-            "--detect-tempo", "best-effort",
-        ],
+        command,
         capture_output=True,
         text=True,
         env={**os.environ, "HF_TOKEN": token} if token else None,
@@ -388,6 +656,134 @@ def transcribe_muscriptor(source: Path, into: Path, on_progress: ProgressFn) -> 
         destination.unlink(missing_ok=True)
         raise RuntimeError(_muscriptor_error(result.stderr))
     remove_bar_offset(destination)
+
+
+def collapse_to_one_instrument(instruments: list, name: str) -> list:
+    """Every note of a stem on one track, named after what it mostly is.
+
+    A stem is one instrument, so the several tracks a chunk-by-chunk decode can
+    produce for it are the same part split at the points where the model changed
+    its mind. Joining them back is what leaves a guitar track with a guitar on it
+    from the first bar to the last instead of three tracks with holes.
+    """
+    import pretty_midi
+
+    populated = [instrument for instrument in instruments if instrument.notes]
+    if not populated:
+        return []
+    dominant = max(populated, key=lambda instrument: len(instrument.notes))
+    merged = pretty_midi.Instrument(
+        program=dominant.program, is_drum=dominant.is_drum, name=dominant.name or name
+    )
+    for instrument in populated:
+        merged.notes.extend(instrument.notes)
+    merged.notes.sort(key=lambda note: note.start)
+    return [merged]
+
+
+def merge_named_instruments(instruments: list) -> list:
+    """One track per named instrument, with the passing mislabels dropped.
+
+    For the ``other`` stem, where several real instruments do share the file: the
+    same name appearing twice is always the same part interrupted, and a name
+    carrying a handful of notes across a whole song is a chunk that decoded
+    differently from the ones around it.
+    """
+    import pretty_midi
+
+    by_name: dict[tuple[str, bool], list] = {}
+    for instrument in instruments:
+        if instrument.notes:
+            by_name.setdefault((instrument.name, instrument.is_drum), []).append(instrument)
+    total = sum(len(group_member.notes) for group in by_name.values() for group_member in group)
+    merged = []
+    for (name, is_drum), group in by_name.items():
+        notes = [note for instrument in group for note in instrument.notes]
+        if total and len(notes) < FRAGMENT_SHARE * total:
+            continue
+        instrument = pretty_midi.Instrument(
+            program=group[0].program, is_drum=is_drum, name=name
+        )
+        instrument.notes = sorted(notes, key=lambda note: note.start)
+        merged.append(instrument)
+    return merged
+
+
+def transcribe_muscriptor(
+    source: Path, into: Path, stems: dict[str, str], on_progress: ProgressFn
+) -> dict[str, str] | None:
+    """Transcribe the song with MuScriptor into ``midi/song.mid``.
+
+    One pass per separated stem, each told which instruments it may contain, and
+    the results merged into the single multi-track file RustDAW imports. Falls
+    back to one pass over the mix when there are no stems to work from — which is
+    also what the model was built for, but on a mix it re-decides the instrument
+    every five seconds and the tracks come back full of holes.
+
+    Returns ``None`` when MuScriptor is not installed.
+    """
+    if muscriptor_binary() is None:
+        return None
+    midi_dir = into / "midi"
+    midi_dir.mkdir(parents=True, exist_ok=True)
+    destination = midi_dir / "song.mid"
+    model = muscriptor_model()
+
+    targets = [name for name in STEM_TRANSCRIBE_ORDER if name in stems]
+    if not per_stem_transcription() or not targets:
+        on_progress("transcribe", 0.0, f"transcribing the mix with muscriptor ({model})")
+        run_muscriptor(source, destination, None)
+        on_progress("transcribe", 100.0, "transcription complete")
+        return {"song": "midi/song.mid"}
+
+    import pretty_midi
+
+    parts: list = []
+    tempo: float | None = None
+    failures: list[str] = []
+    with tempfile.TemporaryDirectory() as scratch:
+        for index, name in enumerate(targets):
+            on_progress(
+                "transcribe",
+                100.0 * index / len(targets),
+                f"transcribing {name} with muscriptor ({model})",
+            )
+            part_path = Path(scratch) / f"{name}.mid"
+            try:
+                run_muscriptor(
+                    into / stems[name], part_path, STEM_INSTRUMENTS.get(name), name
+                )
+                part = pretty_midi.PrettyMIDI(str(part_path))
+            except Exception as error:  # noqa: BLE001 — one stem must not lose the rest
+                failures.append(f"{name} ({error})")
+                continue
+            # Every stem is the same recording, so they all detect the same
+            # tempo; the first one that found a real pulse settles the file.
+            if tempo is None:
+                found = part.get_tempo_changes()[1]
+                if len(found) and abs(float(found[0]) - 120.0) > 0.01:
+                    tempo = float(found[0])
+            parts.extend(
+                merge_named_instruments(drop_covered_instruments(part.instruments, stems))
+                if name == "other"
+                else collapse_to_one_instrument(part.instruments, name)
+            )
+
+    if not parts:
+        # Every stem failing is one reason, not six — an unaccepted licence, no
+        # token, no room on the GPU — so this goes up as a failed backend and
+        # basic-pitch gets the song.
+        reasons = "; ".join(failures)
+        raise RuntimeError(
+            f"no stem could be transcribed: {reasons}"
+            if reasons
+            else "no stem could be transcribed"
+        )
+    combined = pretty_midi.PrettyMIDI(initial_tempo=tempo or 120.0)
+    combined.instruments.extend(parts)
+    combined.write(str(destination))
+    if failures:
+        on_progress("transcribe", 100.0, f"not transcribed: {', '.join(failures)}")
     on_progress("transcribe", 100.0, "transcription complete")
     return {"song": "midi/song.mid"}
 
