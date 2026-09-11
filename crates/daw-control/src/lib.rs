@@ -255,7 +255,14 @@ pub fn likely_foot_controller(ports: &[String]) -> Option<&String> {
     /// `FootCtrl` are what the M-Vave boxes report over USB and Bluetooth
     /// respectively, neither of which is the name on the pedal.
     const HINTS: [&str; 8] = [
-        "footctrl", "sinco", "m-vave", "mvave", "chocolate", "foot", "pedal", "switch",
+        "footctrl",
+        "sinco",
+        "m-vave",
+        "mvave",
+        "chocolate",
+        "foot",
+        "pedal",
+        "switch",
     ];
     ports.iter().find(|name| {
         let name = name.to_ascii_lowercase();

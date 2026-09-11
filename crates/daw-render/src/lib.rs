@@ -2,8 +2,8 @@
 
 use anyhow::{Context, Result, bail};
 use daw_engine::{
-    ChannelStrip, ChannelStripParams, GmBank, NoiseGate, Reverb, SampledSynth, SoundFontBank, Synth,
-    ToneStack, Wah,
+    ChannelStrip, ChannelStripParams, GmBank, NoiseGate, Reverb, SampledSynth, SoundFontBank,
+    Synth, ToneStack, Wah,
 };
 use daw_midi::ScheduledNote;
 use daw_nam::NamProcessor;
@@ -262,7 +262,13 @@ impl Instrument {
         }
     }
 
-    fn render(&mut self, notes: &[ScheduledNote], block_start: u64, left: &mut [f32], right: &mut [f32]) {
+    fn render(
+        &mut self,
+        notes: &[ScheduledNote],
+        block_start: u64,
+        left: &mut [f32],
+        right: &mut [f32],
+    ) {
         match self {
             Self::Sampled(player) => player.render(notes, block_start, left, right),
             Self::Bank(synth) => synth.render(notes, block_start, left, right),
@@ -453,11 +459,7 @@ fn apply_track_chain(
     // exactly as the runtime has it. An export that dropped the wah
     // would not be the take that was played.
     if track.effects.wah_enabled {
-        wah.process_stereo(
-            samples,
-            track.effects.wah_position,
-            track.effects.wah_mix,
-        );
+        wah.process_stereo(samples, track.effects.wah_position, track.effects.wah_mix);
     }
     if let Some(nam) = nam {
         let input_gain = db_to_gain(track.effects.nam_input_db);
@@ -565,7 +567,15 @@ fn render_track(
         };
         for clip in &track.clips {
             let mut samples = read_wav(&clip.path, sample_rate_hz)?;
-            apply_track_chain(&mut samples, track, &mut gate, &mut tone, &mut wah, &mut nam, &mut processor)?;
+            apply_track_chain(
+                &mut samples,
+                track,
+                &mut gate,
+                &mut tone,
+                &mut wah,
+                &mut nam,
+                &mut processor,
+            )?;
             let wanted = usize::try_from(clip.length()).unwrap_or(usize::MAX);
             let start = usize::try_from(clip.start_frame).context("clip starts too late")?;
             // The clip reads a window of its source rather than the whole file:
@@ -842,10 +852,7 @@ mod tests {
 
         let mut project = ProjectDocument {
             sample_rate: 48_000,
-            tracks: vec![
-                noise_track("Bass", &source, 1),
-                note_track("Piano", 0, 1),
-            ],
+            tracks: vec![noise_track("Bass", &source, 1), note_track("Piano", 0, 1)],
             ..ProjectDocument::default()
         };
         project.tempo = 120;

@@ -37,7 +37,10 @@ fn main() {
     };
 
     let bindings = Bindings::footswitch();
-    println!("Listening to {}. Step on it. Ctrl-C to stop.\n", surface.port());
+    println!(
+        "Listening to {}. Step on it. Ctrl-C to stop.\n",
+        surface.port()
+    );
     loop {
         for message in surface.drain() {
             let bound = match bindings.resolve(message) {

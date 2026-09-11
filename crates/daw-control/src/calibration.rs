@@ -274,10 +274,7 @@ mod tests {
     fn a_pedal_that_never_reaches_the_stops_still_closes_and_opens() {
         // The whole point: 9 to 112 has to mean 0% to 100%, or the wah never
         // shuts and never fully opens.
-        let calibration = Calibration {
-            heel: 9,
-            toe: 112,
-        };
+        let calibration = Calibration { heel: 9, toe: 112 };
         assert!((calibration.position(9) - 0.0).abs() < 1e-6);
         assert!((calibration.position(112) - 1.0).abs() < 1e-6);
         assert!((calibration.position(60) - 0.495).abs() < 0.01);
@@ -313,10 +310,7 @@ mod tests {
     #[test]
     fn a_run_finds_the_pedal_and_its_travel() {
         let run = swept(11, 9, 112);
-        assert_eq!(
-            run.finish(),
-            Ok((11, Calibration { heel: 9, toe: 112 }))
-        );
+        assert_eq!(run.finish(), Ok((11, Calibration { heel: 9, toe: 112 })));
     }
 
     #[test]

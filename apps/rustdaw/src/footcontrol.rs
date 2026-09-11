@@ -384,7 +384,7 @@ impl FootControlState {
         if let Message::Control {
             controller, value, ..
         } = message
-{
+        {
             // Every control change, on any controller, bound or not. Nothing
             // is filtered: a pedal whose socket is wired to a controller
             // nobody expects is exactly the case this drawing exists to make
@@ -598,12 +598,11 @@ fn monitor(ui: &mut egui::Ui, state: &FootControlState) {
                 } else {
                     line.clone()
                 };
-                ui.label(
-                    RichText::new(counted)
-                        .monospace()
-                        .small()
-                        .color(if newest { theme::GREEN } else { theme::MUTED }),
-                );
+                ui.label(RichText::new(counted).monospace().small().color(if newest {
+                    theme::GREEN
+                } else {
+                    theme::MUTED
+                }));
             }
         });
 }
@@ -713,7 +712,9 @@ fn finish_step(state: &mut FootControlState) {
             // A run says which controller swept, so calibrating also finds a
             // pedal nobody has bound yet. Nobody knows their pedal's CC
             // number, and now nobody has to.
-            state.bindings.bind(Trigger::Control(controller), Action::WahPedal);
+            state
+                .bindings
+                .bind(Trigger::Control(controller), Action::WahPedal);
             state.calibration_error = None;
             state.dirty = true;
         }
@@ -765,10 +766,7 @@ fn readings(ui: &mut egui::Ui, state: &FootControlState) {
         (Some((controller, _)), Some(pedal)) if controller == pedal => {
             (format!("CC {controller}"), theme::TEXT)
         }
-        (Some((controller, _)), _) => (
-            format!("CC {controller} · not bound yet"),
-            theme::YELLOW,
-        ),
+        (Some((controller, _)), _) => (format!("CC {controller} · not bound yet"), theme::YELLOW),
         (None, Some(pedal)) => (format!("CC {pedal} · nothing arriving"), theme::MUTED),
         (None, None) => (
             "Nothing from the expression socket yet".to_owned(),
@@ -802,7 +800,12 @@ fn readings(ui: &mut egui::Ui, state: &FootControlState) {
     } else {
         "not calibrated".to_owned()
     };
-    ui.label(RichText::new(travel).monospace().small().color(theme::MUTED));
+    ui.label(
+        RichText::new(travel)
+            .monospace()
+            .small()
+            .color(theme::MUTED),
+    );
 }
 
 /// A side-on drawing of the pedal, tilted where the foot has it.
@@ -841,7 +844,10 @@ fn pedal_view(ui: &mut egui::Ui, position: f32, live: bool) {
     let toe_y = hinge_y - LIFT * (1.0 - position);
     for extreme in [hinge_y - LIFT, hinge_y] {
         painter.line_segment(
-            [egui::pos2(right - 20.0, extreme), egui::pos2(right, extreme)],
+            [
+                egui::pos2(right - 20.0, extreme),
+                egui::pos2(right, extreme),
+            ],
             Stroke::new(1.0_f32, theme::BORDER),
         );
     }
@@ -1078,12 +1084,11 @@ fn learn_button(ui: &mut egui::Ui, state: &mut FootControlState, action: Action)
         theme::PANEL_2
     };
     let response = ui.add(
-        egui::Button::new(
-            RichText::new(label)
-                .monospace()
-                .small()
-                .color(if learning { Color32::BLACK } else { theme::TEXT }),
-        )
+        egui::Button::new(RichText::new(label).monospace().small().color(if learning {
+            Color32::BLACK
+        } else {
+            theme::TEXT
+        }))
         .fill(colour)
         .min_size(egui::vec2(76.0, 0.0)),
     );
@@ -1095,9 +1100,7 @@ fn learn_button(ui: &mut egui::Ui, state: &mut FootControlState, action: Action)
         state.learning = None;
         state.dirty = true;
     }
-    response.on_hover_text(
-        "Click, then step on the switch you want. Right-click to unbind it.",
-    );
+    response.on_hover_text("Click, then step on the switch you want. Right-click to unbind it.");
 }
 
 #[cfg(test)]
@@ -1228,7 +1231,9 @@ mod tests {
     fn defaults_put_the_four_switches_back_on_the_amps() {
         let mut state = FootControlState::default();
         state.bindings.bind(Trigger::Program(0), Action::PlayPause);
-        state.bindings.bind(Trigger::Program(1), Action::ToggleDelay);
+        state
+            .bindings
+            .bind(Trigger::Program(1), Action::ToggleDelay);
         state.reset_bindings();
         for slot in 0..4 {
             assert_eq!(
@@ -1272,7 +1277,10 @@ mod tests {
         state.handle(vec![control(11, 66)]);
         finish_step(&mut state);
         assert!(state.calibration_error.is_some());
-        assert_eq!(state.calibration.heel, 9, "a failed run overwrote a good one");
+        assert_eq!(
+            state.calibration.heel, 9,
+            "a failed run overwrote a good one"
+        );
         assert_eq!(state.calibration.toe, 112);
     }
 

@@ -232,7 +232,10 @@ impl Bindings {
         let value = match message {
             // A program change has no value; it is the press.
             Message::Program { .. } => return Some(Command::Press(action)),
-            Message::Control { value, .. } | Message::Note { velocity: value, .. } => value,
+            Message::Control { value, .. }
+            | Message::Note {
+                velocity: value, ..
+            } => value,
             // Nothing to act on, however it came to be bound.
             Message::Unhandled { .. } => return None,
         };

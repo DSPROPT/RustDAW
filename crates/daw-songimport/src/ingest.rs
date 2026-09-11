@@ -295,8 +295,12 @@ pub fn ingest_project(
     }
 
     if options.import_midi {
-        match import_midi_tracks(project_dir, &document.tempo_map(), offset_seconds, beats_per_bar)
-        {
+        match import_midi_tracks(
+            project_dir,
+            &document.tempo_map(),
+            offset_seconds,
+            beats_per_bar,
+        ) {
             Ok((instrument_tracks, skipped_midi)) => {
                 if !skipped_midi.is_empty() {
                     notes.push(format!("MIDI tracks left out: {}", skipped_midi.join(", ")));
@@ -569,8 +573,9 @@ fn import_midi_tracks(
         tempo.seconds_to_tick(seconds)
     };
 
-    let split_ticks =
-        u64::from(CLIP_SPLIT_BARS) * u64::from(beats_per_bar) * u64::from(tempo.ticks_per_quarter());
+    let split_ticks = u64::from(CLIP_SPLIT_BARS)
+        * u64::from(beats_per_bar)
+        * u64::from(tempo.ticks_per_quarter());
 
     let mut tracks = Vec::new();
     let skipped = Vec::new();
@@ -940,10 +945,7 @@ mod tests {
     #[test]
     fn digital_silence_reports_negative_infinity() {
         let stderr = "[Parsed_volumedetect_0 @ 0x55] max_volume: -inf dB\n";
-        assert_eq!(
-            parse_volume(stderr, "max_volume:"),
-            Some(f64::NEG_INFINITY)
-        );
+        assert_eq!(parse_volume(stderr, "max_volume:"), Some(f64::NEG_INFINITY));
         assert!(
             ConvertedAudio {
                 frames: 1,

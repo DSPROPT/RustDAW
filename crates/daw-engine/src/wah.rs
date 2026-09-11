@@ -99,7 +99,11 @@ impl Wah {
     fn settings(&self, position: f32, mix: f32) -> (f32, f32) {
         // `f32::clamp` passes a NaN straight through, and a NaN wet fraction
         // would put one into the signal and keep it there.
-        let mix = if mix.is_finite() { mix.clamp(0.0, 1.0) } else { 0.0 };
+        let mix = if mix.is_finite() {
+            mix.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         (coefficient_for(position, self.sample_rate), mix)
     }
 
@@ -188,8 +192,14 @@ mod tests {
     fn the_peak_follows_the_pedal_up() {
         // Heel-down favours the low note, toe-down the high one. That reversal
         // is the whole effect.
-        assert!(swept(400.0, 0.0) > swept(400.0, 1.0) * 2.0, "heel lost its low");
-        assert!(swept(2_000.0, 1.0) > swept(2_000.0, 0.0) * 2.0, "toe lost its high");
+        assert!(
+            swept(400.0, 0.0) > swept(400.0, 1.0) * 2.0,
+            "heel lost its low"
+        );
+        assert!(
+            swept(2_000.0, 1.0) > swept(2_000.0, 0.0) * 2.0,
+            "toe lost its high"
+        );
     }
 
     #[test]
@@ -197,8 +207,14 @@ mod tests {
         // A resonant peak, not a tilt: the note at the peak comes up, and a
         // note two octaves below it does not.
         let dry = tone(400.0);
-        assert!(swept(400.0, 0.0) > level(&dry) * 2.0, "the peak did not lift");
-        assert!(swept(100.0, 0.0) < level(&tone(100.0)) * 0.9, "two octaves down was lifted");
+        assert!(
+            swept(400.0, 0.0) > level(&dry) * 2.0,
+            "the peak did not lift"
+        );
+        assert!(
+            swept(100.0, 0.0) < level(&tone(100.0)) * 0.9,
+            "two octaves down was lifted"
+        );
     }
 
     #[test]
@@ -216,7 +232,11 @@ mod tests {
         let mut wah = wah();
         let mut frames = tone(800.0);
         wah.process_stereo(&mut frames, 0.35, 1.0);
-        assert!(frames.iter().all(|frame| (frame[0] - frame[1]).abs() < 1e-6));
+        assert!(
+            frames
+                .iter()
+                .all(|frame| (frame[0] - frame[1]).abs() < 1e-6)
+        );
     }
 
     #[test]

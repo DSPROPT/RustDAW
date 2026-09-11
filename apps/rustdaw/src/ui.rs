@@ -3821,8 +3821,7 @@ impl RustDawApp {
             }
             (
                 track.effects != before || track.nam_model != before_model,
-                track.nam_model != before_model
-                    || track.effects.nam_enabled != before.nam_enabled,
+                track.nam_model != before_model || track.effects.nam_enabled != before.nam_enabled,
             )
         };
         if let Some(lit) = lit {
@@ -4150,44 +4149,39 @@ impl RustDawApp {
                             // In signal order: the wah is a pedal on the
                             // floor in front of the amp, and the engine runs
                             // it there.
-                            channel_module(
-                                ui,
-                                "WAH",
-                                track.effects.wah_enabled,
-                                150.0,
-                                |ui| {
-                                    illuminated_toggle(
+                            channel_module(ui, "WAH", track.effects.wah_enabled, 150.0, |ui| {
+                                illuminated_toggle(
+                                    ui,
+                                    "WAH IN",
+                                    &mut track.effects.wah_enabled,
+                                    theme::YELLOW,
+                                );
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    // Shown as percentages of the pedal's
+                                    // travel, which is what an expression
+                                    // pedal sends and what a foot means.
+                                    let mut pedal = track.effects.wah_position * 100.0;
+                                    rotary_knob(
                                         ui,
-                                        "WAH IN",
-                                        &mut track.effects.wah_enabled,
+                                        "PEDAL",
+                                        &mut pedal,
+                                        0.0,
+                                        100.0,
+                                        "%",
                                         theme::YELLOW,
                                     );
-                                    ui.add_space(8.0);
-                                    ui.horizontal(|ui| {
-                                        // Shown as percentages of the pedal's
-                                        // travel, which is what an expression
-                                        // pedal sends and what a foot means.
-                                        let mut pedal = track.effects.wah_position * 100.0;
-                                        rotary_knob(
-                                            ui, "PEDAL", &mut pedal, 0.0, 100.0, "%",
-                                            theme::YELLOW,
-                                        );
-                                        set_percentage(&mut track.effects.wah_position, pedal);
-                                        let mut mix = track.effects.wah_mix * 100.0;
-                                        rotary_knob(
-                                            ui, "MIX", &mut mix, 0.0, 100.0, "%", theme::BLUE,
-                                        );
-                                        set_percentage(&mut track.effects.wah_mix, mix);
-                                    });
-                                    ui.label(
-                                        RichText::new(
-                                            "Bind an expression pedal to this in FOOT",
-                                        )
+                                    set_percentage(&mut track.effects.wah_position, pedal);
+                                    let mut mix = track.effects.wah_mix * 100.0;
+                                    rotary_knob(ui, "MIX", &mut mix, 0.0, 100.0, "%", theme::BLUE);
+                                    set_percentage(&mut track.effects.wah_mix, mix);
+                                });
+                                ui.label(
+                                    RichText::new("Bind an expression pedal to this in FOOT")
                                         .small()
                                         .color(theme::MUTED),
-                                    );
-                                },
-                            );
+                                );
+                            });
 
                             channel_module(
                                 ui,
@@ -5167,9 +5161,9 @@ impl RustDawApp {
                             })
                             .width(104.0)
                             .show_ui(ui, |ui| {
-                                egui::ScrollArea::vertical().max_height(320.0).show(
-                                    ui,
-                                    |ui| {
+                                egui::ScrollArea::vertical()
+                                    .max_height(320.0)
+                                    .show(ui, |ui| {
                                         // The kit is not one of the 128 programs
                                         // — on General MIDI it is a channel — so
                                         // it sits above them rather than among
@@ -5204,8 +5198,7 @@ impl RustDawApp {
                                                 instrument_changed = true;
                                             }
                                         }
-                                    },
-                                );
+                                    });
                             });
                         if instrument_changed {
                             self.dirty = true;
