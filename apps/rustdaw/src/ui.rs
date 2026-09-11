@@ -166,6 +166,7 @@ impl TrimDrag {
 }
 
 #[allow(clippy::struct_excessive_bools)]
+#[derive(Clone)]
 struct Track {
     id: Uuid,
     name: String,
@@ -224,6 +225,29 @@ enum EditCommand {
         added: Vec<ClipSnapshot>,
         label: &'static str,
     },
+    /// A count-in put in front of the song. Boxed: it carries a whole track
+    /// and two tempo maps, and the other variants should not pay for that.
+    CountIn(Box<CountInEdit>),
+}
+
+/// Everything needed to put a count-in in front of the song and to take it
+/// out again: the track that holds the clicks and the bar the rest of the
+/// session moves by to make room.
+///
+/// The tempo map is kept whole in both states rather than shifted back
+/// arithmetically. Building a map de-duplicates equal neighbouring tempi, so
+/// a count-in at the song's own tempo merges with the song's first point and
+/// could not be told apart from it afterwards.
+#[derive(Clone)]
+struct CountInEdit {
+    track: Track,
+    /// The bar in frames, ticks and seconds — audio, notes and the chord
+    /// chart each keep time in a different one.
+    bar_frames: u64,
+    bar_ticks: u64,
+    bar_seconds: f64,
+    tempo_before: TempoMap,
+    tempo_after: TempoMap,
 }
 
 /// Messages from the song-import worker thread. Importing runs off the UI
@@ -1165,6 +1189,12 @@ impl RustDawApp {
                 self.save_session();
                 self.redo_stack.push(command);
             }
+            EditCommand::CountIn(edit) => {
+                self.apply_count_in(edit, false);
+                self.status_message = "Removed the count-in; the song moved back a bar".to_owned();
+                self.save_session();
+                self.redo_stack.push(command);
+            }
         }
     }
 
@@ -1191,6 +1221,13 @@ impl RustDawApp {
             } => {
                 self.apply_replacement(removed, added);
                 self.status_message = format!("Redid {label}");
+                self.save_session();
+                self.undo_stack.push(command);
+            }
+            EditCommand::CountIn(edit) => {
+                self.apply_count_in(edit, true);
+                self.status_message =
+                    "Put the count-in back; the song moved one bar later".to_owned();
                 self.save_session();
                 self.undo_stack.push(command);
             }
@@ -3306,6 +3343,175 @@ impl RustDawApp {
         self.status_message = format!("Deleted track ‘{name}’ (audio files preserved)");
     }
 
+    /// Puts one bar of wood-block clicks in front of the song.
+    ///
+    /// A song that opens on the guitar has nothing to count the guitarist in:
+    /// the click plays over the song, so it is either on for the whole take or
+    /// off. This moves everything on the timeline one bar later — audio,
+    /// notes, chords, the tempo map and the loop — and fills the bar that opens
+    /// up with a rendered count on its own track at the top. It is audio like
+    /// any other, so it is heard with the click off and goes out with the
+    /// exported mix. One edit, and one `Ctrl+Z` takes it out again.
+    ///
+    /// The bar is counted at the transport tempo, the tempo the click runs
+    /// at, rather than at whatever the tempo map holds in its first beat: an
+    /// imported song's map can open on one noisy interval, and a count at that
+    /// tempo would set the band up for the wrong song.
+    fn create_count_in(&mut self) {
+        if matches!(
+            self.snapshot().transport,
+            RuntimeTransportState::Recording | RuntimeTransportState::CountIn
+        ) {
+            self.status_message = "Stop recording before adding a count-in".to_owned();
+            return;
+        }
+        let rate = self
+            .runtime
+            .as_ref()
+            .map_or(48_000, |runtime| runtime.sample_rate().get());
+        let Some(sample_rate) = daw_core::SampleRate::new(rate) else {
+            return;
+        };
+        let beats = self.meter_numerator.max(1);
+        let tempo = self.tempo;
+        let samples = match daw_engine::render_count_in(sample_rate, tempo, beats) {
+            Ok(samples) => samples,
+            Err(error) => {
+                self.status_message = format!("Could not render the count-in: {error}");
+                return;
+            }
+        };
+        // A fresh file every time: the engine caches decoded audio by path,
+        // so rewriting one name would play the previous tempo's count.
+        let path = unique_import_path(&import_dir(), &format!("Count-in {beats} at {tempo} BPM"));
+        if let Err(error) = write_mono_wav(&path, &samples, rate) {
+            self.status_message = format!("Could not write the count-in: {error:#}");
+            return;
+        }
+        let bar_frames = samples.len() as u64;
+        let bar_ticks = u64::from(beats) * u64::from(daw_midi::TICKS_PER_QUARTER);
+        let bar_seconds = f64::from(beats) * 60.0 / f64::from(tempo);
+
+        let mut track = Track::new(0, ChannelLayout::Mono);
+        track.name = "Count-in".to_owned();
+        let (waveform, source_frames) = analyze_waveform(&path);
+        track.clips.push(Clip {
+            id: Uuid::new_v4(),
+            name: "Count-in".to_owned(),
+            path,
+            start_frame: 0,
+            end_frame: bar_frames,
+            source_start_frame: 0,
+            source_frames,
+            source_path: None,
+            color: theme::BLUE_DARK,
+            waveform,
+        });
+        let edit = CountInEdit {
+            track,
+            bar_frames,
+            bar_ticks,
+            bar_seconds,
+            tempo_before: self.tempo_map.clone(),
+            tempo_after: tempo_map_with_count_in(&self.tempo_map, tempo, bar_ticks),
+        };
+        self.apply_count_in(&edit, true);
+        self.remember_edit(EditCommand::CountIn(Box::new(edit)));
+        self.status_message = format!(
+            "Added a {beats}-click count-in at {tempo} BPM in bar 1; the song moved one bar later"
+        );
+        self.save_session();
+    }
+
+    /// Puts a count-in in (`insert`) or takes it out again, moving the rest of
+    /// the session by the bar it occupies. Shared by the edit, its undo and
+    /// its redo, so all three agree about what moves and by how much.
+    fn apply_count_in(&mut self, edit: &CountInEdit, insert: bool) {
+        // Undo can arrive mid-take; the take is kept, as pressing stop keeps it.
+        if let Some(runtime) = &self.runtime {
+            runtime.stop();
+        }
+        self.finish_recording_clip();
+        let shift_frames = |frame: u64| {
+            if insert {
+                frame.saturating_add(edit.bar_frames)
+            } else {
+                frame.saturating_sub(edit.bar_frames)
+            }
+        };
+        let shift_ticks = |tick: u64| {
+            if insert {
+                tick.saturating_add(edit.bar_ticks)
+            } else {
+                tick.saturating_sub(edit.bar_ticks)
+            }
+        };
+        let shift_seconds = |seconds: f64| {
+            if insert {
+                seconds + edit.bar_seconds
+            } else {
+                (seconds - edit.bar_seconds).max(0.0)
+            }
+        };
+
+        // The count-in track is the one thing that must not move, so it comes
+        // out before the shift and goes back in after it.
+        let position = self
+            .tracks
+            .iter()
+            .position(|track| track.id == edit.track.id);
+        if let Some(position) = position {
+            self.tracks.remove(position);
+            if self.piano_roll.track > position {
+                self.piano_roll.track -= 1;
+            }
+        }
+        for track in &mut self.tracks {
+            for clip in &mut track.clips {
+                clip.start_frame = shift_frames(clip.start_frame);
+                clip.end_frame = shift_frames(clip.end_frame);
+            }
+            for clip in &mut track.midi_clips {
+                clip.start_tick = shift_ticks(clip.start_tick);
+            }
+        }
+        for chord in &mut self.chords {
+            chord.start_seconds = shift_seconds(chord.start_seconds);
+            chord.end_seconds = shift_seconds(chord.end_seconds);
+        }
+        if let Some((from, to)) = self.loop_range {
+            let (from, to) = (shift_seconds(from), shift_seconds(to));
+            self.loop_range = Some((from, to));
+            if let Some(runtime) = &self.runtime {
+                let rate = f64::from(runtime.sample_rate().get());
+                runtime.set_loop((from * rate).round() as u64, (to * rate).round() as u64);
+            }
+        }
+        self.tempo_map = if insert {
+            self.tracks.insert(0, edit.track.clone());
+            self.piano_roll.track += 1;
+            self.selected_track = 0;
+            edit.tempo_after.clone()
+        } else {
+            self.selected_track = self.selected_track.min(self.tracks.len().saturating_sub(1));
+            edit.tempo_before.clone()
+        };
+        if self.tracks.is_empty() {
+            self.tracks.push(Track::new(0, ChannelLayout::Mono));
+        }
+        self.selected_clip = None;
+        self.dragged_clip = None;
+        self.trimming = None;
+        self.dirty = true;
+        if let Some(runtime) = &self.runtime {
+            runtime.seek_to_start();
+        }
+        self.playback_synced = false;
+        if let Err(error) = self.sync_playback() {
+            self.status_message = format!("Count-in applied; playback preload failed: {error}");
+        }
+    }
+
     fn nudge_selected_clip(&mut self, delta_frames: i64) {
         let Some((track_index, clip_index)) = self.selected_clip else {
             return;
@@ -4738,6 +4944,18 @@ impl RustDawApp {
                     );
                     if let Some(runtime) = &self.runtime {
                         runtime.set_click(self.click_enabled, self.click_level);
+                    }
+                    if ui
+                        .button("CLICK TO START")
+                        .on_hover_text(format!(
+                            "Put {} wood-block clicks in front of the song, one bar at {} BPM, \
+                             so whoever starts it can count the band in. Everything moves one \
+                             bar later to make room; Ctrl+Z takes it out again.",
+                            self.meter_numerator, self.tempo
+                        ))
+                        .clicked()
+                    {
+                        self.create_count_in();
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -6649,6 +6867,48 @@ fn unique_import_path(directory: &std::path::Path, stem: &str) -> PathBuf {
     directory.join(format!("{stem}-{}.wav", Uuid::new_v4().simple()))
 }
 
+/// The tempo map with one bar at `tempo` put in front of it.
+///
+/// Every point moves later by the bar, and the bar itself runs at the
+/// transport tempo, so what follows keeps exactly the timing it had against
+/// the audio, which moved by the same bar in frames.
+fn tempo_map_with_count_in(map: &TempoMap, tempo: u16, bar_ticks: u64) -> TempoMap {
+    let mut points = vec![daw_midi::TempoPoint {
+        tick: 0,
+        bpm: f64::from(tempo),
+    }];
+    points.extend(map.points().iter().map(|point| daw_midi::TempoPoint {
+        tick: point.tick.saturating_add(bar_ticks),
+        bpm: point.bpm,
+    }));
+    TempoMap::new(points, map.ticks_per_quarter())
+}
+
+/// Writes rendered samples as a 24-bit mono WAV, the format every other file
+/// in the session is in, creating the folder if needed.
+fn write_mono_wav(path: &std::path::Path, samples: &[f32], sample_rate: u32) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 24,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    let full_scale = f32::from(i16::MAX) * 256.0;
+    for sample in samples {
+        writer.write_sample((sample.clamp(-1.0, 1.0) * full_scale).round() as i32)?;
+    }
+    writer
+        .finalize()
+        .with_context(|| format!("failed to finalize {}", path.display()))
+}
+
 /// Converts any audio file ffmpeg can read into a session-rate WAV under
 /// [`import_dir`], and returns it with its layout and length.
 ///
@@ -7370,6 +7630,63 @@ mod tests {
         assert_eq!(moved_start_frame(48_000, 24_000), 72_000);
         assert_eq!(moved_start_frame(48_000, -12_000), 36_000);
         assert_eq!(moved_start_frame(1_000, -2_000), 0);
+    }
+
+    #[test]
+    fn a_count_in_bar_goes_in_front_of_the_tempo_map() {
+        let song = TempoMap::new(
+            vec![
+                daw_midi::TempoPoint {
+                    tick: 0,
+                    bpm: 100.0,
+                },
+                daw_midi::TempoPoint {
+                    tick: 1_920,
+                    bpm: 130.0,
+                },
+            ],
+            daw_midi::TICKS_PER_QUARTER,
+        );
+        let bar_ticks = 4 * u64::from(daw_midi::TICKS_PER_QUARTER);
+        let with_count = tempo_map_with_count_in(&song, 124, bar_ticks);
+
+        // The bar itself runs at the transport tempo, not the song's first beat.
+        assert!((with_count.bpm_at_tick(0) - 124.0).abs() < f64::EPSILON);
+        assert!((with_count.bpm_at_tick(bar_ticks) - 100.0).abs() < f64::EPSILON);
+        assert!((with_count.bpm_at_tick(bar_ticks + 1_920) - 130.0).abs() < f64::EPSILON);
+        // Everything after it keeps its timing, one bar later.
+        let bar_seconds = 4.0 * 60.0 / 124.0;
+        for tick in [0, 960, 1_920, 5_000] {
+            let expected = bar_seconds + song.tick_to_seconds(tick);
+            let actual = with_count.tick_to_seconds(tick + bar_ticks);
+            assert!((actual - expected).abs() < 1e-9, "tick {tick}");
+        }
+    }
+
+    #[test]
+    fn a_count_in_at_the_songs_own_tempo_is_still_a_bar_long() {
+        let song = TempoMap::constant(124.0);
+        let bar_ticks = 4 * u64::from(daw_midi::TICKS_PER_QUARTER);
+        let with_count = tempo_map_with_count_in(&song, 124, bar_ticks);
+        assert!(with_count.is_constant());
+        assert!((with_count.tick_to_seconds(bar_ticks) - 4.0 * 60.0 / 124.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_rendered_count_in_is_session_media() {
+        let path =
+            std::env::temp_dir().join(format!("rustdaw-count-in-{}.wav", std::process::id()));
+        let samples = daw_engine::render_count_in(daw_core::SampleRate::DEFAULT, 124, 4).unwrap();
+        write_mono_wav(&path, &samples, 48_000).unwrap();
+
+        let (layout, frames) = inspect_import_audio(&path, 48_000).unwrap();
+        assert_eq!(layout, ChannelLayout::Mono);
+        assert_eq!(frames, samples.len() as u64);
+        let (peaks, analysed) = analyze_waveform(&path);
+        assert_eq!(analysed, frames);
+        assert!(peaks.iter().copied().fold(0.0_f32, f32::max) > 0.5);
+
+        std::fs::remove_file(path).unwrap();
     }
 
     fn write_test_wav(path: &std::path::Path, channels: u16, sample_rate: u32) {

@@ -1,5 +1,6 @@
 //! Backend-neutral, allocation-free audio processing primitives.
 
+mod count_in;
 mod delay;
 mod effects;
 mod gate;
@@ -12,6 +13,7 @@ pub(crate) mod tone;
 mod transport;
 mod wah;
 
+pub use count_in::render_count_in;
 pub use delay::Delay;
 pub use effects::{ChannelStrip, ChannelStripParams};
 pub use gate::{NoiseGate, OPEN_THRESHOLD_DB};

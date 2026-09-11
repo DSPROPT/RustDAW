@@ -241,6 +241,28 @@ about 3 seconds and subsequent playback schedule rebuilds take approximately
 0.005 ms. Clip moves and keyboard nudges use UUID-based edit commands and can be
 reversed with **UNDO** / `Ctrl+Z`, then restored with **REDO** / `Ctrl+Shift+Z`.
 
+### Counting the band in
+
+A song that opens on the guitar has nothing to count the guitarist in: the
+metronome plays over the whole song, so it is either on for the take or off, and
+it is not in the exported mix at all. **CLICK TO START** in the transport bar
+puts the count *in* the song instead. It moves everything on the timeline one bar
+later — audio, notes, the chord chart, the tempo map and any loop — and fills the
+bar that opens up with one wood-block click per beat at the session tempo, on a
+**Count-in** track at the top. Beat one is a high block and the rest are low, so
+the downbeat is heard as well as counted.
+
+The clicks are an ordinary mono 24-bit WAV under `Imports/` and the track is an
+ordinary audio track: it plays with the click switched off, goes out with
+**EXPORT MIX**, and its fader turns it down. The bar is counted at the transport
+tempo — what the click runs at — rather than at the tempo map's first beat, which
+on an imported song can be one noisy interval. It is one undo step: `Ctrl+Z`
+takes the count out and moves the song back. To hear the block on its own:
+
+```bash
+cargo run -p daw-engine --example audition-count-in -- count-in.wav 124 4
+```
+
 For a two-second command-line recording check using Scarlett Input 2:
 
 ```bash
