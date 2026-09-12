@@ -241,23 +241,37 @@ about 3 seconds and subsequent playback schedule rebuilds take approximately
 0.005 ms. Clip moves and keyboard nudges use UUID-based edit commands and can be
 reversed with **UNDO** / `Ctrl+Z`, then restored with **REDO** / `Ctrl+Shift+Z`.
 
-### Counting the band in
+### Counting the band in, and a click you can export
 
-A song that opens on the guitar has nothing to count the guitarist in: the
-metronome plays over the whole song, so it is either on for the take or off, and
-it is not in the exported mix at all. **CLICK TO START** in the transport bar
-puts the count *in* the song instead. It moves everything on the timeline one bar
-later — audio, notes, the chord chart, the tempo map and any loop — and fills the
-bar that opens up with one wood-block click per beat at the session tempo, on a
-**Count-in** track at the top. Beat one is a high block and the rest are low, so
-the downbeat is heard as well as counted.
+The metronome plays over the whole song and is gone the moment the mix or the
+stems are exported. Two buttons in the transport bar put the click *in* the song
+instead, as wood-block audio on tracks of its own — beat one a high block, the
+rest low, so the downbeat is heard as well as counted.
 
-The clicks are an ordinary mono 24-bit WAV under `Imports/` and the track is an
-ordinary audio track: it plays with the click switched off, goes out with
-**EXPORT MIX**, and its fader turns it down. The bar is counted at the transport
-tempo — what the click runs at — rather than at the tempo map's first beat, which
-on an imported song can be one noisy interval. It is one undo step: `Ctrl+Z`
-takes the count out and moves the song back. To hear the block on its own:
+**CLICK TO START** is for a song that opens on the guitar, where nothing counts
+the guitarist in. It moves everything on the timeline one bar later — audio,
+notes, the chord chart, the tempo map and any loop — and fills the bar that
+opens up with one click per beat at the session tempo, on a **Count-in** track
+at the top. The bar is counted at the transport tempo, what the click runs at,
+rather than at the tempo map's first beat, which on an imported song can be one
+noisy interval. It is one undo step: `Ctrl+Z` takes the count out and moves the
+song back.
+
+**CLICK TRACK** renders the click for the whole song — one block per beat from
+bar 1 to the bar line after the last clip — on a **Click** track, so a band
+rehearsing to the stems gets the click as a stem. It follows the session's tempo
+map the way the ruler does, so a song imported with tempo changes gets a click
+that changes with it. Where a count-in is already in front of the song the clip
+starts after it rather than striking the same beats twice; pull its start edge
+back and bar 1 is there. Delete the track to take it out. The click is rendered
+at the tempo of the moment, so change the tempo and make a new one.
+
+Both are ordinary mono 24-bit WAVs under `Imports/` on ordinary audio tracks:
+they play with the metronome off, their faders turn them down, and **EXPORT
+MIX** and **EXPORT STEMS** treat them like any other track. Setting the tempo in
+the transport bar, or tapping it, now also moves a steady tempo map, so the
+ruler, the notes and anything rendered from the map agree with the click. To
+hear the block on its own:
 
 ```bash
 cargo run -p daw-engine --example audition-count-in -- count-in.wav 124 4

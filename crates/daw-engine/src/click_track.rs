@@ -1,21 +1,22 @@
-//! A count-in rendered as audio: one bar of wood-block clicks to put in front
-//! of a song.
+//! The click rendered as audio: wood-block hits on the beat, as a clip.
 //!
 //! The metronome plays *over* the song and stops being useful the moment the
-//! click is switched off or the mix is exported. A song that starts on the
-//! guitar needs its count *in* the song — the clicks the guitarist hears before
-//! the first bar whether the session is played here, exported, or sent to the
-//! rest of the band — so this renders the count once into a buffer that becomes
-//! an ordinary clip.
+//! click is switched off or the mix is exported. Two things want the click
+//! *in* the song instead. A song that starts on the guitar needs a count-in the
+//! guitarist hears before the first bar, whether the session is played here or
+//! sent to the rest of the band; and a band rehearsing to exported stems needs
+//! the click as a stem of its own. Both are rendered here, once, into a buffer
+//! that becomes an ordinary clip.
 //!
 //! The sound is a struck wood block rather than the metronome's beep: a
 //! fundamental and one inharmonic overtone that ring for a few tens of
-//! milliseconds under a short burst of noise for the strike. Beat one is the
-//! high block and the rest of the bar the low one, so the downbeat is heard as
-//! well as counted.
+//! milliseconds under a short burst of noise for the strike. The first beat of
+//! a bar is the high block and the rest the low one, so the downbeat is heard
+//! as well as counted.
 
 use crate::metronome::MetronomeError;
 use daw_core::SampleRate;
+use daw_midi::TempoMap;
 use std::f32::consts::TAU;
 
 /// Fundamental of the high block, on the downbeat.
@@ -33,6 +34,11 @@ const STRIKE_DECAY_SECONDS: f32 = 0.001_5;
 const HIT_LENGTH_SECONDS: f32 = 0.1;
 const ACCENT_LEVEL: f32 = 0.8;
 const REGULAR_LEVEL: f32 = 0.6;
+
+/// The longest click track that will be rendered. A song is minutes; this is
+/// what stops a clip dragged to the far end of the timeline asking for
+/// gigabytes.
+const MAX_CLICK_TRACK_SECONDS: u64 = 60 * 60;
 
 /// Renders `beats` clicks at `tempo_bpm` into a mono buffer exactly one bar
 /// long.
@@ -57,22 +63,85 @@ pub fn render_count_in(
         return Err(MetronomeError::InvalidMeter);
     }
     let frames_per_beat = f64::from(sample_rate.get()) * 60.0 / f64::from(tempo_bpm);
-    let bar_frames = frames_per_beat * f64::from(beats);
     // Both are bounded: 300 beats at 20 BPM at any real sample rate is well
-    // inside usize.
+    // inside u64.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let mut output = vec![0.0; bar_frames.round() as usize];
-    for beat in 0..beats {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let start = (frames_per_beat * f64::from(beat)).round() as usize;
-        let (frequency, level) = if beat == 0 {
+    let hits = (0..beats).map(|beat| {
+        (
+            (frames_per_beat * f64::from(beat)).round() as u64,
+            beat == 0,
+        )
+    });
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let length = (frames_per_beat * f64::from(beats)).round() as u64;
+    Ok(render_hits(sample_rate, hits, length))
+}
+
+/// Renders the click for a whole song: one wood block on every beat from bar
+/// 1 to the first bar line at or after `end_frame`, following the tempo map.
+///
+/// The bars come from the map the way the ruler's do, so a song whose tempo
+/// was detected as changing gets a click that changes with it. The render
+/// stops on a bar line rather than mid-bar, and always covers at least one
+/// bar, so an empty session still gets something to play to.
+///
+/// # Errors
+///
+/// Returns [`MetronomeError::InvalidMeter`] when `beats_per_bar` is zero.
+pub fn render_click_track(
+    sample_rate: SampleRate,
+    tempo: &TempoMap,
+    beats_per_bar: u16,
+    end_frame: u64,
+) -> Result<Vec<f32>, MetronomeError> {
+    if beats_per_bar == 0 {
+        return Err(MetronomeError::InvalidMeter);
+    }
+    let rate = sample_rate.get();
+    let end_frame = end_frame.min(u64::from(rate) * MAX_CLICK_TRACK_SECONDS);
+    let ticks_per_beat = u64::from(tempo.ticks_per_quarter());
+    let beats_per_bar = u64::from(beats_per_bar);
+
+    let mut hits = Vec::new();
+    let mut beat = 0_u64;
+    let length = loop {
+        let frame = tempo.tick_to_frame(beat.saturating_mul(ticks_per_beat), rate);
+        let bar_line = beat % beats_per_bar == 0;
+        if bar_line && beat > 0 && frame >= end_frame {
+            break frame;
+        }
+        // A map converts tick offsets through a u32 and stops advancing past
+        // it; that is hours away, but a beat that does not move on is the end.
+        if hits.last().is_some_and(|&(previous, _)| frame <= previous) {
+            break frame;
+        }
+        hits.push((frame, bar_line));
+        beat += 1;
+    };
+    Ok(render_hits(sample_rate, hits, length))
+}
+
+/// A buffer `length` frames long with a block struck at each hit: the high
+/// block where the hit is accented, the low one elsewhere.
+#[allow(clippy::cast_possible_truncation)]
+fn render_hits(
+    sample_rate: SampleRate,
+    hits: impl IntoIterator<Item = (u64, bool)>,
+    length: u64,
+) -> Vec<f32> {
+    let mut output = vec![0.0; length as usize];
+    for (frame, accent) in hits {
+        let Some(tail) = output.get_mut(frame as usize..) else {
+            continue;
+        };
+        let (frequency, level) = if accent {
             (HIGH_BLOCK_HZ, ACCENT_LEVEL)
         } else {
             (LOW_BLOCK_HZ, REGULAR_LEVEL)
         };
-        strike_wood_block(sample_rate, frequency, level, &mut output[start..]);
+        strike_wood_block(sample_rate, frequency, level, tail);
     }
-    Ok(output)
+    output
 }
 
 /// Adds one hit of a wood block tuned to `frequency` at the head of `output`,
@@ -196,6 +265,81 @@ mod tests {
         let first = render_count_in(SampleRate::DEFAULT, 124, 4).unwrap();
         let second = render_count_in(SampleRate::DEFAULT, 124, 4).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_click_track_runs_to_the_bar_line_after_the_song() {
+        // 120 BPM, 4/4: a bar is 96,000 frames. A song ending mid-bar 3 gets
+        // three whole bars of click.
+        let click = render_click_track(SampleRate::DEFAULT, &TempoMap::constant(120.0), 4, 200_000)
+            .unwrap();
+        assert_eq!(click.len(), 288_000);
+        for beat in 0..12 {
+            let start = beat * 24_000;
+            assert!(
+                peak(&click[start..start + 480]) > 0.3,
+                "beat {beat} is quiet"
+            );
+        }
+        // Bar lines are accented, the beats between them are not.
+        assert!(peak(&click[96_000..100_800]) > peak(&click[120_000..124_800]));
+    }
+
+    #[test]
+    fn a_song_ending_on_a_bar_line_gets_no_extra_bar() {
+        let click = render_click_track(SampleRate::DEFAULT, &TempoMap::constant(120.0), 4, 192_000)
+            .unwrap();
+        assert_eq!(click.len(), 192_000);
+    }
+
+    #[test]
+    fn an_empty_session_still_gets_one_bar() {
+        let click =
+            render_click_track(SampleRate::DEFAULT, &TempoMap::constant(120.0), 3, 0).unwrap();
+        assert_eq!(click.len(), 72_000);
+    }
+
+    #[test]
+    fn the_click_follows_a_tempo_change() {
+        // Two bars at 120, then 60: the fifth beat lands where the map says.
+        let map = TempoMap::new(
+            vec![
+                daw_midi::TempoPoint {
+                    tick: 0,
+                    bpm: 120.0,
+                },
+                daw_midi::TempoPoint {
+                    tick: 4 * u64::from(daw_midi::TICKS_PER_QUARTER),
+                    bpm: 60.0,
+                },
+            ],
+            daw_midi::TICKS_PER_QUARTER,
+        );
+        let click = render_click_track(SampleRate::DEFAULT, &map, 4, 200_000).unwrap();
+        // One bar at 120 (2 s) and one at 60 (4 s), ending on the bar line.
+        assert_eq!(click.len(), 288_000);
+        let fifth_beat = 96_000;
+        let sixth_beat = 96_000 + 48_000;
+        assert!(peak(&click[fifth_beat..fifth_beat + 480]) > 0.3);
+        assert!(peak(&click[sixth_beat..sixth_beat + 480]) > 0.3);
+        // Halfway between them, at 120 there would have been a beat.
+        assert!(peak(&click[fifth_beat + 24_000..fifth_beat + 24_480]) < 0.001);
+    }
+
+    #[test]
+    fn a_click_track_is_capped_at_an_hour() {
+        let click =
+            render_click_track(SampleRate::DEFAULT, &TempoMap::constant(120.0), 4, u64::MAX)
+                .unwrap();
+        assert_eq!(click.len(), 48_000 * 60 * 60);
+    }
+
+    #[test]
+    fn a_click_track_needs_a_meter() {
+        assert_eq!(
+            render_click_track(SampleRate::DEFAULT, &TempoMap::constant(120.0), 0, 1).unwrap_err(),
+            MetronomeError::InvalidMeter
+        );
     }
 
     #[test]

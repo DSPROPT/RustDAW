@@ -1,18 +1,25 @@
-//! Renders one bar of the count-in to a WAV so the wood block can be judged by
-//! ear, which is the only way a click can be judged at all.
+//! Renders the wood-block click to a WAV so it can be judged by ear, which is
+//! the only way a click can be judged at all.
 //!
 //! ```text
-//! cargo run -p daw-engine --example audition-count-in -- count-in.wav [bpm] [beats]
+//! cargo run -p daw-engine --example audition-count-in -- count-in.wav [bpm] [beats] [bars]
 //! ```
 //!
-//! Defaults to four beats at 120 BPM. Run it after touching the block's
+//! Defaults to a one-bar count-in of four beats at 120 BPM. Give a number of
+//! bars to hear the whole-song click track instead, rendered the way the
+//! **CLICK TRACK** button renders it. Run it after touching the block's
 //! partials or decays: a test can say the hit is short and peaks where it
 //! should, not whether it sounds like wood.
 
-#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 
 use daw_core::SampleRate;
-use daw_engine::render_count_in;
+use daw_engine::{render_click_track, render_count_in};
+use daw_midi::TempoMap;
 
 fn main() {
     let mut arguments = std::env::args().skip(1);
@@ -27,11 +34,25 @@ fn main() {
         .next()
         .and_then(|value| value.parse().ok())
         .unwrap_or(4);
+    let bars: Option<u64> = arguments.next().and_then(|value| value.parse().ok());
 
-    let samples = match render_count_in(SampleRate::DEFAULT, tempo, beats) {
+    let rendered = match bars {
+        None => render_count_in(SampleRate::DEFAULT, tempo, beats),
+        Some(bars) => {
+            let frames_per_bar =
+                f64::from(SampleRate::DEFAULT.get()) * 60.0 / f64::from(tempo) * f64::from(beats);
+            render_click_track(
+                SampleRate::DEFAULT,
+                &TempoMap::constant(f64::from(tempo)),
+                beats,
+                (frames_per_bar * bars as f64).round() as u64,
+            )
+        }
+    };
+    let samples = match rendered {
         Ok(samples) => samples,
         Err(error) => {
-            eprintln!("could not render the count-in: {error}");
+            eprintln!("could not render the click: {error}");
             std::process::exit(1);
         }
     };
@@ -60,7 +81,11 @@ fn main() {
         std::process::exit(1);
     }
     println!(
-        "Wrote {beats} clicks at {tempo} BPM ({:.3} s) to {destination}",
+        "Wrote {} at {tempo} BPM ({:.3} s) to {destination}",
+        match bars {
+            None => format!("{beats} clicks"),
+            Some(bars) => format!("{bars} bar(s) of {beats}"),
+        },
         samples.len() as f64 / f64::from(SampleRate::DEFAULT.get())
     );
 }

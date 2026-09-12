@@ -845,10 +845,7 @@ impl RustDawApp {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let bpm = (60.0 / median).round().clamp(20.0, 300.0) as u16;
                 self.tempo = bpm;
-                if let Some(runtime) = &self.runtime {
-                    runtime.set_tempo(bpm);
-                }
-                self.dirty = true;
+                self.follow_transport_tempo();
             }
         }
 
@@ -874,6 +871,34 @@ impl RustDawApp {
                     let offset = (snapshot.position_frames as f64 % bar_frames) as u64;
                     runtime.set_click_offset(offset);
                 }
+            }
+        }
+    }
+
+    /// Pushes a changed transport tempo to the click, and keeps a steady tempo
+    /// map in step with it.
+    ///
+    /// Bars, notes and the chord lane take their time from the map; the click
+    /// takes it from the transport. Setting one without the other left the
+    /// ruler at 120 under a click at 124, and anything rendered from the map —
+    /// a click track, say — at the wrong tempo. A map with tempo changes came
+    /// from the song itself and is left alone: one number cannot describe it.
+    fn follow_transport_tempo(&mut self) {
+        if let Some(runtime) = &self.runtime {
+            runtime.set_tempo(self.tempo);
+        }
+        self.dirty = true;
+        if !self.tempo_map.is_constant()
+            || (self.tempo_map.bpm_at_tick(0) - f64::from(self.tempo)).abs() < f64::EPSILON
+        {
+            return;
+        }
+        self.tempo_map = TempoMap::constant(f64::from(self.tempo));
+        // Notes are scheduled in frames, so they have to be laid out again.
+        if self.tracks.iter().any(|track| !track.midi_clips.is_empty()) {
+            self.playback_synced = false;
+            if let Err(error) = self.sync_playback() {
+                self.status_message = format!("Tempo changed; playback preload failed: {error}");
             }
         }
     }
@@ -3512,6 +3537,129 @@ impl RustDawApp {
         }
     }
 
+    /// Renders the click as a wood-block audio track for the whole song.
+    ///
+    /// The metronome is gone the moment the stems are exported, and a band
+    /// rehearsing to stems needs the click as a stem of its own. This renders
+    /// one block per beat from bar 1 to the bar line after the last clip,
+    /// following the tempo map the way the ruler does, on a **Click** track at
+    /// the top. It is audio like any other track: its fader turns it down, and
+    /// **EXPORT STEMS** writes it out beside the rest.
+    ///
+    /// The file always holds the click from bar 1. Where a count-in is already
+    /// in front of the song the clip is windowed to start after it, so the two
+    /// blocks are not struck on top of each other; pull the clip's start edge
+    /// back and the bar is there.
+    fn create_click_track(&mut self) {
+        if matches!(
+            self.snapshot().transport,
+            RuntimeTransportState::Recording | RuntimeTransportState::CountIn
+        ) {
+            self.status_message = "Stop recording before adding a click track".to_owned();
+            return;
+        }
+        let rate = self
+            .runtime
+            .as_ref()
+            .map_or(48_000, |runtime| runtime.sample_rate().get());
+        let Some(sample_rate) = daw_core::SampleRate::new(rate) else {
+            return;
+        };
+        let audio_end = self
+            .tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .map(|clip| clip.end_frame)
+            .max()
+            .unwrap_or(0);
+        let midi_end = self
+            .tracks
+            .iter()
+            .flat_map(|track| &track.midi_clips)
+            .map(|clip| self.tempo_map.tick_to_frame(clip.end_tick(), rate))
+            .max()
+            .unwrap_or(0);
+        let beats_per_bar = self.meter_numerator.max(1);
+        let samples = match daw_engine::render_click_track(
+            sample_rate,
+            &self.tempo_map,
+            beats_per_bar,
+            audio_end.max(midi_end),
+        ) {
+            Ok(samples) => samples,
+            Err(error) => {
+                self.status_message = format!("Could not render the click track: {error}");
+                return;
+            }
+        };
+        let path = unique_import_path(
+            &import_dir(),
+            &format!(
+                "Click track {} BPM {beats_per_bar}-{}",
+                self.tempo, self.meter_denominator
+            ),
+        );
+        if let Err(error) = write_mono_wav(&path, &samples, rate) {
+            self.status_message = format!("Could not write the click track: {error:#}");
+            return;
+        }
+        let length = samples.len() as u64;
+
+        // A count-in already counts bar 1; the click picks up where it ends.
+        let count_in = self
+            .tracks
+            .iter()
+            .position(|track| track.name == "Count-in");
+        let start = count_in
+            .and_then(|index| {
+                self.tracks[index]
+                    .clips
+                    .iter()
+                    .map(|clip| clip.end_frame)
+                    .max()
+            })
+            .filter(|end| *end < length)
+            .unwrap_or(0);
+
+        let mut track = Track::new(0, ChannelLayout::Mono);
+        track.name = "Click".to_owned();
+        let (waveform, source_frames) = analyze_waveform(&path);
+        track.clips.push(Clip {
+            id: Uuid::new_v4(),
+            name: "Click".to_owned(),
+            path,
+            start_frame: start,
+            end_frame: length,
+            source_start_frame: start,
+            source_frames,
+            source_path: None,
+            color: theme::BLUE_DARK,
+            waveform,
+        });
+        let index = count_in.map_or(0, |index| index + 1);
+        self.tracks.insert(index, track);
+        if self.piano_roll.track >= index {
+            self.piano_roll.track += 1;
+        }
+        self.selected_track = index;
+        self.selected_clip = None;
+        self.dirty = true;
+        self.playback_synced = false;
+        if let Err(error) = self.sync_playback() {
+            self.status_message = format!("Click track added; playback preload failed: {error}");
+            return;
+        }
+        // The render ends on a bar line, so its length in ticks is whole bars.
+        let bar_ticks = u64::from(beats_per_bar) * u64::from(self.tempo_map.ticks_per_quarter());
+        let bars = (self.tempo_map.frame_to_tick(length, rate) + bar_ticks / 2) / bar_ticks;
+        self.status_message = format!(
+            "Rendered a wood-block click for {bars} bar(s){}; it plays with the click off \
+             and exports with the stems",
+            if start > 0 { " after the count-in" } else { "" }
+        );
+        self.save_session();
+    }
+
     fn nudge_selected_clip(&mut self, delta_frames: i64) {
         let Some((track_index, clip_index)) = self.selected_clip else {
             return;
@@ -4822,10 +4970,7 @@ impl RustDawApp {
                         )
                         .changed()
                     {
-                        if let Some(runtime) = &self.runtime {
-                            runtime.set_tempo(self.tempo);
-                        }
-                        self.dirty = true;
+                        self.follow_transport_tempo();
                     }
                     ui.label("BPM");
                     if ui
@@ -4950,6 +5095,17 @@ impl RustDawApp {
                         .clicked()
                     {
                         self.create_count_in();
+                    }
+                    if ui
+                        .button("CLICK TRACK")
+                        .on_hover_text(
+                            "Render the click as a wood-block audio track for the whole song, \
+                             following the tempo map. It plays with the click off and exports \
+                             with the stems. Delete the track to take it out.",
+                        )
+                        .clicked()
+                    {
+                        self.create_click_track();
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
