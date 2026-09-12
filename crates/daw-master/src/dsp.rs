@@ -20,7 +20,7 @@ pub fn lr_to_ms(frames: &[[f32; 2]]) -> (Vec<f32>, Vec<f32>) {
     let mut mid = Vec::with_capacity(frames.len());
     let mut side = Vec::with_capacity(frames.len());
     for frame in frames {
-        mid.push((frame[0] + frame[1]) * 0.5);
+        mid.push(f32::midpoint(frame[0], frame[1]));
         side.push((frame[0] - frame[1]) * 0.5);
     }
     (mid, side)

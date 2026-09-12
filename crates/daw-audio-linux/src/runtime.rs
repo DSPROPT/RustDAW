@@ -331,7 +331,7 @@ impl ActiveNam {
         }
         let count = frames.len().min(self.mono.len()).min(self.stereo.len());
         for (sample, frame) in self.mono[..count].iter_mut().zip(frames.iter()) {
-            *sample = (frame[0] + frame[1]) * 0.5 * self.input_gain;
+            *sample = f32::midpoint(frame[0], frame[1]) * self.input_gain;
         }
         // Ahead of the model, so the hiss between notes never reaches the gain.
         self.gate.process(&mut self.mono[..count], self.gate_db);
@@ -1934,9 +1934,9 @@ fn mix_monitoring(
     if let Some(nam) = nam.as_mut().filter(|nam| nam.enabled) {
         let count = output_left.len().min(nam.mono.len());
         for sample in &mut nam.mono[..count] {
-            *sample = queue
-                .pop()
-                .map_or(0.0, |frame| (frame[0] + frame[1]) * 0.5 * nam.input_gain);
+            *sample = queue.pop().map_or(0.0, |frame| {
+                f32::midpoint(frame[0], frame[1]) * nam.input_gain
+            });
         }
         let params = effects.params();
         // In front of the amp, and mono, which is where a pedal actually is.

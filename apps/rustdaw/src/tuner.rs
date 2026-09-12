@@ -316,7 +316,7 @@ mod tests {
             let phase = index as f32 / RATE * hertz * std::f32::consts::TAU;
             state
                 .window
-                .push((phase.sin() * 0.3 + (phase * 2.0).sin() * 0.2) * 0.5);
+                .push(f32::midpoint(phase.sin() * 0.3, (phase * 2.0).sin() * 0.2));
         }
     }
 

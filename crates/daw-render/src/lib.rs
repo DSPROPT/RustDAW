@@ -477,7 +477,7 @@ fn apply_track_chain(
         for block in samples.chunks_mut(2_048) {
             let block_len = block.len();
             for (sample, frame) in mono[..block_len].iter_mut().zip(block.iter()) {
-                *sample = (frame[0] + frame[1]) * 0.5 * input_gain;
+                *sample = f32::midpoint(frame[0], frame[1]) * input_gain;
             }
             gate.process(&mut mono[..block_len], track.effects.nam_gate_db);
             nam.process(&mut mono[..block_len])
