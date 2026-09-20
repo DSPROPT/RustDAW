@@ -7,6 +7,9 @@ A finished project lives at ``<data_dir>/projects/<id>/`` and holds:
 * ``stems/<name>.wav`` — one file per separated instrument.
 * ``midi/song.mid`` — the transcription (optional).
 
+Beside the projects, ``renders/`` holds single tracks ACE-Step produced on
+request; they belong to no project and RustDAW reads them by path.
+
 The manifest schema is deliberately the subset RustDAW consumes, written in the
 exact camelCase shape ``manifest.rs`` expects. Keep the two in step.
 """
@@ -63,6 +66,12 @@ def uploads_dir() -> Path:
     return data_dir() / "uploads"
 
 
+def renders_dir() -> Path:
+    """Where a track ACE-Step re-rendered, extracted or wrote is left for
+    RustDAW to collect. Not a project: one WAV per render, read by path."""
+    return data_dir() / "renders"
+
+
 _SLUG = re.compile(r"[^a-z0-9]+")
 
 
@@ -102,14 +111,20 @@ def write_manifest(
     midi: dict[str, str] | None,
     beat_grid: dict | None,
     stages: dict[str, dict] | None,
+    generation: dict | None = None,
 ) -> Path:
-    """Write ``project.json`` in the shape RustDAW's ``SongManifest`` reads."""
+    """Write ``project.json`` in the shape RustDAW's ``SongManifest`` reads.
+
+    ``generation`` records what ACE-Step was asked for when the song was
+    written rather than downloaded; RustDAW reads it back as provenance.
+    """
     manifest = {
         "title": title,
         "artist": artist,
         "style": style,
         "sourceUrl": source_url,
         "duration": duration,
+        "generation": generation,
         "files": {
             "stems": stems,
             "drumkit": drumkit or {},

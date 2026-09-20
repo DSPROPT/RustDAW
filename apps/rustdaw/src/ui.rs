@@ -23,8 +23,9 @@ use daw_project::{
     save_atomic,
 };
 use daw_songimport::{
-    CancelFlag, ImportProgress, ImportSource, IngestOptions, Ingested, MAX_TRANSPOSE_SEMITONES,
-    ProjectSummary, Rekeyed,
+    AceStepHealth, CancelFlag, GenerateRequest, ImportProgress, ImportSource, IngestOptions,
+    Ingested, MAX_TRANSPOSE_SEMITONES, MixClip, ProjectSummary, Rekeyed, RenderInput, RenderMode,
+    RenderOutcome, RenderRequest, RenderTask, ace_track_for,
 };
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
@@ -259,6 +260,68 @@ enum ImportMessage {
     Failed(String),
 }
 
+/// Messages from a track render on its worker thread. Same shape as an
+/// import's, for the same reason: ACE-Step takes anywhere from seconds to
+/// minutes and the window has to stay live.
+enum RenderMessage {
+    Progress(ImportProgress),
+    Finished(Box<RenderOutcome>),
+    Failed(String),
+}
+
+/// One track being re-rendered, extracted or written by ACE-Step.
+///
+/// The track is remembered by id rather than index: a track can be deleted
+/// or reordered while the render runs, and the result must land on the one
+/// it was asked for or nowhere.
+struct RenderState {
+    open: bool,
+    track: Option<Uuid>,
+    mode: RenderMode,
+    /// The instrument, in ACE-Step's own vocabulary.
+    ace_track: String,
+    prompt: String,
+    /// How closely a re-render keeps the part.
+    strength: f32,
+    receiver: Option<Receiver<RenderMessage>>,
+    cancel: Option<CancelFlag>,
+    /// What the running job was asked for, so the result is applied the way
+    /// it was requested even if the form has been changed since.
+    running: Option<(Uuid, RenderMode, String, PathBuf)>,
+    stage: String,
+    detail: String,
+    fraction: Option<f32>,
+    notes: Vec<String>,
+    error: Option<String>,
+}
+
+impl Default for RenderState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            track: None,
+            mode: RenderMode::Rerender,
+            ace_track: "keyboard".to_owned(),
+            prompt: String::new(),
+            strength: 0.9,
+            receiver: None,
+            cancel: None,
+            running: None,
+            stage: String::new(),
+            detail: String::new(),
+            fraction: None,
+            notes: Vec::new(),
+            error: None,
+        }
+    }
+}
+
+impl RenderState {
+    fn is_running(&self) -> bool {
+        self.receiver.is_some()
+    }
+}
+
 /// State of the Import Song window.
 #[allow(clippy::struct_excessive_bools)]
 struct SongImportState {
@@ -276,7 +339,20 @@ struct SongImportState {
     /// Songs the pipeline has already processed; `None` until first loaded.
     catalog: Option<Vec<ProjectSummary>>,
     catalog_error: Option<String>,
-    catalog_receiver: Option<Receiver<Result<Vec<ProjectSummary>, String>>>,
+    catalog_receiver: Option<Receiver<Result<Catalog, String>>>,
+    /// What the worker said about its ACE-Step install when the catalog
+    /// loaded; `None` means songs cannot be written, only fetched.
+    acestep: Option<AceStepHealth>,
+    /// The song to write with ACE-Step, for when there is no record to fetch.
+    generate_prompt: String,
+    generate_lyrics: String,
+    generate_seconds: f32,
+    /// 0 lets the model choose.
+    generate_bpm: u16,
+    /// Empty lets the model choose; otherwise ACE-Step's spelling ("A Minor").
+    generate_key: String,
+    generate_language: String,
+    generate_title: String,
     job_receiver: Option<Receiver<ImportMessage>>,
     cancel: Option<CancelFlag>,
     stage: String,
@@ -301,6 +377,14 @@ impl Default for SongImportState {
             catalog: None,
             catalog_error: None,
             catalog_receiver: None,
+            acestep: None,
+            generate_prompt: String::new(),
+            generate_lyrics: String::new(),
+            generate_seconds: 120.0,
+            generate_bpm: 0,
+            generate_key: String::new(),
+            generate_language: "en".to_owned(),
+            generate_title: String::new(),
             job_receiver: None,
             cancel: None,
             stage: String::new(),
@@ -312,7 +396,34 @@ impl Default for SongImportState {
     }
 }
 
+/// What the import window learns from the worker in one round trip.
+struct Catalog {
+    projects: Vec<ProjectSummary>,
+    acestep: Option<AceStepHealth>,
+}
+
 impl SongImportState {
+    /// The song the generation form describes, or why it cannot be sent.
+    fn generate_request(&self) -> Result<GenerateRequest, &'static str> {
+        let prompt = self.generate_prompt.trim();
+        if prompt.is_empty() {
+            return Err("describe the song first");
+        }
+        let key = self.generate_key.trim();
+        let title = self.generate_title.trim();
+        let language = self.generate_language.trim();
+        Ok(GenerateRequest {
+            prompt: prompt.to_owned(),
+            lyrics: self.generate_lyrics.trim().to_owned(),
+            duration: f64::from(self.generate_seconds.clamp(10.0, 600.0)),
+            bpm: (self.generate_bpm > 0).then_some(self.generate_bpm),
+            key: (!key.is_empty()).then(|| key.to_owned()),
+            time_signature: None,
+            language: (!language.is_empty()).then(|| language.to_owned()),
+            title: (!title.is_empty()).then(|| title.to_owned()),
+        })
+    }
+
     /// The hint the user picked, as the analysis crate wants it.
     fn selected_tempo_hint(&self) -> daw_analysis::TempoHint {
         let (_, centre) = daw_analysis::TempoHint::PRESETS
@@ -474,6 +585,8 @@ pub struct RustDawApp {
     undo_stack: Vec<EditCommand>,
     redo_stack: Vec<EditCommand>,
     song_import: SongImportState,
+    /// The AI TRACK window and the render it may be running.
+    render: RenderState,
     tempo_map: TempoMap,
     piano_roll: PianoRollState,
     tuner: crate::tuner::TunerState,
@@ -598,6 +711,7 @@ impl RustDawApp {
             presets,
             preset_panel: PresetPanel::default(),
             song_import: SongImportState::default(),
+            render: RenderState::default(),
             tempo_map: document_tempo_map,
             piano_roll: PianoRollState::default(),
             tuner: crate::tuner::TunerState::default(),
@@ -1495,8 +1609,14 @@ impl RustDawApp {
         let spawned = std::thread::Builder::new()
             .name("song-catalog".to_owned())
             .spawn(move || {
-                let result =
-                    daw_songimport::list_ready_projects().map_err(|error| format!("{error:#}"));
+                let result = daw_songimport::list_ready_projects()
+                    .map(|projects| Catalog {
+                        projects,
+                        // The worker is up by now, so this is one more request;
+                        // and not knowing is the same as not having it.
+                        acestep: daw_songimport::acestep_status().ok().flatten(),
+                    })
+                    .map_err(|error| format!("{error:#}"));
                 let _ = sender.send(result);
                 repaint.request_repaint();
             });
@@ -1639,7 +1759,10 @@ impl RustDawApp {
     fn poll_song_import(&mut self, context: &egui::Context) {
         if let Some(receiver) = self.song_import.catalog_receiver.take() {
             match receiver.try_recv() {
-                Ok(Ok(projects)) => self.song_import.catalog = Some(projects),
+                Ok(Ok(catalog)) => {
+                    self.song_import.catalog = Some(catalog.projects);
+                    self.song_import.acestep = catalog.acestep;
+                }
                 Ok(Err(error)) => self.song_import.catalog_error = Some(error),
                 Err(TryRecvError::Empty) => self.song_import.catalog_receiver = Some(receiver),
                 Err(TryRecvError::Disconnected) => {
@@ -1867,6 +1990,9 @@ impl RustDawApp {
                 );
 
                 ui.add_space(6.0);
+                self.generate_song_section(ui, &mut requested);
+
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.checkbox(
                         &mut self.song_import.align_to_bar,
@@ -2053,6 +2179,680 @@ impl RustDawApp {
         if let Some(source) = requested {
             self.start_song_import(context, source);
         }
+    }
+
+    /// The part of the import window that writes a song instead of fetching
+    /// one. What it makes goes through the same pipeline as a link, so the
+    /// options below the form apply to it as well.
+    fn generate_song_section(&mut self, ui: &mut egui::Ui, requested: &mut Option<ImportSource>) {
+        let Some(acestep) = self.song_import.acestep.clone() else {
+            if self.song_import.catalog.is_some() {
+                ui.label(
+                    RichText::new(
+                        "Writing a song needs ACE-Step: install it once with \
+                         crates/daw-songimport/worker/install.sh --with-ace-step.",
+                    )
+                    .small()
+                    .color(theme::MUTED),
+                );
+            }
+            return;
+        };
+        egui::CollapsingHeader::new(RichText::new("WRITE A SONG").strong())
+            .id_salt("generate-song")
+            .default_open(!self.song_import.generate_prompt.is_empty())
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "ACE-Step writes a song from a description and, if you give it any, \
+                         lyrics. It is then separated, transcribed and beat-tracked exactly as \
+                         a download is, and arrives as stems.",
+                    )
+                    .small()
+                    .color(theme::MUTED),
+                );
+                ui.add_space(4.0);
+                ui.label("Description");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.song_import.generate_prompt)
+                        .hint_text(
+                            "bossa nova, nylon-string guitar, brushed drums, warm female vocal, \
+                             late-night, 1960s Rio",
+                        )
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.label("Lyrics");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.song_import.generate_lyrics)
+                        .hint_text(
+                            "Leave empty for an instrumental. [Verse] and [Chorus] tags help the \
+                             model shape the song.",
+                        )
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Length");
+                    ui.add(
+                        egui::Slider::new(&mut self.song_import.generate_seconds, 10.0..=600.0)
+                            .suffix(" s")
+                            .integer(),
+                    );
+                    ui.label("Tempo");
+                    ui.add(
+                        egui::DragValue::new(&mut self.song_import.generate_bpm)
+                            .range(0..=300)
+                            .custom_formatter(|value, _| {
+                                if value < 1.0 {
+                                    "model's choice".to_owned()
+                                } else {
+                                    format!("{value:.0} BPM")
+                                }
+                            }),
+                    )
+                    .on_hover_text("0 lets the model pick a tempo; it is reported after import.");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Key");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.song_import.generate_key)
+                            .hint_text("model's choice — or e.g. A Minor")
+                            .desired_width(180.0),
+                    );
+                    ui.label("Lyrics in");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.song_import.generate_language)
+                            .hint_text("en")
+                            .desired_width(40.0),
+                    )
+                    .on_hover_text("Language code of the lyrics: en, pt, es, ja…");
+                    ui.label("Title");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.song_import.generate_title)
+                            .hint_text("named after the description")
+                            .desired_width(160.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    let request = self.song_import.generate_request();
+                    if ui
+                        .add_enabled(request.is_ok(), egui::Button::new("WRITE & IMPORT"))
+                        .on_hover_text(
+                            "Generation is a few seconds on a GPU; separation and transcription \
+                             follow as for any song.",
+                        )
+                        .clicked()
+                        && let Ok(request) = request
+                    {
+                        *requested = Some(ImportSource::Generate(request));
+                    }
+                    let models = if acestep.models.is_empty() {
+                        "models download on first use (~6 GB)".to_owned()
+                    } else {
+                        format!(
+                            "{}{}",
+                            acestep.song_model.as_deref().unwrap_or("ACE-Step"),
+                            if acestep.running {
+                                ""
+                            } else {
+                                " — loads on first use"
+                            }
+                        )
+                    };
+                    ui.label(RichText::new(models).small().color(theme::MUTED));
+                });
+            });
+    }
+
+    /// The window that hands one track to ACE-Step.
+    fn render_window(&mut self, context: &egui::Context) {
+        if !self.render.open {
+            return;
+        }
+        let Some(track_id) = self.render.track else {
+            self.render.open = false;
+            return;
+        };
+        let Some(track) = self.tracks.iter().find(|track| track.id == track_id) else {
+            // The track went while the window was open.
+            self.render.open = false;
+            self.render.track = None;
+            return;
+        };
+        let track_name = track.name.clone();
+        let mut open = self.render.open;
+        let mut go = false;
+        let mut cancel_requested = false;
+        let tracks = self
+            .song_import
+            .acestep
+            .as_ref()
+            .map(|health| health.tracks.clone())
+            .filter(|tracks| !tracks.is_empty())
+            .unwrap_or_else(|| {
+                [
+                    "vocals",
+                    "backing_vocals",
+                    "drums",
+                    "percussion",
+                    "bass",
+                    "guitar",
+                    "keyboard",
+                    "synth",
+                    "strings",
+                    "brass",
+                    "woodwinds",
+                    "fx",
+                ]
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect()
+            });
+
+        egui::Window::new("AI TRACK")
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .default_width(520.0)
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&track_name).strong().color(theme::BLUE));
+                    ui.label(
+                        RichText::new("with ACE-Step, on this machine")
+                            .small()
+                            .color(theme::MUTED),
+                    );
+                });
+                ui.separator();
+
+                if self.render.is_running() {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label(
+                            RichText::new(self.render.stage.to_uppercase())
+                                .strong()
+                                .color(theme::BLUE),
+                        );
+                    });
+                    if !self.render.detail.is_empty() {
+                        ui.label(RichText::new(&self.render.detail).small());
+                    }
+                    match self.render.fraction {
+                        Some(fraction) => {
+                            ui.add(egui::ProgressBar::new(fraction).show_percentage());
+                        }
+                        None => {
+                            ui.label(RichText::new("Working…").small().color(theme::MUTED));
+                        }
+                    }
+                    ui.add_space(4.0);
+                    if ui.button("CANCEL").clicked() {
+                        cancel_requested = true;
+                    }
+                    ui.label(
+                        RichText::new(
+                            "The first render after a cold start loads the models, and the very \
+                             first one downloads them. Cancelling stops RustDAW waiting; the \
+                             result is discarded.",
+                        )
+                        .small()
+                        .color(theme::MUTED),
+                    );
+                    return;
+                }
+
+                for mode in RenderMode::ALL {
+                    ui.radio_value(&mut self.render.mode, mode, mode.label());
+                }
+                ui.label(
+                    RichText::new(self.render.mode.description())
+                        .small()
+                        .color(theme::MUTED),
+                );
+                ui.add_space(6.0);
+
+                if self.render.mode.takes_mix() {
+                    ui.horizontal(|ui| {
+                        ui.label("Instrument");
+                        egui::ComboBox::from_id_salt("ace-track")
+                            .selected_text(&self.render.ace_track)
+                            .width(160.0)
+                            .show_ui(ui, |ui| {
+                                for name in &tracks {
+                                    ui.selectable_value(
+                                        &mut self.render.ace_track,
+                                        name.clone(),
+                                        name,
+                                    );
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Which instrument ACE-Step is asked for, in its own vocabulary. \
+                                 Piano and organ are \"keyboard\".",
+                            );
+                    });
+                }
+                ui.label(if self.render.mode == RenderMode::Rerender {
+                    "The sound to play it in"
+                } else {
+                    "About the song (optional)"
+                });
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.render.prompt)
+                        .hint_text(match self.render.mode {
+                            RenderMode::Rerender => "clean electric guitar, slight crunch, dry",
+                            RenderMode::Extract => "bossa nova, nylon guitar, brushed drums",
+                            RenderMode::Add => "a sparse Rhodes part under the verses",
+                        })
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                );
+                if self.render.mode == RenderMode::Rerender {
+                    ui.horizontal(|ui| {
+                        ui.label("Keep the part");
+                        ui.add(
+                            egui::Slider::new(&mut self.render.strength, 0.2..=1.0)
+                                .show_value(false),
+                        )
+                        .on_hover_text(
+                            "How closely the render follows the track it is given. High keeps \
+                             the notes and timing and changes the sound; low is a loose cover.",
+                        );
+                        ui.label(
+                            RichText::new(if self.render.strength >= 0.85 {
+                                "faithful"
+                            } else if self.render.strength >= 0.55 {
+                                "loose"
+                            } else {
+                                "reinterpreted"
+                            })
+                            .small()
+                            .color(theme::MUTED),
+                        );
+                    });
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(match self.render.mode {
+                        RenderMode::Rerender | RenderMode::Extract => {
+                            "What comes back is a performance that resembles the record, not \
+                             the record: clean, in time, and now and then with a note the \
+                             model preferred. The original stays on disk and the swap is one \
+                             undo away."
+                        }
+                        RenderMode::Add => {
+                            "The new part lands on its own track, aligned with the song, and \
+                             can be deleted like any other."
+                        }
+                    })
+                    .small()
+                    .color(theme::MUTED),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.render.mode.takes_mix() || !self.render.prompt.trim().is_empty(),
+                            egui::Button::new(match self.render.mode {
+                                RenderMode::Rerender => "RE-RENDER",
+                                RenderMode::Extract => "EXTRACT",
+                                RenderMode::Add => "WRITE THE PART",
+                            }),
+                        )
+                        .clicked()
+                    {
+                        go = true;
+                    }
+                    if let Some(health) = &self.song_import.acestep {
+                        let model = if self.render.mode.takes_mix() {
+                            health.stem_model.as_deref()
+                        } else {
+                            health.song_model.as_deref()
+                        };
+                        ui.label(
+                            RichText::new(model.unwrap_or("ACE-Step"))
+                                .small()
+                                .color(theme::MUTED),
+                        );
+                    }
+                });
+                if let Some(error) = &self.render.error {
+                    ui.separator();
+                    ui.label(RichText::new(error).color(theme::RED));
+                }
+                if !self.render.notes.is_empty() {
+                    ui.separator();
+                    ui.label(RichText::new("LAST RENDER").strong().color(theme::GREEN));
+                    for note in &self.render.notes {
+                        ui.label(RichText::new(note).small());
+                    }
+                }
+            });
+
+        self.render.open = open;
+        if cancel_requested {
+            if let Some(cancel) = &self.render.cancel {
+                cancel.cancel();
+            }
+            self.status_message = "Cancelling the render…".to_owned();
+        }
+        if go {
+            self.start_render(context, track_id);
+        }
+    }
+
+    /// Hands the track to ACE-Step on a worker thread.
+    fn start_render(&mut self, context: &egui::Context, track_id: Uuid) {
+        if self.render.is_running() {
+            return;
+        }
+        let Some(session_dir) = self.session_path.parent().map(std::path::Path::to_path_buf) else {
+            self.render.error =
+                Some("This session has no folder to write the render into".to_owned());
+            return;
+        };
+        let Some(track) = self.tracks.iter().find(|track| track.id == track_id) else {
+            self.render.error = Some("The track is gone".to_owned());
+            return;
+        };
+        let mode = self.render.mode;
+        // What the model is given: the track's own file, or the dry sum of
+        // every audio track — the song as it plays, before the mixer.
+        let (input, subject) = if mode.takes_mix() {
+            let clips: Vec<MixClip> = self
+                .tracks
+                .iter()
+                .filter(|track| !track.kind.is_instrument())
+                .flat_map(|track| track.clips.iter())
+                .map(|clip| MixClip {
+                    path: clip
+                        .source_path
+                        .clone()
+                        .unwrap_or_else(|| clip.path.clone()),
+                    start_frame: clip.start_frame,
+                    source_start_frame: clip.source_start_frame,
+                    frames: clip.length(),
+                })
+                .collect();
+            if clips.is_empty() {
+                self.render.error =
+                    Some("There is no audio in the session to work from".to_owned());
+                return;
+            }
+            (RenderInput::Mix(clips), PathBuf::new())
+        } else {
+            let Some(clip) = track.clips.first() else {
+                self.render.error = Some("The track has no audio to re-render".to_owned());
+                return;
+            };
+            let file = clip
+                .source_path
+                .clone()
+                .unwrap_or_else(|| clip.path.clone());
+            (RenderInput::File(file.clone()), file)
+        };
+        let task = RenderTask {
+            session_dir,
+            track_name: track.name.clone(),
+            request: RenderRequest {
+                mode,
+                track: self.render.ace_track.clone(),
+                prompt: self.render.prompt.trim().to_owned(),
+                strength: self.render.strength,
+            },
+            input,
+            target_rate: self
+                .runtime
+                .as_ref()
+                .map_or(48_000, |runtime| runtime.sample_rate().get()),
+            transpose_semitones: self.session_transpose,
+            // A render that replaces the track sits at the track's level; a
+            // new part has nothing to match and sits under the mix.
+            level_reference: (!matches!(mode, RenderMode::Add))
+                .then(|| track.clips.first())
+                .flatten()
+                .map(|clip| {
+                    clip.source_path
+                        .clone()
+                        .unwrap_or_else(|| clip.path.clone())
+                }),
+        };
+        let cancel = CancelFlag::new();
+        let thread_cancel = cancel.clone();
+        let (sender, receiver) = channel();
+        let repaint = context.clone();
+        let spawned = std::thread::Builder::new()
+            .name("ai-render".to_owned())
+            .spawn(move || {
+                let progress_sender = sender.clone();
+                let progress_repaint = repaint.clone();
+                let outcome = daw_songimport::render_track(&task, &thread_cancel, |progress| {
+                    let _ = progress_sender.send(RenderMessage::Progress(progress));
+                    progress_repaint.request_repaint();
+                });
+                let message = match outcome {
+                    Ok(rendered) => RenderMessage::Finished(Box::new(rendered)),
+                    Err(error) => RenderMessage::Failed(format!("{error:#}")),
+                };
+                let _ = sender.send(message);
+                repaint.request_repaint();
+            });
+        match spawned {
+            Ok(_) => {
+                self.render.receiver = Some(receiver);
+                self.render.cancel = Some(cancel);
+                self.render.running =
+                    Some((track_id, mode, self.render.ace_track.clone(), subject));
+                self.render.stage = "starting".to_owned();
+                self.render.detail.clear();
+                self.render.fraction = None;
+                self.render.notes.clear();
+                self.render.error = None;
+            }
+            Err(error) => self.render.error = Some(error.to_string()),
+        }
+    }
+
+    /// Takes the render from its thread once it is ready and puts it on the
+    /// track as an undoable edit.
+    fn poll_render(&mut self, context: &egui::Context) {
+        let Some(receiver) = self.render.receiver.take() else {
+            return;
+        };
+        let mut running = true;
+        let mut outcome = None;
+        loop {
+            match receiver.try_recv() {
+                Ok(RenderMessage::Progress(progress)) => match progress {
+                    ImportProgress::Status(message) => {
+                        self.render.stage = "render".to_owned();
+                        self.render.detail = message;
+                        self.render.fraction = None;
+                    }
+                    ImportProgress::Pipeline {
+                        stage,
+                        percent,
+                        message,
+                    } => {
+                        self.render.stage = stage;
+                        self.render.detail = message;
+                        self.render.fraction = Some((percent / 100.0).clamp(0.0, 1.0));
+                    }
+                    ImportProgress::Converting { fraction, stem } => {
+                        self.render.stage = "converting".to_owned();
+                        self.render.detail = stem;
+                        self.render.fraction = Some(fraction.clamp(0.0, 1.0));
+                    }
+                },
+                Ok(RenderMessage::Finished(rendered)) => {
+                    outcome = Some(Ok(rendered));
+                    running = false;
+                    break;
+                }
+                Ok(RenderMessage::Failed(error)) => {
+                    outcome = Some(Err(error));
+                    running = false;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    outcome = Some(Err("the render thread stopped unexpectedly".to_owned()));
+                    running = false;
+                    break;
+                }
+            }
+        }
+        if running {
+            self.render.receiver = Some(receiver);
+            context.request_repaint_after(Duration::from_millis(200));
+            return;
+        }
+        self.render.cancel = None;
+        self.render.stage.clear();
+        self.render.detail.clear();
+        self.render.fraction = None;
+        let job = self.render.running.take();
+        match (outcome, job) {
+            (Some(Ok(rendered)), Some((track_id, mode, ace_track, subject))) => {
+                self.apply_render(track_id, mode, &ace_track, &subject, *rendered);
+            }
+            (Some(Err(error)), _) => {
+                self.render.error = Some(error.clone());
+                self.status_message = format!("Render failed: {error}");
+            }
+            _ => {}
+        }
+    }
+
+    /// Puts a finished render on the session.
+    ///
+    /// A re-render or an extraction replaces the track's clips through
+    /// [`EditCommand::ReplaceClips`], so it is one undo away and the original
+    /// file is never touched. A new part gets a track of its own.
+    fn apply_render(
+        &mut self,
+        track_id: Uuid,
+        mode: RenderMode,
+        ace_track: &str,
+        subject: &std::path::Path,
+        rendered: RenderOutcome,
+    ) {
+        let (waveform, source_frames) = analyze_waveform(&rendered.path);
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        let label: &'static str;
+
+        match mode {
+            RenderMode::Rerender => {
+                label = "AI re-render";
+                let Some(track) = self.tracks.iter().find(|track| track.id == track_id) else {
+                    self.render.error =
+                        Some("The track is gone; the render was left in Audio/AI".to_owned());
+                    return;
+                };
+                // Every clip that read the file that went in now reads the
+                // render, with its window unchanged: the render is exactly
+                // the file's length.
+                for clip in &track.clips {
+                    let file = clip.source_path.as_deref().unwrap_or(&clip.path);
+                    if file != subject {
+                        continue;
+                    }
+                    removed.push(ClipSnapshot {
+                        track_id,
+                        clip: clip.clone(),
+                    });
+                    added.push(ClipSnapshot {
+                        track_id,
+                        clip: Clip {
+                            id: Uuid::new_v4(),
+                            path: rendered.path.clone(),
+                            source_path: rendered.source_path.clone(),
+                            source_frames,
+                            waveform: waveform.clone(),
+                            ..clip.clone()
+                        },
+                    });
+                }
+            }
+            RenderMode::Extract => {
+                label = "AI extraction";
+                let Some(track) = self.tracks.iter().find(|track| track.id == track_id) else {
+                    self.render.error =
+                        Some("The track is gone; the render was left in Audio/AI".to_owned());
+                    return;
+                };
+                for clip in &track.clips {
+                    removed.push(ClipSnapshot {
+                        track_id,
+                        clip: clip.clone(),
+                    });
+                }
+                added.push(ClipSnapshot {
+                    track_id,
+                    clip: Clip {
+                        id: Uuid::new_v4(),
+                        name: track.name.clone(),
+                        path: rendered.path.clone(),
+                        start_frame: rendered.start_frame,
+                        end_frame: rendered.start_frame.saturating_add(rendered.frames),
+                        source_start_frame: 0,
+                        source_frames,
+                        source_path: rendered.source_path.clone(),
+                        color: theme::BLUE_DARK,
+                        waveform,
+                    },
+                });
+            }
+            RenderMode::Add => {
+                label = "AI part";
+                let mut track = Track::new(self.tracks.len(), ChannelLayout::Stereo);
+                track.name = format!("AI {}", title_case_words(ace_track));
+                let new_id = track.id;
+                self.tracks.push(track);
+                added.push(ClipSnapshot {
+                    track_id: new_id,
+                    clip: Clip {
+                        id: Uuid::new_v4(),
+                        name: format!("AI {}", title_case_words(ace_track)),
+                        path: rendered.path.clone(),
+                        start_frame: rendered.start_frame,
+                        end_frame: rendered.start_frame.saturating_add(rendered.frames),
+                        source_start_frame: 0,
+                        source_frames,
+                        source_path: rendered.source_path.clone(),
+                        color: theme::BLUE_DARK,
+                        waveform,
+                    },
+                });
+                self.selected_track = self.tracks.len().saturating_sub(1);
+            }
+        }
+
+        if added.is_empty() {
+            self.render.error =
+                Some("Nothing on the track read the file that was rendered".to_owned());
+            return;
+        }
+        self.apply_replacement(&removed, &added);
+        self.remember_edit(EditCommand::ReplaceClips {
+            removed,
+            added,
+            label,
+        });
+        self.save_session();
+        self.render.notes = rendered.notes;
+        self.status_message = format!(
+            "{label} applied ({}) — undo to hear the original again",
+            rendered
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("render")
+        );
     }
 
     /// The tick under the playhead, for drawing the piano roll's cursor.
@@ -5286,6 +6086,31 @@ impl RustDawApp {
                         self.selected_track = index;
                         self.inserts_open = true;
                     }
+                    // An audio track with something on it can be handed to
+                    // ACE-Step. An instrument track is already a rendering of
+                    // its notes and has nothing for the model to listen to.
+                    if !track.kind.is_instrument()
+                        && !track.clips.is_empty()
+                        && ui
+                            .add(
+                                egui::Button::new(RichText::new("AI").color(theme::MUTED))
+                                    .fill(theme::PANEL_2),
+                            )
+                            .on_hover_text(
+                                "Re-render this track, extract it afresh from the song, or \
+                                 write a new part against it — with ACE-Step, on this machine.",
+                            )
+                            .clicked()
+                    {
+                        self.selected_track = index;
+                        self.render.open = true;
+                        self.render.error = None;
+                        if self.render.track != Some(track.id) && !self.render.is_running() {
+                            self.render.track = Some(track.id);
+                            self.render.ace_track = ace_track_for(&track.name).to_owned();
+                            self.render.prompt = default_render_prompt(&track.name);
+                        }
+                    }
                     if ui
                         .add(egui::Button::new(RichText::new("×").color(theme::RED)))
                         .on_hover_text("Delete track")
@@ -6291,9 +7116,11 @@ impl eframe::App for RustDawApp {
         );
         self.poll_song_import(context);
         self.poll_rekey();
+        self.poll_render(context);
         self.poll_amp_fetch();
         self.song_import_window(context);
         self.transpose_window(context);
+        self.render_window(context);
         self.piano_roll_window(context);
     }
 }
@@ -7395,6 +8222,36 @@ fn analyze_waveform(path: &std::path::Path) -> (Vec<f32>, u64) {
         .map(|bucket| bucket.iter().copied().fold(0.0_f32, f32::max))
         .collect();
     (peaks, frames as u64)
+}
+
+/// What to ask for when a track is first handed to ACE-Step: its own name,
+/// as a sound. "Guitar" → "guitar"; the person refines it from there.
+fn default_render_prompt(track_name: &str) -> String {
+    let name = track_name
+        .trim()
+        .trim_end_matches("(MIDI)")
+        .trim()
+        .to_ascii_lowercase();
+    if name.is_empty() {
+        "clean, dry".to_owned()
+    } else {
+        format!("clean {name}, dry")
+    }
+}
+
+/// `backing_vocals` → `Backing Vocals`, for naming a track after an
+/// ACE-Step instrument.
+fn title_case_words(name: &str) -> String {
+    name.split(['_', ' '])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut characters = word.chars();
+            characters.next().map_or(String::new(), |first| {
+                first.to_uppercase().collect::<String>() + characters.as_str()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn track_from_project(track: ProjectTrack) -> Track {

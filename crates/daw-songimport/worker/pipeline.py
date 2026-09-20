@@ -896,6 +896,90 @@ def run_file(
         return _process(audio, Path(scratch), metadata, None, progress)
 
 
+def run_generated(request: dict, on_progress: ProgressFn | None = None) -> str:
+    """Write a song with ACE-Step, then treat it exactly like a download.
+
+    The generated mix goes through the same separation, transcription and beat
+    analysis as a link does, so it arrives in RustDAW as stems, MIDI and a
+    tempo rather than as one stereo file. The description, lyrics and the
+    tempo and key the model settled on are kept in the manifest.
+    """
+    import acestep
+
+    progress = on_progress or _noop
+    prompt = (request.get("prompt") or "").strip()
+    if not prompt:
+        raise RuntimeError("a description of the song is needed")
+    duration = float(request.get("duration") or 120.0)
+    duration = max(10.0, min(600.0, duration))
+    title = (request.get("title") or "").strip() or prompt[:48]
+    with tempfile.TemporaryDirectory() as scratch:
+        scratch_dir = Path(scratch)
+        song, metas = acestep.generate_song(
+            prompt=prompt,
+            lyrics=(request.get("lyrics") or "").strip(),
+            duration=duration,
+            bpm=request.get("bpm") or None,
+            key_scale=(request.get("key") or "").strip() or None,
+            time_signature=request.get("timeSignature") or None,
+            language=(request.get("language") or "").strip() or None,
+            destination=scratch_dir / "generated.wav",
+            on_progress=progress,
+        )
+        metadata = {"title": title, "artist": "ACE-Step", "duration": None}
+        generation = {
+            "engine": "acestep",
+            "model": metas.get("model"),
+            "seed": metas.get("seed"),
+            "prompt": prompt,
+            "lyrics": (request.get("lyrics") or "").strip(),
+            "bpm": metas.get("bpm"),
+            "keyScale": metas.get("keyscale"),
+            "timeSignature": metas.get("timesignature"),
+        }
+        return _process(song, scratch_dir, metadata, None, progress, generation=generation)
+
+
+def run_render(audio: Path, request: dict, on_progress: ProgressFn | None = None) -> str:
+    """Re-render, extract or write one track with ACE-Step.
+
+    Unlike the imports above this makes no project: the result is a single WAV
+    under the worker's ``renders`` folder, and the returned string is its path.
+    RustDAW converts it to the session rate and drops it onto the track itself.
+    """
+    import acestep
+    from store import renders_dir
+
+    progress = on_progress or _noop
+    if not audio.is_file():
+        raise RuntimeError(f"no such file: {audio}")
+    mode = (request.get("mode") or "").strip()
+    task = {"rerender": "cover", "extract": "extract", "add": "lego"}.get(mode)
+    if task is None:
+        raise RuntimeError(f"unknown render mode {mode!r}; expected rerender, extract or add")
+    track = (request.get("track") or "").strip() or None
+    if task != "cover" and not track:
+        raise RuntimeError(f"the {mode} mode needs an instrument")
+    try:
+        strength = float(request.get("strength") or 1.0)
+    except (TypeError, ValueError):
+        strength = 1.0
+    with tempfile.TemporaryDirectory() as scratch:
+        # ACE-Step decodes whatever it is sent, but a plain WAV never trips it.
+        source = to_wav(audio, Path(scratch))
+        destination = renders_dir() / f"{audio.stem}-{mode}.wav"
+        rendered, _info = acestep.render_track(
+            source=source,
+            task=task,
+            track=track,
+            prompt=(request.get("prompt") or "").strip(),
+            strength=strength,
+            destination=destination,
+            on_progress=progress,
+        )
+    return str(rendered)
+
+
 def wav_duration(path: Path) -> float | None:
     """Length of a WAV in seconds, or ``None`` if it cannot be read.
 
@@ -919,8 +1003,14 @@ def _process(
     metadata: dict,
     source_url: str | None,
     progress: ProgressFn,
+    generation: dict | None = None,
 ) -> str:
-    """Separate, transcribe and analyse one downloaded or uploaded song."""
+    """Separate, transcribe and analyse one downloaded, uploaded or generated song.
+
+    ``generation`` is what ACE-Step was asked for and what it decided, when the
+    song came from it; it is written to the manifest so the session can say
+    where its music came from.
+    """
     # Decode to WAV once so the codec never trips up Demucs or librosa.
     source = to_wav(downloaded, scratch_dir)
 
@@ -953,8 +1043,10 @@ def _process(
         drumkit=None,
         midi=midi,
         beat_grid=beat_grid,
+        generation=generation,
         stages={
             "download": {"status": "done"},
+            **({"generate": {"status": "done"}} if generation else {}),
             "separate": {"status": "done"},
             "transcribe": {
                 "status": "done" if midi else "skipped",

@@ -16,8 +16,10 @@
 Multitrack recording through a Focusrite Scarlett Solo, non-destructive editing,
 a console mixer, a channel strip with EQ / compressor / gate / delay / reverb,
 Neural Amp Modeler guitar amps, a General MIDI synthesiser written from scratch,
-a piano roll, an instrument tuner, reference mastering, and native tempo, beat
-and chord detection that holds its own against commercial tools.
+a piano roll, an instrument tuner, reference mastering, native tempo, beat
+and chord detection that holds its own against commercial tools, and — through
+ACE-Step, running locally — songs written from a description and tracks
+re-rendered, extracted or added by the model.
 
 ![RustDAW — the timeline with a separated song loaded, and the channel strip open on a guitar track running a Neural Amp Modeler capture](docs/images/channel-strip.png)
 
@@ -776,6 +778,88 @@ cargo run -p daw-songimport --example import-song -- <id>      # import one
 cargo run -p daw-songimport --example import-song -- <url>     # separate, then import
 ```
 
+### Writing a song, and handing a track to ACE-Step
+
+The same worker fronts [ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5),
+an open music model (MIT code and weights) that runs on this machine, when it is
+installed alongside:
+
+```bash
+crates/daw-songimport/worker/install.sh --with-ace-step
+```
+
+That clones ACE-Step under the worker's data directory and makes it its own
+environment with `uv` — it pins a newer torch than Demucs and brings vLLM, so
+the two never share an interpreter. Nothing else changes: the worker starts
+ACE-Step's API server on loopback the first time a job needs it, and its models
+(about 6 GB) download then, not at install time. That first job is a long one;
+the window shows ACE-Step's own log line while it waits. On an RTX 3060 the
+song model and the 1.7B language model fit together; between jobs the models are
+moved to system RAM so Demucs and the transcriber get the GPU back.
+
+Two things become possible.
+
+**Write a song.** IMPORT SONG grows a **WRITE A SONG** section: a description,
+optional lyrics (empty means an instrumental), a length, and a tempo and key if
+you have them — leave those at "model's choice" and they are reported after the
+import. What ACE-Step writes then goes through exactly the path a download does:
+separated into stems, transcribed, beat-tracked, aligned to bar 1, so it arrives
+as a session to play along with rather than one stereo file. The description,
+the seed and the tempo and key the model settled on are kept in the project
+manifest and shown in the import notes.
+
+**Hand a track to ACE-Step.** Every audio track with something on it has an
+**AI** button next to FX. It opens a window with three things the model can do:
+
+- *Re-render this track* plays the track's own audio back through ACE-Step in
+  the sound you describe. The part stays — "keep the part" says how closely —
+  and the sound, and the separation artefacts, are replaced.
+- *Extract from the song* asks for the named instrument from the whole mix,
+  written afresh rather than filtered out. This is the one to reach for when a
+  stem came apart badly.
+- *Add a new part* writes a part for the named instrument that fits the song,
+  on a new track.
+
+Be clear about what comes back: a performance that resembles the record, not
+the record. It is clean and in time, and now and then it has a note the model
+preferred. That is a different bargain from Demucs, whose stems are the
+recording with the other instruments filtered out, bleed and all — so the
+original file is never touched, the render lands under `Audio/AI/`, and the
+swap is one **undo** away. A render is made from the unshifted originals and
+moved into whatever key the session is being heard in, so SONG KEY keeps
+working afterwards; it is converted to exactly the length of what went in, so
+nothing after it on the track moves; and because ACE-Step normalises what it
+writes to just under full scale, the render is brought to the mean level of the
+track it replaces (a new part sits 6 dB under the song), held under −1 dBFS.
+On an RTX 3060 a re-render of a minute takes about 15 s, an extraction about
+45 s plus the model swap.
+
+The instrument names are ACE-Step's own — vocals, backing_vocals, drums,
+percussion, bass, guitar, keyboard, synth, strings, brass, woodwinds, fx — and
+the button pre-selects one from the track's name (a piano is a "keyboard").
+Extraction and new parts need ACE-Step's `base` model, which the worker loads on
+demand the first time one is asked for; songs and re-renders use `turbo`. If a
+result ever comes back from the wrong model it is refused rather than imported,
+because a stem task answered by the song model is a whole new song.
+
+The same three renders, and generation, from the command line:
+
+```bash
+cargo run -p daw-songimport --example ai-track -- generate "slow bossa nova, nylon guitar" 90
+cargo run -p daw-songimport --example ai-track -- rerender Songs/x/Audio/guitar.wav "clean electric guitar" 0.9
+cargo run -p daw-songimport --example ai-track -- extract mix.wav guitar
+cargo run -p daw-songimport --example ai-track -- add mix.wav keyboard "a sparse Rhodes part"
+```
+
+`ACESTEP_HOME` relocates the checkout, `CHORDS_STUDIO_ACESTEP_PORT` moves its
+server off 8766, `ACESTEP_MODEL` picks another song model (`acestep-v15-sft`
+for quality over speed), and the server's log is `logs/acestep.log` under the
+worker's data directory. ACE-Step's language model prefers a vLLM backend that
+compiles a small CUDA helper on first use and needs the Python headers for it
+(`sudo apt install python3.12-dev`, matching the interpreter `uv` chose);
+without them it falls back to plain PyTorch by itself, which works and is only
+a little slower on the planning step.
+
 ## Building the package yourself
 
 To install a prebuilt release instead, see [Install on Ubuntu](#install-on-ubuntu).
@@ -815,7 +899,7 @@ and the plug-in format.
 | [`crates/daw-audio-linux`](crates/daw-audio-linux) | 4,069 | The real-time runtime — PipeWire/Pulse via cpal, lock-free command and metering channels, disk writers, time stretching |
 | [`crates/daw-analysis`](crates/daw-analysis) | 3,367 | In-house FFT, spectral-flux onsets, beat tracking, chromagram, Viterbi chord decoding, YIN pitch detection |
 | [`crates/daw-master`](crates/daw-master) | 2,135 | Reference mastering: level matching, the log-grid matching EQ, LOWESS, cubic splines, the brickwall limiter |
-| [`crates/daw-songimport`](crates/daw-songimport) | 1,918 | Worker supervision, manifest parsing, stem/MIDI ingest (+655 lines of Python worker) |
+| [`crates/daw-songimport`](crates/daw-songimport) | 3,680 | Worker supervision, manifest parsing, stem/MIDI ingest, re-keying, ACE-Step generation and per-track renders (+2,133 lines of Python worker) |
 | [`crates/daw-midi`](crates/daw-midi) | 1,377 | Standard MIDI file reading, clips in ticks, tempo maps |
 | [`crates/daw-tone3000`](crates/daw-tone3000) | 1,002 | OAuth PKCE, the loopback redirect server, capture download |
 | [`crates/daw-project`](crates/daw-project) | 919 | The versioned session document, its migrations, clip editing, and the chord chart |

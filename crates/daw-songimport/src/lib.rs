@@ -9,11 +9,17 @@
 //! GPU, driven by the DSPRO Studio worker that is already installed on this
 //! machine. `RustDAW` drives that worker over loopback HTTP and takes ownership
 //! of the audio afterwards. Nothing is uploaded anywhere.
+//!
+//! The same worker fronts ACE-Step when it is installed: a song can be written
+//! from a description instead of downloaded ([`ImportSource::Generate`]), and
+//! one track of a loaded session can be re-rendered, extracted afresh from the
+//! mix, or joined by a new part ([`render::render_track`]).
 
 pub mod client;
 pub mod ingest;
 pub mod manifest;
 pub mod rekey;
+pub mod render;
 pub mod supervisor;
 
 use anyhow::{Context, Result, bail};
@@ -22,10 +28,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-pub use client::{Job, ProjectSummary, WorkerClient};
+pub use client::{
+    AceStepHealth, GenerateRequest, Job, ProjectSummary, RenderMode, RenderRequest, WorkerClient,
+};
 pub use ingest::{IngestOptions, Ingested, MAX_TRANSPOSE_SEMITONES};
 pub use manifest::SongManifest;
 pub use rekey::{Rekeyed, forget_other_keys, other_keys_size, rekey_session};
+pub use render::{MixClip, RenderInput, RenderOutcome, RenderTask, ace_track_for, render_track};
 
 /// How long to wait for a worker we started to come up. Importing torch and
 /// opening CUDA on a cold start is slow; this is deliberately patient.
@@ -42,6 +51,9 @@ pub enum ImportSource {
     LocalFile(PathBuf),
     /// Reuse a project the pipeline has already finished.
     ExistingProject(String),
+    /// Have ACE-Step write the song, then run the full pipeline on it — so it
+    /// arrives as stems, MIDI and a tempo like any other song.
+    Generate(GenerateRequest),
 }
 
 /// Progress updates for the UI. Deliberately coarse: the caller polls these
@@ -123,6 +135,14 @@ pub fn run_import(
             let job = client.submit_file(path)?;
             run_pipeline(&client, &job.id, cancel, &mut on_progress)?
         }
+        ImportSource::Generate(request) => {
+            ensure_acestep(&client)?;
+            on_progress(ImportProgress::Status(
+                "Asking ACE-Step for the song…".to_owned(),
+            ));
+            let job = client.submit_generate(request)?;
+            run_pipeline(&client, &job.id, cancel, &mut on_progress)?
+        }
     };
 
     let project_dir = supervisor::project_dir(&project_id)?;
@@ -188,12 +208,33 @@ fn run_pipeline(
     cancel: &CancelFlag,
     on_progress: &mut impl FnMut(ImportProgress),
 ) -> Result<String> {
+    let job = wait_for_job(
+        client,
+        job_id,
+        cancel,
+        "import cancelled; the pipeline keeps running and the song will appear under existing \
+         projects when it finishes",
+        on_progress,
+    )?;
+    job.project_id
+        .context("the pipeline finished without producing a project")
+}
+
+/// Polls a worker job until it is done, failed, or `cancel` is raised.
+///
+/// `cancel_message` is what the error says on cancellation, because the two
+/// kinds of job leave different things behind: a pipeline run still lands in
+/// the project list, a render is simply thrown away.
+pub(crate) fn wait_for_job(
+    client: &WorkerClient,
+    job_id: &str,
+    cancel: &CancelFlag,
+    cancel_message: &str,
+    on_progress: &mut impl FnMut(ImportProgress),
+) -> Result<Job> {
     loop {
         if cancel.is_cancelled() {
-            bail!(
-                "import cancelled; the pipeline keeps running and the song will appear under \
-                 existing projects when it finishes"
-            );
+            bail!("{cancel_message}");
         }
         let job = client.job(job_id)?;
         on_progress(ImportProgress::Pipeline {
@@ -208,12 +249,34 @@ fn run_pipeline(
             );
         }
         if job.is_finished() {
-            return job
-                .project_id
-                .context("the pipeline finished without producing a project");
+            return Ok(job);
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// Refuses early, with the fix, when the worker has no ACE-Step to call.
+pub(crate) fn ensure_acestep(client: &WorkerClient) -> Result<()> {
+    let health = client.health()?;
+    if health.models.acestep.is_none() {
+        bail!(
+            "ACE-Step is not installed on the song-import worker. Install it once with \
+             `crates/daw-songimport/worker/install.sh --with-ace-step`; the first use then \
+             downloads its models (about 6 GB)."
+        );
+    }
+    Ok(())
+}
+
+/// Whether the worker can generate and render, without starting anything.
+///
+/// # Errors
+///
+/// Returns an error if the worker cannot be reached or started.
+pub fn acestep_status() -> Result<Option<AceStepHealth>> {
+    let client = WorkerClient::new();
+    ensure_worker(&client, &mut |_| {})?;
+    Ok(client.health()?.models.acestep)
 }
 
 /// Default location for imported songs: a `Songs` folder beside the

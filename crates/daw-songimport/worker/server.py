@@ -6,6 +6,9 @@ Implements the exact endpoints RustDAW's ``client.rs`` calls:
 * ``GET  /api/projects``      -> ``[ProjectSummary]``
 * ``POST /api/jobs``          -> start a job for ``{url}``, returns a ``Job``
 * ``POST /api/jobs/upload``   -> start a job for an uploaded file, returns a ``Job``
+* ``POST /api/jobs/generate`` -> write a song with ACE-Step and run the pipeline on it
+* ``POST /api/jobs/render``   -> re-render / extract / add one track with ACE-Step;
+                                 the finished ``Job`` carries ``resultPath``
 * ``GET  /api/jobs/<id>``     -> poll a ``Job``
 
 Jobs run on background threads; their state lives in memory. The server binds to
@@ -69,6 +72,16 @@ def _muscriptor() -> str | None:
     return muscriptor_model(_device())
 
 
+def _acestep() -> dict | None:
+    """The ACE-Step install, or None if there is none. Never starts it."""
+    try:
+        import acestep
+
+        return acestep.describe()
+    except Exception:  # noqa: BLE001 — health must never fail on a bad import
+        return None
+
+
 def _new_job() -> dict:
     return {
         "id": uuid.uuid4().hex[:12],
@@ -78,6 +91,7 @@ def _new_job() -> dict:
         "message": "",
         "error": None,
         "projectId": None,
+        "resultPath": None,
     }
 
 
@@ -121,25 +135,71 @@ def _run_upload_job(job_id: str, upload: tuple[Path, str]) -> None:
     _run(job_id, start)
 
 
-def _multipart_file(body: bytes, content_type: str) -> tuple[str, bytes] | None:
-    """The single ``file`` part of a multipart body, as ``(filename, bytes)``.
+def _run_generate_job(job_id: str, request: dict) -> None:
+    def start(on_progress):
+        import pipeline
 
-    RustDAW sends exactly one part, under a random boundary that cannot occur in
-    the payload, so this reads that shape rather than the whole of RFC 7578.
+        return pipeline.run_generated(request, on_progress)
+
+    _run(job_id, start)
+
+
+def _run_render_job(job_id: str, render: tuple[Path, dict]) -> None:
+    """A render ends in a file, not a project, so it lands in ``resultPath``."""
+    audio, request = render
+
+    def on_progress(stage: str, percent: float, message: str) -> None:
+        _update(job_id, status="running", stage=stage, percent=float(percent), message=message)
+
+    try:
+        import pipeline
+
+        path = pipeline.run_render(audio, request, on_progress)
+        _update(job_id, status="done", percent=100.0, resultPath=path, message="done")
+    except Exception as error:  # noqa: BLE001 — any failure becomes a reported job error
+        _update(job_id, status="error", error=str(error), message=str(error))
+    finally:
+        # The upload was copied in for this one job; nothing reads it again.
+        try:
+            audio.unlink()
+        except OSError:
+            pass
+
+
+def _multipart_parts(body: bytes, content_type: str) -> tuple[dict[str, str], tuple[str, bytes] | None]:
+    """A multipart body as its text fields and its one ``file`` part.
+
+    RustDAW sends a handful of plain fields and at most one file, under a random
+    boundary that cannot occur in the payload, so this reads that shape rather
+    than the whole of RFC 7578. The file comes back as ``(filename, bytes)``.
     """
     match = re.search(r'boundary=(?:"([^"]+)"|([^;\s]+))', content_type)
     if not match:
-        return None
+        return {}, None
     delimiter = b"--" + (match.group(1) or match.group(2)).encode()
+    fields: dict[str, str] = {}
+    file: tuple[str, bytes] | None = None
     for chunk in body.split(delimiter):
         head, blank, data = chunk.partition(b"\r\n\r\n")
-        if not blank or b'name="file"' not in head:
+        if not blank:
             continue
-        found = re.search(br'filename="([^"]*)"', head)
-        name = found.group(1).decode("utf-8", "replace") if found else "upload.bin"
-        # The CRLF closing the part belongs to the delimiter, not to the file.
-        return name, data[:-2] if data.endswith(b"\r\n") else data
-    return None
+        named = re.search(br'name="([^"]*)"', head)
+        if named is None:
+            continue
+        # The CRLF closing the part belongs to the delimiter, not to the payload.
+        payload = data[:-2] if data.endswith(b"\r\n") else data
+        if named.group(1) == b"file":
+            found = re.search(br'filename="([^"]*)"', head)
+            name = found.group(1).decode("utf-8", "replace") if found else "upload.bin"
+            file = (name, payload)
+        else:
+            fields[named.group(1).decode("utf-8", "replace")] = payload.decode("utf-8", "replace")
+    return fields, file
+
+
+def _multipart_file(body: bytes, content_type: str) -> tuple[str, bytes] | None:
+    """The single ``file`` part of a multipart body, as ``(filename, bytes)``."""
+    return _multipart_parts(body, content_type)[1]
 
 
 def _store_upload(name: str, data: bytes) -> Path:
@@ -179,6 +239,7 @@ class Handler(BaseHTTPRequestHandler):
                         "demucs": "htdemucs_6s" if _demucs_available() else None,
                         "drumsep": False,
                         "muscriptor": _muscriptor(),
+                        "acestep": _acestep(),
                     },
                 },
             )
@@ -221,6 +282,36 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {"error": "the uploaded file is empty"})
                 return
             self._start(_run_upload_job, (_store_upload(name, data), Path(name).stem))
+            return
+
+        if path == "/api/jobs/render":
+            fields, part = _multipart_parts(raw, self.headers.get("Content-Type", ""))
+            if part is None:
+                self._send(400, {"error": "expected a multipart 'file' part with the audio"})
+                return
+            name, data = part
+            if not data:
+                self._send(400, {"error": "the uploaded audio is empty"})
+                return
+            if _acestep() is None:
+                self._send(400, {"error": "ACE-Step is not installed; run install.sh --with-ace-step"})
+                return
+            self._start(_run_render_job, (_store_upload(name, data), fields))
+            return
+
+        if path == "/api/jobs/generate":
+            try:
+                body = json.loads(raw or b"{}")
+            except json.JSONDecodeError:
+                self._send(400, {"error": "invalid JSON body"})
+                return
+            if not (body.get("prompt") or "").strip():
+                self._send(400, {"error": "a description of the song is needed"})
+                return
+            if _acestep() is None:
+                self._send(400, {"error": "ACE-Step is not installed; run install.sh --with-ace-step"})
+                return
+            self._start(_run_generate_job, body)
             return
 
         if path != "/api/jobs":

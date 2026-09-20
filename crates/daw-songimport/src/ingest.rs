@@ -229,6 +229,25 @@ pub fn ingest_project(
     if !skipped.is_empty() {
         notes.push(format!("Skipped silent or missing: {}", skipped.join(", ")));
     }
+    if let Some(generation) = &manifest.generation {
+        let model = generation
+            .model
+            .as_deref()
+            .or(generation.engine.as_deref())
+            .unwrap_or("ACE-Step");
+        let prompt = generation.prompt.as_deref().unwrap_or("").trim();
+        let tempo = generation.bpm.map_or(String::new(), |bpm| {
+            format!(" — the model wrote it at {bpm:.0} BPM")
+        });
+        let key = generation
+            .key_scale
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .map_or(String::new(), |key| format!(" in {key}"));
+        notes.push(format!(
+            "Written by {model} from: \"{prompt}\"{tempo}{key}."
+        ));
+    }
 
     progress(1.0, "tempo");
     let detection = detect_tempo(&audio_dir, options, target_rate, &mut notes);
@@ -852,8 +871,76 @@ fn convert_audio(
     })
 }
 
+/// Converts `source` to a stereo 24-bit WAV at `target_rate` that is exactly
+/// `frames` long, padding with silence or trimming as needed.
+///
+/// A render that comes back from a model is the length of its input give or
+/// take a window, and a clip that stands in for another has to be exactly as
+/// long, or the clips after it on the same track would move. Resampling runs
+/// first so the count is in the session's frames, not the file's.
+pub(crate) fn convert_exact(
+    source: &Path,
+    destination: &Path,
+    target_rate: u32,
+    frames: u64,
+    gain_db: f64,
+) -> Result<u64> {
+    let filter = format!(
+        "volume={gain_db:.2}dB,aresample={target_rate},apad=whole_len={frames},atrim=end_sample={frames}"
+    );
+    let output = Command::new(ffmpeg_program())
+        .arg("-nostdin")
+        .arg("-y")
+        .args(["-v", "error"])
+        .arg("-i")
+        .arg(source)
+        .args(["-af", &filter])
+        .args(["-ar", &target_rate.to_string()])
+        .args(["-ac", "2"])
+        .args(["-c:a", "pcm_s24le"])
+        .arg(destination)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run ffmpeg; install it with `{}`",
+                ffmpeg_install_hint()
+            )
+        })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let reason = detail.lines().last().unwrap_or("ffmpeg failed");
+        let _ = std::fs::remove_file(destination);
+        bail!("ffmpeg could not convert {}: {reason}", source.display());
+    }
+    wav_frame_count(destination)
+}
+
+/// Peak and mean level of a file in dBFS, as ffmpeg's `volumedetect`
+/// measures them. Either is `None` when it cannot be read.
+pub(crate) fn measure_levels(path: &Path) -> Result<(Option<f64>, Option<f64>)> {
+    let output = Command::new(ffmpeg_program())
+        .arg("-nostdin")
+        .args(["-v", "info"])
+        .arg("-i")
+        .arg(path)
+        .args(["-af", "volumedetect"])
+        .args(["-f", "null", "-"])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run ffmpeg; install it with `{}`",
+                ffmpeg_install_hint()
+            )
+        })?;
+    let report = String::from_utf8_lossy(&output.stderr);
+    Ok((
+        parse_volume(&report, "max_volume:"),
+        parse_volume(&report, "mean_volume:"),
+    ))
+}
+
 /// Reads the frame count from a WAV header without decoding the audio.
-fn wav_frame_count(path: &Path) -> Result<u64> {
+pub(crate) fn wav_frame_count(path: &Path) -> Result<u64> {
     let reader = hound::WavReader::open(path)
         .with_context(|| format!("failed to open {}", path.display()))?;
     Ok(u64::from(reader.duration()))

@@ -240,7 +240,7 @@ pub fn forget_other_keys(session_dir: &Path, keep: i32) -> Result<u64> {
 }
 
 /// Where renders for one key are kept, e.g. `Audio/Keys/-4`.
-fn keys_dir(session_dir: &Path, semitones: i32) -> PathBuf {
+pub(crate) fn keys_dir(session_dir: &Path, semitones: i32) -> PathBuf {
     session_dir.join("Audio").join("Keys").join(format!(
         "{}{}",
         if semitones < 0 { "-" } else { "+" },

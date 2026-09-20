@@ -38,6 +38,27 @@ pub struct SongManifest {
     pub beat_grid: Option<BeatGrid>,
     #[serde(default)]
     pub stages: BTreeMap<String, StageRecord>,
+    /// Set when the song was written by ACE-Step rather than downloaded.
+    #[serde(default)]
+    pub generation: Option<Generation>,
+}
+
+/// What a generated song was asked for, and what the model settled on.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Generation {
+    #[serde(default)]
+    pub engine: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub lyrics: Option<String>,
+    #[serde(default)]
+    pub bpm: Option<f64>,
+    #[serde(default)]
+    pub key_scale: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
