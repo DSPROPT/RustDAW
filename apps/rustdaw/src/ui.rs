@@ -587,6 +587,8 @@ pub struct RustDawApp {
     song_import: SongImportState,
     /// The AI TRACK window and the render it may be running.
     render: RenderState,
+    /// The WAV → MP3 window and the run it may be doing.
+    mp3: Mp3State,
     tempo_map: TempoMap,
     piano_roll: PianoRollState,
     tuner: crate::tuner::TunerState,
@@ -712,6 +714,7 @@ impl RustDawApp {
             preset_panel: PresetPanel::default(),
             song_import: SongImportState::default(),
             render: RenderState::default(),
+            mp3: Mp3State::default(),
             tempo_map: document_tempo_map,
             piano_roll: PianoRollState::default(),
             tuner: crate::tuner::TunerState::default(),
@@ -2853,6 +2856,302 @@ impl RustDawApp {
                 .and_then(|name| name.to_str())
                 .unwrap_or("render")
         );
+    }
+
+    /// Picks the files to convert and opens the WAV → MP3 window on them.
+    fn choose_audio_for_mp3(&mut self) {
+        if self.mp3.is_running() {
+            self.mp3.open = true;
+            return;
+        }
+        let Some(paths) = rfd::FileDialog::new()
+            .set_title("Choose audio to convert to MP3")
+            .add_filter("WAV", &["wav", "wave"])
+            .add_filter(
+                "Audio",
+                &["wav", "wave", "flac", "aiff", "aif", "ogg", "m4a", "aac"],
+            )
+            .add_filter("Any file (*.*)", &["*"])
+            .pick_files()
+        else {
+            return;
+        };
+        let files: Vec<PathBuf> = paths.into_iter().filter(|path| path.is_file()).collect();
+        if files.is_empty() {
+            self.status_message = "Nothing to convert".to_owned();
+            return;
+        }
+        self.mp3.files = files;
+        self.mp3.results.clear();
+        self.mp3.open = true;
+    }
+
+    /// The window that turns the picked files into MP3s.
+    fn mp3_window(&mut self, context: &egui::Context) {
+        if !self.mp3.open {
+            return;
+        }
+        let mut open = self.mp3.open;
+        let mut go = false;
+        let mut choose_folder = false;
+        let mut pick_again = false;
+        let mut reveal = None;
+        egui::Window::new("WAV → MP3")
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .default_width(520.0)
+            .show(context, |ui| {
+                if self.mp3.is_running() {
+                    let total = self.mp3.files.len();
+                    let done = self.mp3.results.len();
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label(
+                            RichText::new(format!(
+                                "CONVERTING {} OF {total}",
+                                (done + 1).min(total)
+                            ))
+                            .strong()
+                            .color(theme::BLUE),
+                        );
+                    });
+                    ui.label(RichText::new(&self.mp3.current).small());
+                    #[allow(clippy::cast_precision_loss)]
+                    ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32));
+                    return;
+                }
+
+                if !self.mp3.results.is_empty() {
+                    // A finished run: say what happened, then offer another.
+                    let converted = self
+                        .mp3
+                        .results
+                        .iter()
+                        .filter(|result| result.outcome.is_ok())
+                        .count();
+                    let failed = self.mp3.results.len() - converted;
+                    ui.label(
+                        RichText::new(if failed == 0 {
+                            format!("Converted {converted} file(s).")
+                        } else {
+                            format!("Converted {converted} file(s); {failed} failed.")
+                        })
+                        .strong()
+                        .color(if failed == 0 {
+                            theme::GREEN
+                        } else {
+                            theme::RED
+                        }),
+                    );
+                    egui::ScrollArea::vertical()
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            for result in &self.mp3.results {
+                                let name = result
+                                    .source
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("audio");
+                                match &result.outcome {
+                                    Ok(path) => {
+                                        ui.label(
+                                            RichText::new(format!("{name} → {}", path.display()))
+                                                .small(),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        ui.label(
+                                            RichText::new(format!("{name}: {error}"))
+                                                .small()
+                                                .color(theme::RED),
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if let Some(directory) = self
+                            .mp3
+                            .results
+                            .iter()
+                            .find_map(|result| result.outcome.as_ref().ok())
+                            .and_then(|path| path.parent())
+                            && ui.button("Show in folder").clicked()
+                        {
+                            reveal = Some(directory.to_owned());
+                        }
+                        if ui.button("Convert more…").clicked() {
+                            pick_again = true;
+                        }
+                    });
+                    return;
+                }
+
+                ui.label(
+                    RichText::new(format!(
+                        "{} file(s) to convert. The originals are left as they are; an MP3 that \
+                         already exists is not overwritten — the new one gets a number.",
+                        self.mp3.files.len()
+                    ))
+                    .small()
+                    .color(theme::MUTED),
+                );
+                egui::ScrollArea::vertical()
+                    .max_height(140.0)
+                    .show(ui, |ui| {
+                        for path in &self.mp3.files {
+                            ui.label(RichText::new(path.display().to_string()).small());
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Quality");
+                    egui::ComboBox::from_id_salt("mp3-quality")
+                        .selected_text(self.mp3.quality.label())
+                        .width(220.0)
+                        .show_ui(ui, |ui| {
+                            for quality in Mp3Quality::ALL {
+                                ui.selectable_value(
+                                    &mut self.mp3.quality,
+                                    quality,
+                                    quality.label(),
+                                );
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Write to");
+                    ui.radio_value(&mut self.mp3.beside_originals, true, "beside each original");
+                    ui.radio_value(&mut self.mp3.beside_originals, false, "a folder");
+                    if !self.mp3.beside_originals {
+                        if ui.button("Choose…").clicked() {
+                            choose_folder = true;
+                        }
+                        ui.label(
+                            RichText::new(self.mp3.folder.as_ref().map_or_else(
+                                || "none chosen".to_owned(),
+                                |f| f.display().to_string(),
+                            ))
+                            .small()
+                            .color(theme::MUTED),
+                        );
+                    }
+                });
+                ui.add_space(6.0);
+                let ready = self.mp3.beside_originals || self.mp3.folder.is_some();
+                if ui
+                    .add_enabled(ready, egui::Button::new("CONVERT"))
+                    .clicked()
+                {
+                    go = true;
+                }
+            });
+
+        self.mp3.open = open;
+        if let Some(directory) = reveal {
+            reveal_in_file_manager(&directory);
+        }
+        if pick_again {
+            // The picker is modal; the window is closed first so the dialog
+            // does not sit under it, and reopened by the pick.
+            self.mp3.results.clear();
+            self.mp3.files.clear();
+            self.mp3.open = false;
+            self.choose_audio_for_mp3();
+        }
+        if choose_folder
+            && let Some(folder) = rfd::FileDialog::new()
+                .set_title("Choose where to write the MP3s")
+                .pick_folder()
+        {
+            self.mp3.folder = Some(folder);
+        }
+        if go {
+            self.start_mp3();
+        }
+    }
+
+    /// Encodes the picked files on a worker thread, one after another.
+    fn start_mp3(&mut self) {
+        if self.mp3.is_running() || self.mp3.files.is_empty() {
+            return;
+        }
+        // Work out every destination first, so a folder that cannot be
+        // resolved is reported before anything is written.
+        let mut jobs = Vec::with_capacity(self.mp3.files.len());
+        for source in &self.mp3.files {
+            let Some(directory) = self.mp3.destination_dir(source) else {
+                self.status_message = format!("{} has no folder to write beside", source.display());
+                return;
+            };
+            jobs.push((source.clone(), directory));
+        }
+        let quality = self.mp3.quality;
+        let (sender, receiver) = channel();
+        let spawned = std::thread::Builder::new()
+            .name("mp3-convert".to_owned())
+            .spawn(move || {
+                for (source, directory) in jobs {
+                    let name = source
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("audio")
+                        .to_owned();
+                    let _ = sender.send(Mp3Message::Started(name));
+                    let outcome = encode_mp3(&source, &directory, quality)
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = sender.send(Mp3Message::Finished(Mp3Result { source, outcome }));
+                }
+                let _ = sender.send(Mp3Message::Done);
+            });
+        match spawned {
+            Ok(_) => {
+                self.mp3.receiver = Some(receiver);
+                self.mp3.results.clear();
+                self.mp3.current.clear();
+            }
+            Err(error) => self.status_message = format!("Could not start the conversion: {error}"),
+        }
+    }
+
+    /// Collects the conversion's progress and results.
+    fn poll_mp3(&mut self, context: &egui::Context) {
+        let Some(receiver) = self.mp3.receiver.take() else {
+            return;
+        };
+        let mut running = true;
+        loop {
+            match receiver.try_recv() {
+                Ok(Mp3Message::Started(name)) => self.mp3.current = name,
+                Ok(Mp3Message::Finished(result)) => self.mp3.results.push(result),
+                Ok(Mp3Message::Done) | Err(TryRecvError::Disconnected) => {
+                    running = false;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+            }
+        }
+        if running {
+            self.mp3.receiver = Some(receiver);
+            context.request_repaint_after(Duration::from_millis(200));
+            return;
+        }
+        self.mp3.current.clear();
+        let converted = self
+            .mp3
+            .results
+            .iter()
+            .filter(|result| result.outcome.is_ok())
+            .count();
+        let failed = self.mp3.results.len() - converted;
+        self.status_message = if failed == 0 {
+            format!("Converted {converted} file(s) to MP3")
+        } else {
+            format!("Converted {converted} file(s) to MP3; {failed} failed")
+        };
     }
 
     /// The tick under the playhead, for drawing the piano roll's cursor.
@@ -6816,6 +7115,16 @@ impl eframe::App for RustDawApp {
                     {
                         self.export_stems();
                     }
+                    if ui
+                        .button("WAV → MP3")
+                        .on_hover_text(
+                            "Convert audio files from this disk to MP3, beside the originals or \
+                             into a folder of your choosing. The originals are left as they are.",
+                        )
+                        .clicked()
+                    {
+                        self.choose_audio_for_mp3();
+                    }
                     // The mastering reference sits next to EXPORT MIX because
                     // that is the only thing it affects: it is a property of
                     // the bounce, not of the mix.
@@ -7117,10 +7426,12 @@ impl eframe::App for RustDawApp {
         self.poll_song_import(context);
         self.poll_rekey();
         self.poll_render(context);
+        self.poll_mp3(context);
         self.poll_amp_fetch();
         self.song_import_window(context);
         self.transpose_window(context);
         self.render_window(context);
+        self.mp3_window(context);
         self.piano_roll_window(context);
     }
 }
@@ -7743,6 +8054,107 @@ struct ExportReport {
     path: Option<PathBuf>,
 }
 
+/// How hard to squeeze an MP3. Constant bitrates are what people ask for by
+/// name; V0 is LAME's best variable setting, smaller than 320 and as good.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mp3Quality {
+    Cbr320,
+    Cbr256,
+    Cbr192,
+    Cbr128,
+    Vbr0,
+}
+
+impl Mp3Quality {
+    const ALL: [Self; 5] = [
+        Self::Cbr320,
+        Self::Cbr256,
+        Self::Cbr192,
+        Self::Cbr128,
+        Self::Vbr0,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cbr320 => "320 kbps",
+            Self::Cbr256 => "256 kbps",
+            Self::Cbr192 => "192 kbps",
+            Self::Cbr128 => "128 kbps",
+            Self::Vbr0 => "V0 (variable, ~245 kbps)",
+        }
+    }
+
+    /// The encoder arguments, after `-c:a libmp3lame`.
+    fn ffmpeg_args(self) -> [&'static str; 2] {
+        match self {
+            Self::Cbr320 => ["-b:a", "320k"],
+            Self::Cbr256 => ["-b:a", "256k"],
+            Self::Cbr192 => ["-b:a", "192k"],
+            Self::Cbr128 => ["-b:a", "128k"],
+            Self::Vbr0 => ["-q:a", "0"],
+        }
+    }
+}
+
+/// One file's outcome in a conversion run.
+struct Mp3Result {
+    source: PathBuf,
+    outcome: Result<PathBuf, String>,
+}
+
+/// Messages from the conversion thread. One per file, then `Done`, so the
+/// window can count them up as they land.
+enum Mp3Message {
+    Started(String),
+    Finished(Mp3Result),
+    Done,
+}
+
+/// The WAV → MP3 window: what was picked, how to encode it, where to put it,
+/// and how the run is going.
+struct Mp3State {
+    open: bool,
+    files: Vec<PathBuf>,
+    quality: Mp3Quality,
+    /// Write next to each source, or into `folder`.
+    beside_originals: bool,
+    folder: Option<PathBuf>,
+    receiver: Option<Receiver<Mp3Message>>,
+    /// The file being encoded now, for the progress line.
+    current: String,
+    results: Vec<Mp3Result>,
+}
+
+impl Default for Mp3State {
+    fn default() -> Self {
+        Self {
+            open: false,
+            files: Vec::new(),
+            quality: Mp3Quality::Cbr320,
+            beside_originals: true,
+            folder: None,
+            receiver: None,
+            current: String::new(),
+            results: Vec::new(),
+        }
+    }
+}
+
+impl Mp3State {
+    fn is_running(&self) -> bool {
+        self.receiver.is_some()
+    }
+
+    /// Where a source's MP3 goes, before the name is made unique.
+    fn destination_dir(&self, source: &std::path::Path) -> Option<PathBuf> {
+        if self.beside_originals {
+            source.parent().map(std::path::Path::to_path_buf)
+        } else {
+            self.folder.clone()
+        }
+    }
+}
+
 impl ExportReport {
     fn exported(detail: String, path: PathBuf) -> Self {
         Self {
@@ -7841,6 +8253,75 @@ fn unique_import_path(directory: &std::path::Path, stem: &str) -> PathBuf {
         }
     }
     directory.join(format!("{stem}-{}.wav", Uuid::new_v4().simple()))
+}
+
+/// `<directory>/<stem>.mp3`, or a numbered name when that is taken: a
+/// conversion never replaces a file that was already there.
+fn unique_mp3_path(directory: &std::path::Path, stem: &str) -> PathBuf {
+    let candidate = directory.join(format!("{stem}.mp3"));
+    if !candidate.exists() {
+        return candidate;
+    }
+    for index in 2..1000 {
+        let candidate = directory.join(format!("{stem}-{index}.mp3"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    directory.join(format!("{stem}-{}.mp3", Uuid::new_v4().simple()))
+}
+
+/// Encodes `source` as an MP3 in `directory` and returns the file written.
+///
+/// Tags travel across, and the channel count and rate are kept — except that
+/// MP3 stops at 48 kHz, so a 96 kHz file is resampled to it rather than
+/// refused. The source is only ever read.
+fn encode_mp3(
+    source: &std::path::Path,
+    directory: &std::path::Path,
+    quality: Mp3Quality,
+) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(directory)
+        .map_err(|error| anyhow::anyhow!("could not create {}: {error}", directory.display()))?;
+    let stem = source
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("audio");
+    let destination = unique_mp3_path(directory, stem);
+
+    let mut command = Command::new(ffmpeg_program());
+    command
+        .arg("-nostdin")
+        .arg("-y")
+        .args(["-v", "error"])
+        .arg("-i")
+        .arg(source)
+        .arg("-vn")
+        .args(["-map_metadata", "0"])
+        .args(["-id3v2_version", "3"]);
+    // Only a WAV says its rate without decoding; anything else above 48 kHz
+    // is rare enough to let ffmpeg report it.
+    if hound::WavReader::open(source).is_ok_and(|reader| reader.spec().sample_rate > 48_000) {
+        command.args(["-ar", "48000"]);
+    }
+    let output = command
+        .args(["-c:a", "libmp3lame"])
+        .args(quality.ffmpeg_args())
+        .arg(&destination)
+        .output()
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "could not run ffmpeg: {error}; install it with `{}`",
+                ffmpeg_install_hint()
+            )
+        })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let reason = detail.lines().last().unwrap_or("ffmpeg failed");
+        let _ = std::fs::remove_file(&destination);
+        anyhow::bail!("{reason}");
+    }
+    Ok(destination)
 }
 
 /// The tempo map with one bar at `tempo` put in front of it.
@@ -8603,6 +9084,64 @@ mod tests {
 
         std::fs::remove_file(source).unwrap();
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn mp3_conversion_writes_a_playable_file_beside_a_name_that_is_taken() {
+        if ffmpeg_missing() {
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!("rustdaw-mp3-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("Take.wav");
+        write_test_wav(&source, 2, 44_100);
+        // Something already called Take.mp3 must survive the conversion.
+        std::fs::write(directory.join("Take.mp3"), b"taken").unwrap();
+
+        let written = encode_mp3(&source, &directory, Mp3Quality::Cbr192).unwrap();
+        assert_eq!(written, directory.join("Take-2.mp3"));
+        let bytes = std::fs::read(&written).unwrap();
+        // An ID3v2 header, or a bare MPEG frame sync if the tag was dropped.
+        assert!(
+            bytes.starts_with(b"ID3") || bytes.first() == Some(&0xFF),
+            "not an MP3: {:?}",
+            &bytes[..bytes.len().min(4)]
+        );
+        assert_eq!(std::fs::read(directory.join("Take.mp3")).unwrap(), b"taken");
+        assert!(source.is_file(), "the source must be left alone");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn mp3_qualities_map_to_lame_settings() {
+        assert_eq!(Mp3Quality::Cbr320.ffmpeg_args(), ["-b:a", "320k"]);
+        assert_eq!(Mp3Quality::Vbr0.ffmpeg_args(), ["-q:a", "0"]);
+        assert_eq!(Mp3Quality::ALL.len(), 5);
+    }
+
+    #[test]
+    fn mp3_destination_follows_the_choice() {
+        let state = Mp3State {
+            beside_originals: true,
+            ..Mp3State::default()
+        };
+        let source = PathBuf::from("/music/album/track.wav");
+        assert_eq!(
+            state.destination_dir(&source),
+            Some(PathBuf::from("/music/album"))
+        );
+        let chosen = Mp3State {
+            beside_originals: false,
+            folder: Some(PathBuf::from("/out")),
+            ..Mp3State::default()
+        };
+        assert_eq!(chosen.destination_dir(&source), Some(PathBuf::from("/out")));
+        let unset = Mp3State {
+            beside_originals: false,
+            ..Mp3State::default()
+        };
+        assert_eq!(unset.destination_dir(&source), None);
     }
 
     #[test]

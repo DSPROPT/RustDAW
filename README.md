@@ -9,7 +9,7 @@
 [![CI](https://github.com/DSPROPT/RustDAW/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DSPROPT/RustDAW/actions/workflows/ci.yml)
 [![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-[![Download](https://img.shields.io/badge/download-.deb%20v0.11.0-4ac470.svg)](#install-on-ubuntu)
+[![Download](https://img.shields.io/badge/download-.deb%20v0.11.1-4ac470.svg)](#install-on-ubuntu)
 
 </div>
 
@@ -62,8 +62,8 @@ and [The timeline](#the-timeline). Everything above it is the manual.
 No Rust toolchain needed. Download the package and install it:
 
 ```bash
-wget https://github.com/DSPROPT/RustDAW/raw/main/dist/rustdaw_0.11.0_amd64.deb
-sudo apt install ./rustdaw_0.11.0_amd64.deb
+wget https://github.com/DSPROPT/RustDAW/raw/main/dist/rustdaw_0.11.1_amd64.deb
+sudo apt install ./rustdaw_0.11.1_amd64.deb
 ```
 
 Then launch **RustDAW** from the applications menu, or run `rustdaw` from a
@@ -618,6 +618,16 @@ scale on its own clips in its stem even where the mix sounds clean, because in
 the mix the other tracks pull the sum back under; the export names any stem that
 happened to, so you know to pull that fader down.
 
+**WAV → MP3**, beside them, converts audio files from this disk in one go: pick
+as many as you like, choose a quality (320, 256, 192 or 128 kbps, or LAME's V0),
+and say whether the MP3s go beside each original or into one folder. They are
+encoded one after another with a running count, tags carried across, and the
+originals are never touched — an MP3 that already exists is not overwritten
+either; the new one gets a number. Any format ffmpeg reads is accepted, so a
+FLAC or an AIFF converts the same way, and a 96 kHz file is brought to 48 kHz,
+the most MP3 can hold. The window lists what was written, with **Show in
+folder**, and offers to convert more.
+
 **MASTER…** in the bottom bar, next to **EXPORT MIX**, matches your bounce to a
 record you want yours to sound like. Pick a WAV at the session rate and the
 export is measured against it and brought to meet it — loudness, tone, stereo
@@ -870,12 +880,12 @@ Build the optimized `.deb` from a source checkout with:
 ./packaging/build-deb.sh
 ```
 
-The package is written to `dist/rustdaw_0.11.0_amd64.deb` and installs the `rustdaw`
+The package is written to `dist/rustdaw_0.11.1_amd64.deb` and installs the `rustdaw`
 executable, desktop launcher, and application icon. Installation is explicit and
 remains under the user's control:
 
 ```bash
-sudo apt install ./dist/rustdaw_0.11.0_amd64.deb
+sudo apt install ./dist/rustdaw_0.11.1_amd64.deb
 ```
 
 The native window embeds the RustDAW icon and the desktop launcher declares
